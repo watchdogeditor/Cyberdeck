@@ -49,6 +49,8 @@ from display import (
 )
 from profiles import Profile
 from profile_registry import ProfileRegistry, ProfileEvent
+from plugins import Plugin
+from plugin_registry import PluginRegistry, PluginEvent
 from session_manager import SessionManager, SessionPool, PoolEvent
 from watchdog import Watchdog, WatchdogQuestion
 from connection_monitor import (
@@ -243,6 +245,21 @@ class ProfileListItem(ListItem):
     def __init__(self, profile, label_markup: str) -> None:
         super().__init__(Label(label_markup, markup=True))
         self.profile = profile
+
+
+class PluginListItem(ListItem):
+    """A focusable row in the Tools tab's Plugins section. Stashes
+    the underlying Plugin object so the launch modal (deferred) and
+    z-magnify (which reads README.md inline) can find it without
+    a registry round-trip.
+
+    Distinct from ProfileListItem because the underlying types are
+    different — Plugin carries a source_dir and a readme blob,
+    Profile carries a daemon/construct addendum and recommended_tools."""
+
+    def __init__(self, plugin, label_markup: str) -> None:
+        super().__init__(Label(label_markup, markup=True))
+        self.plugin = plugin
 
 
 class ScriptListItem(ListItem):
@@ -2645,6 +2662,17 @@ class CyberdeckApp(App):
             self.profiles_dir,
             on_event=self._handle_profile_event,
         )
+        # Plugins directory: defaults next to profiles. Plugins are
+        # capability bundles (manifest + README + entry script) that
+        # extend what constructs can do beyond Bash + builtins. Unlike
+        # profiles, plugins are NOT hot-reloaded — adding a new plugin
+        # or editing an entry script requires a deck restart. Plugin
+        # registry scans once at startup; that's the entire lifecycle.
+        self.plugins_dir = self.home_dir / "plugins"
+        self.plugin_registry = PluginRegistry(
+            self.plugins_dir,
+            on_event=self._handle_plugin_event,
+        )
         # Watchdog Q&A oracle. Async question→answer pipe backed by
         # one-shot `claude -p` invocations. The simpler half of the
         # spec'd Watchdog (tripwires + blacklist still deferred).
@@ -2833,6 +2861,21 @@ class CyberdeckApp(App):
                             )
                             yield ListView(id="tools_profile_list")
                             yield Label(
+                                "[b]PLUGINS[/b]  [dim](0)[/dim]",
+                                id="tools_plugins_header",
+                            )
+                            # Plugins section — capability bundles that
+                            # extend what constructs can do beyond Bash
+                            # + builtins. Each plugin is a folder under
+                            # <home>/plugins/ with a manifest, a README,
+                            # and an entry point. Items render with
+                            # `[category/name][availability badge]`,
+                            # similar to profiles but with a unique
+                            # marker so the netrunner can tell at a
+                            # glance which plugins are installed but
+                            # missing dependencies.
+                            yield ListView(id="tools_plugin_list")
+                            yield Label(
                                 "[b]SCRIPTS[/b]  [dim](0)[/dim]",
                                 id="tools_scripts_header",
                             )
@@ -2886,11 +2929,17 @@ class CyberdeckApp(App):
             scripts_list = self.query_one(
                 "#tools_scripts_list", ListView
             )
+            plugins_list = self.query_one(
+                "#tools_plugin_list", ListView
+            )
             header = self.query_one(
                 "#tools_profiles_header", Label
             )
             scripts_header = self.query_one(
                 "#tools_scripts_header", Label
+            )
+            plugins_header = self.query_one(
+                "#tools_plugins_header", Label
             )
         except Exception:
             # Pre-mount or test harness without right panel.
@@ -2948,6 +2997,55 @@ class CyberdeckApp(App):
                         ProfileListItem(p, label_markup)
                     )
 
+        # Plugins section. Read from the registry's snapshot —
+        # populated once at startup, no hot reload (plugins are code).
+        # Render with category prefix + name, availability marker
+        # for plugins whose `requires` checks failed (so the
+        # netrunner sees what's installed but can't run yet).
+        plugins_by_cat = self.plugin_registry.by_category()
+        plugin_total = sum(len(ps) for ps in plugins_by_cat.values())
+        plugin_avail = len(self.plugin_registry.available())
+        # Header shows available count when it differs from total —
+        # avoids needing the netrunner to expand each row to find
+        # out something's broken.
+        if plugin_avail == plugin_total:
+            plugins_header.update(
+                f"[b]PLUGINS[/b]  [dim]({plugin_total})[/dim]"
+            )
+        else:
+            plugins_header.update(
+                f"[b]PLUGINS[/b]  [dim]({plugin_avail}/{plugin_total} "
+                f"available)[/dim]"
+            )
+        plugins_list.clear()
+        if plugin_total == 0:
+            empty_item = ListItem(Label(
+                "[dim](no plugins — drop a folder in ~/plugins/"
+                "<name>/ with plugin.toml)[/dim]",
+                markup=True,
+            ))
+            empty_item.disabled = True
+            plugins_list.append(empty_item)
+        else:
+            for cat, plugins_in_cat in plugins_by_cat.items():
+                for pl in plugins_in_cat:
+                    # Available plugins render in cyan like profiles;
+                    # unavailable ones get a red marker + dimmed name
+                    # so the netrunner can spot them at a glance.
+                    if pl.available:
+                        avail_marker = "[dim]·[/dim]"
+                        name_color = "cyan"
+                    else:
+                        avail_marker = "[red]✗[/red]"
+                        name_color = "dim"
+                    label_markup = (
+                        f"{avail_marker} [dim]{cat}/[/dim]"
+                        f"[{name_color}]{pl.name}[/{name_color}]"
+                    )
+                    plugins_list.append(
+                        PluginListItem(pl, label_markup)
+                    )
+
         # Scripts section. Disk-scanned from <home>/tools/<cat>/<file>.
         # The dispatcher (tools/deck/cyberdeck.py) shows up here on
         # first run because bootstrap writes it. Constructs that
@@ -2998,6 +3096,39 @@ class CyberdeckApp(App):
                 f"[yellow]profiles updated[/yellow] [dim]({count} loaded)[/dim]"
             )
 
+    def _handle_plugin_event(self, event: PluginEvent) -> None:
+        """Receive a plugin registry event. Mirrors
+        _handle_profile_event in shape: errors get surfaced in the
+        chatlog, scan_complete triggers a Tools-panel re-render.
+        Difference is that there's only one scan ever (no hot
+        reload), so this fires at most once during deck startup
+        plus any time the netrunner manually triggers a re-scan
+        (deferred — no UI for that yet)."""
+        if event.kind == "scan_error":
+            err = (event.error or "?").replace("\n", " ")
+            if len(err) > 120:
+                err = err[:117] + "..."
+            self._chatlog_write(
+                f"[red]plugin error:[/red] {err}"
+            )
+            return
+        if event.kind == "scan_complete":
+            self._refresh_tools_panel()
+            total = len(self.plugin_registry.all())
+            avail = len(self.plugin_registry.available())
+            # Suppress the chatlog line when there are no plugins
+            # at all — empty plugins dir is a valid state on first
+            # launch and shouldn't generate a notification.
+            if total > 0:
+                avail_note = (
+                    f", {total - avail} unavailable"
+                    if avail != total else ""
+                )
+                self._chatlog_write(
+                    f"[yellow]plugins loaded[/yellow] "
+                    f"[dim]({avail} available{avail_note})[/dim]"
+                )
+
     def on_mount(self) -> None:
         self.title = "Cyberdeck"
         self._refresh_subtitle()
@@ -3031,6 +3162,24 @@ class CyberdeckApp(App):
             self.profile_registry.start(),
             name="profile-registry-start",
         )
+        # Plugin registry is one-shot: scan synchronously here. No
+        # background task to manage, no shutdown needed. Failures
+        # during a single plugin's load become 'scan_error' events
+        # routed through _handle_plugin_event; the scan as a whole
+        # finishes regardless. Tools panel re-renders on
+        # scan_complete to display whatever was found.
+        try:
+            self.plugin_registry.scan()
+        except Exception as exc:
+            # Defense in depth — the registry is supposed to swallow
+            # per-plugin errors itself, but a top-level crash
+            # shouldn't take down the deck. Log and proceed with an
+            # empty registry.
+            import sys as _sys
+            print(
+                f"plugin_registry: top-level scan crashed: {exc!r}",
+                file=_sys.stderr,
+            )
         # Watchdog worker loop. Idempotent start; runs until
         # on_unmount tears it down. Independent of fleet/daemon —
         # always available so the netrunner can ask questions even
@@ -3499,6 +3648,38 @@ class CyberdeckApp(App):
                 + self.default_profile.default_daemon_addendum.strip()
             )
 
+        # Plugins catalog. Only available plugins are listed — no
+        # point telling the daemon about a plugin whose dependencies
+        # aren't installed; that just produces failed spawns. One
+        # line per plugin: name + category + description (collapsed).
+        # The full README isn't injected here — too much per-turn
+        # token cost. Constructs can read individual plugin READMEs
+        # via Read tool against <home>/plugins/<name>/README.md when
+        # they actually need the interface details.
+        avail_plugins = self.plugin_registry.available()
+        if avail_plugins:
+            catalog: list[str] = [
+                "",
+                "PLUGINS — capability bundles available for construct invocation:",
+                "",
+            ]
+            for pl in avail_plugins:
+                desc_short = " ".join(pl.description.split())
+                if len(desc_short) > 200:
+                    desc_short = desc_short[:197] + "..."
+                catalog.append(
+                    f"- {pl.name} ({pl.category}): {desc_short}"
+                )
+            catalog.append("")
+            catalog.append(
+                "When a construct needs a plugin's capability, instruct "
+                "it to invoke the plugin via Bash: "
+                "`python <home>/plugins/<name>/run.py [args]`. The "
+                "construct can read the plugin's README.md for the "
+                "exact argument shape if needed."
+            )
+            sections.append("\n".join(catalog))
+
         return "\n".join(sections)
 
     async def _drive_daemon(self) -> None:
@@ -3849,9 +4030,12 @@ class CyberdeckApp(App):
 
         The addendum is short by design — Claude Code's system prompt
         is already verbose and this is one of several addenda. We
-        get the point across in 4 lines and move on."""
+        get the point across in a handful of lines and move on. The
+        plugin section appears only when the registry has at least
+        one available plugin; absent plugins means the addendum stays
+        short for routine no-plugin sessions."""
         dispatcher = self.home_dir / "tools" / "deck" / "cyberdeck.py"
-        return (
+        sections: list[str] = [
             f"You have access to a deck-control utility at "
             f"{dispatcher}. Invoke it via the Bash tool to surface "
             f"files in the netrunner's UI panel:\n"
@@ -3861,7 +4045,54 @@ class CyberdeckApp(App):
             f"see in their Files panel — finished outputs, generated "
             f"reports, etc. Don't surface every intermediate scratch "
             f"file. Paths can be absolute or relative to your cwd."
-        )
+        ]
+
+        # Plugin awareness. Only available plugins (`requires` checks
+        # passed) are surfaced — telling the construct about a plugin
+        # whose deps aren't installed just produces failed Bash calls.
+        # One line per plugin so the addendum stays bounded; if the
+        # construct needs the full interface contract, the README is
+        # a Read tool call away.
+        avail_plugins = self.plugin_registry.available()
+        if avail_plugins:
+            plugin_lines: list[str] = [
+                "",
+                "Plugins are capability bundles installed at "
+                "<home>/plugins/<name>/. Each has an entry script you "
+                "invoke via Bash and a README.md describing its "
+                "interface. Available plugins for this session:",
+                "",
+            ]
+            for pl in avail_plugins:
+                desc_short = " ".join(pl.description.split())
+                if len(desc_short) > 140:
+                    desc_short = desc_short[:137] + "..."
+                if pl.source_dir is not None:
+                    entry_path = pl.source_dir / pl.entry
+                    plugin_lines.append(
+                        f"  - {pl.name}: {desc_short}"
+                    )
+                    plugin_lines.append(
+                        f"    invoke: python {entry_path} [args]"
+                    )
+                    plugin_lines.append(
+                        f"    docs:   Read {pl.source_dir / 'README.md'}"
+                    )
+                else:
+                    plugin_lines.append(
+                        f"  - {pl.name}: {desc_short}"
+                    )
+            plugin_lines.append("")
+            plugin_lines.append(
+                "Read a plugin's README before first use so you know "
+                "the exact argument shape and output format. The "
+                "deck's brake hook still gates plugin invocations the "
+                "same way it gates any Bash — destructive patterns "
+                "and protected paths apply."
+            )
+            sections.append("\n".join(plugin_lines))
+
+        return "\n".join(sections)
 
     def _shorten_path(self, p: str) -> str:
         """Render `p` with `~/` substituted for the cyberdeck home

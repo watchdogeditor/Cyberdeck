@@ -1,0 +1,13 @@
+name = "screenshot"
+category = "Capture"
+description = """
+Capture the current screen as a PNG. Cross-platform (Windows / Linux
+/ macOS) via the mss library. Returns the absolute path of the
+captured file on stdout, an error on stderr with non-zero exit. Each
+invocation is a fresh subprocess; no state is kept between calls.
+"""
+entry = "run.py"
+
+[requires]
+platforms = ["windows", "linux", "darwin"]
+python_imports = ["mss"]

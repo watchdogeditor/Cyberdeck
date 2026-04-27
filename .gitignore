@@ -19,11 +19,12 @@ Desktop.ini
 .claude/settings.local.json
 .claude/worktrees/
 
-# Cyberdeck runtime working dir — keep only the profile templates,
-# ignore everything else (logs, ejection snapshots, bootstrapped
-# dispatcher script, construct work outputs).
+# Cyberdeck runtime working dir — keep profile templates and
+# plugin bundles, ignore everything else (logs, ejection snapshots,
+# bootstrapped dispatcher script, construct work outputs).
 cyberdeck-home/*
 !cyberdeck-home/profiles/
+!cyberdeck-home/plugins/
 
 # Milestone snapshots — history, not source.
 Previous Versions/
