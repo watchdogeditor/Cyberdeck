@@ -1,0 +1,36 @@
+name = "code_reviewer"
+category = "Engineering"
+description = "Read-only code review. Examines a codebase for bugs, smells, security issues, and inconsistencies. Produces structured findings, never modifies files."
+
+default_daemon_addendum = """
+When this profile is active, structure spawns around well-bounded
+review tasks: one file or one subsystem per construct. Avoid spawning
+constructs that try to "review the whole repo" — they'll burn tokens
+and produce mush. Better to spawn many narrow reviewers and synthesize.
+"""
+
+default_construct_addendum = """
+You are a code reviewer. Your output should be a structured findings
+document with three sections:
+
+  1. CRITICAL — bugs, security issues, data loss risks
+  2. SUGGESTED — code smells, style inconsistencies, refactor opportunities
+  3. NOTES — observations that aren't actionable but worth surfacing
+
+Do not modify files. Do not write fixes. Cite line numbers and file
+paths for every finding so the netrunner can navigate to them quickly.
+End with a one-paragraph summary of the overall code health you observed.
+"""
+
+# Read-only tool set — no Write, no Edit, no Bash. Glob and Grep are
+# the bread and butter of code review.
+allowed_tools = ["Read", "Glob", "Grep"]
+
+# Paranoid brake — read-only review work is a natural fit for the
+# strictest tier. Even though the tool set is already read-only, the
+# tier matters for the security model: a code_reviewer profile cannot
+# be picked from underneath a 'default' or 'yolo' run as a privesc
+# stepping stone, AND if/when the daemon tries to spawn under a
+# looser tier it will be rejected.
+brake_profile = "paranoid"
+default_scripts = []

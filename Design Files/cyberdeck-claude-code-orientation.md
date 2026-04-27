@@ -1,0 +1,333 @@
+# Cyberdeck — Claude Code Orientation
+
+*Read this BEFORE doing anything else in a fresh Claude Code session
+on this codebase. It captures the institutional knowledge that
+matters most for getting work done quickly without re-introducing
+bugs we've already filed.*
+
+*Pair with `cyberdeck-state.md` (what's shipped + design decisions),
+`cyberdeck-build-plan.md` (what's next), `cyberdeck-spec.md` (the
+canonical architecture), and `cyberdeck-philosophy.md` (the why).*
+
+---
+
+## What this codebase is
+
+A Textual TUI that orchestrates Claude Code subprocesses — a
+"daemon" coordinator AI dispatches "construct" workers to do tasks
+in parallel, while a "watchdog" oracle answers questions about fleet
+activity. The user (the "netrunner") supervises through the UI. ~12k
+LOC, 13 Python modules, real subprocess management, real terminals,
+real Windows quirks.
+
+The deck is in active production use by the user (the operator known
+as Watchdog). They run it on Windows. They will catch bugs you don't.
+Real-deck testing has caught more issues this project than mock
+tests ever did. Trust their reports — the failure mode they describe
+is the failure mode that's actually happening.
+
+---
+
+## Hard-won rules — read these first
+
+### Real-claude testing > mock testing
+Mocks miss subprocess streaming behavior, Windows path quirks, claude
+CLI argument parsing edge cases (`-p` vs trailing positionals, stdin
+vs argv prompt delivery), shutdown noise, ProactorEventLoop quirks,
+and the wedge-recovery cycle. **When in doubt, test against real
+claude before declaring a feature done.** Especially for anything
+involving subprocess lifecycle, streaming, or Windows-specific
+behavior.
+
+### One milestone at a time
+A session that ends mid-refactor leaves landmines. The
+`_process_streaming` stub disaster — where the worker called the
+wrong method name and watchdog questions all failed silently —
+happened because a previous session stopped halfway. **Always close
+the loop on the current method or feature before starting the next.**
+If you have to stop mid-refactor, file a TODO that's impossible to
+miss.
+
+### Filed gotchas are sacred
+The gotchas list in `cyberdeck-state.md` is *cumulative*. Every entry
+on that list is a real bug we hit, diagnosed, and fixed. **Re-introducing
+one wastes a session.** Read the list. When designing a fix that touches
+subprocess lifecycle, file paths, modal screens, or async cleanup —
+check the gotchas first.
+
+### Push back when the user is wrong
+The user appreciates being told "actually, that won't work because
+X" or "I'd argue Y is the better approach." They've course-corrected
+the AI multiple times when it was about to do the wrong thing
+(MCP-vs-stdout-markers, manual-UI-vs-programmatic, etc.) Push back
+politely, with reasoning. They'll do the same to you.
+
+### Bias toward small, sharp, opinionated changes
+The codebase rewards opinionated design decisions explained in
+comments. Avoid "let's add a flag for both behaviors" — pick the one
+that's right and document why. The flag-soup direction makes the
+codebase harder to reason about and the comments thinner.
+
+---
+
+## Architectural concepts
+
+### The four runtime entities
+1. **The deck** (the TUI itself). Renders panels, dispatches actions
+   on key presses, mounts/unmounts modals. Contains the App, all
+   panes, and the action handlers.
+2. **The fleet** (`fleet.py`). N concurrent Construct subprocesses
+   managed by a `Fleet` object. Emits events on a queue; the App
+   listens and updates panes/chatlog.
+3. **The daemon** (`daemon.py` + `daemon_session.py`). A persistent
+   Claude Code subprocess that decomposes goals into actions
+   (spawn / kill / etc.) and dispatches via JSON. Has both one-shot
+   and streaming backends; streaming is the default.
+4. **The watchdog** (`watchdog.py`). An async question-queue oracle
+   that answers human questions about fleet activity. Independent
+   of the daemon; runs its own claude subprocess. Streaming default.
+
+### Profiles, brake tiers, allowed_tools
+A profile is a TOML file in `<home>/profiles/` defining `name`,
+`category`, `description`, `system_prompt_addendum`, `allowed_tools`,
+and `brake_profile` (paranoid / default / yolo). Profiles narrow what
+a construct can do. The daemon picks profiles per-spawn from a JSON
+field. Profile registry hot-reloads from disk. The default profile
+auto-seeds on first run; netrunner edits to it are sacred.
+
+### The dispatcher protocol
+Constructs talk back to the deck via a one-way stdout marker protocol:
+`__CYBERDECK::v1::ACTION::PAYLOAD__`. The marker scanner runs in
+`_handle_event` BEFORE formatters. `dispatcher.py` is the construct-
+side helper script bootstrapped to `<home>/tools/deck/cyberdeck.py`
+and surfaced in the Tools panel like any other script. Constructs
+invoke `cyberdeck files add <path>` etc. via Bash; the dispatcher
+emits markers; the deck parses them.
+
+### The spawn provenance system
+`fleet.spawn(..., origin=...)` carries who initiated each spawn —
+`daemon` / `netrunner` / `inject`. Threaded into the `spawned` meta
+event payload. Renders as cyan `[you]` / `[↳you]` badges in the
+chatlog. Watchdog's system prompt has the badge legend so it doesn't
+have to reverse-engineer attribution from log timing (we caught it
+doing this once — beautiful but expensive reasoning).
+
+### Goal updates and netrunner messages
+Both flow through `DaemonSession` setters that stash content for the
+next outcome turn. `_format_outcomes` prepends preambles
+(`⚠ GOAL UPDATE` / `≫ NETRUNNER MESSAGE`) to the daemon's input.
+A wake event keeps idle sessions responsive. Goal updates overwrite
+(latest wording wins); netrunner messages stack (FIFO). Force-push
+(interrupt in-flight turn) is M5+ — today's deferred-to-next-break
+delivery is good enough.
+
+### The connection monitor
+`connection_monitor.py` heartbeats `api.anthropic.com:443` every 30s
+and emits state transitions: Online (●green) / Degraded (◐yellow) /
+Offline (●red). Sidebar indicator + chatlog announcements update on
+each transition. DNS failure skips Degraded → Offline directly.
+Threshold-based: 2 failures → Degraded, 1 success → Online.
+Spec'd consequences (spawn-blocking, daemon parking, recovery flow)
+are NOT yet wired — only detection. That's the next M5+ slice.
+
+### The session pool
+`session_manager.py` keeps warm Claude Code sessions ready for
+constructs to resume into. Saves cold-start cost. Always warms with
+the **default** profile only — non-default profiles always spawn
+fresh. We considered per-profile pools; the warming cost wasn't
+worth the complexity.
+
+---
+
+## File-by-file orientation
+
+### `tui.py` (6102 LOC, the heart)
+- App class, BINDINGS, action handlers
+- All modal screens (NewConstructScreen, AskWatchdogScreen,
+  TalkDaemonScreen, GoalSetScreen, LimitsScreen, EjectScreen,
+  ExpandModal, LaunchScreen, etc.)
+- ConstructPane (focusable, expandable), DaemonPane, WatchdogPane,
+  GoalPane, PoolMeter
+- All list-item classes: FileListItem, ProfileListItem, ScriptListItem
+- Section navigation: `_focus_section`, `_list_walk`,
+  `_fall_through_to_neighbor`, `_jump_section`, `_cycle_in_section`
+- The `__main__` block at the bottom with argparse + the
+  `sys.unraisablehook` filter
+
+This file is huge but well-organized. When adding a feature, first
+grep for existing similar work — the pattern is almost always there.
+
+### `watchdog.py` (715 LOC)
+- `Watchdog` class with `streaming_mode` switch
+- One-shot path: `_process_oneshot` (claude `-p` per question, stdin)
+- Streaming path: `_process_streaming` + `_spawn_streaming` +
+  `_drain_streaming_question` + `_kill_streaming_proc` +
+  `_shutdown_streaming`
+- Wedge recovery: timeout → kill → respawn-on-next-question
+- System prompt with badge legend
+
+### `daemon.py` (685 LOC)
+- `Daemon` class with both backends
+- One-shot: spawns fresh `claude -p` per turn with `--resume <session>`
+- Streaming: persistent `claude --input-format stream-json` subprocess
+- Same shutdown pattern (close stdin → wait_closed → terminate → kill)
+
+### `fleet.py` (611 LOC)
+- `Fleet` class manages N constructs concurrently with a semaphore
+- `spawn(task, ..., origin=...)` is the main entry point
+- Events flow on an asyncio.Queue; consumers (the App) subscribe
+- `parent_id`, `resumed_from`, `profile_name`, `origin` in the
+  spawned payload
+
+### `daemon_session.py` (570 LOC)
+- `DaemonSession` glues the daemon to the fleet
+- `_format_outcomes` is the daemon's input message builder; respects
+  goal_update + netrunner_messages + respawn_warnings + outcomes
+- `_outcome_event` wakes the loop on inputs from idle states
+- `set_pending_goal_update`, `set_pending_netrunner_message`
+
+### `display.py` (506 LOC)
+- `summarize`, `render_block`, `fmt_input` — formatters with
+  `untruncated=False` kwarg
+- `chatlog_format_fleet` — chatlog spawn line renderer with origin
+  badge logic
+
+### `profile_registry.py` (450 LOC) + `profiles.py` (399 LOC)
+- TOML loader, frozen Profile dataclass with `source_path`
+- File-watch + hot reload, default seeded
+- Brake tier privesc gate
+
+### `connection_monitor.py` (311 LOC)
+- ConnectionMonitor with heartbeat loop
+- State machine, transition events, callback
+- `record_subprocess_error(stderr)` hook
+
+### `dispatcher.py` (138 LOC)
+- The construct-side helper script bootstrapped to
+  `<home>/tools/deck/cyberdeck.py`
+- `cyberdeck files add/remove`, future actions
+- Marker emission only — never reads from the deck
+
+### `construct.py` (552 LOC)
+- The managed claude subprocess
+- Stream-event parsing, `_files_written` tracking, `_handle_event`
+  marker scanner
+
+### `session_manager.py` (557 LOC)
+- Pool with manifest, cross-restart reuse, 5h stale window
+- Warms with `default` profile only
+
+### `mock_claude.py`, `mock_daemon.py`
+- Test fixtures for the chat-era development. Several streaming
+  variants exist in `/tmp/mock_streaming_claude.py`,
+  `/tmp/mock_wedging_claude.py` etc. when reproducing specific bugs.
+
+---
+
+## Workflow patterns
+
+### Adding a feature
+1. Read the relevant section of `cyberdeck-spec.md`.
+2. Grep for similar existing patterns. The codebase is opinionated;
+   match the prevailing style.
+3. Mock-test if it's a new module; real-claude-test if it touches
+   subprocess lifecycle.
+4. Add comments explaining *why*, not just *what*. The codebase has
+   a very high comment density and that has paid off repeatedly.
+5. Update `cyberdeck-state.md` and `cyberdeck-build-plan.md` when a
+   milestone closes. Don't let those drift.
+6. If you fix a bug that's not in the gotchas list, add it.
+
+### Refactoring
+1. Use `str_replace`-equivalent edits sparingly on long files —
+   read the file first, edit precisely. The chat era saw two cases
+   where edit operations ate adjacent code (a class header, a
+   docstring close).
+2. Compile-clean ≠ structurally clean. After bulk edits, view the
+   surrounding code to confirm the structure is intact.
+3. Don't introduce `if config.flag: legacy_path() else: new_path()`
+   — that's how flag soup starts. Pick one path, comment why.
+
+### Debugging a real-deck bug
+1. Believe the user. The screenshot/stack/description is the truth.
+2. Reproduce in a mock if possible — but if mocks can't reproduce,
+   trust the real-deck symptom.
+3. Check the gotchas list FIRST. Most "weird bugs" map to a known
+   gotcha pattern.
+4. When fixing, file the gotcha. Even if you've fixed it before — if
+   you forgot, the next session will too.
+
+### Mid-session checkpoints
+The chat era used "FILES TO REPLACE" blocks at the end of every
+multi-file change so the user could `cp` artifacts to their working
+tree. Claude Code doesn't need this — edits land in place. But the
+discipline of "summarize what changed and why" at the end of a
+substantive change is still useful. Keep it.
+
+---
+
+## Things to NOT do
+
+- Don't introduce flag-soup ("paranoid mode flag, default mode flag,
+  yolo mode flag"). The brake tier system is the right shape; if you
+  feel the urge to add a fourth tier, redesign instead.
+- Don't reach for inheritance when composition works. The codebase
+  has very few inheritance hierarchies and that's deliberate.
+- Don't add features that aren't in the build plan without
+  discussing them. The user has clear priorities; freelancing burns
+  trust.
+- Don't write extensive tests for things real-claude testing covers
+  better. A 200-line mock test that misses the subprocess-streaming
+  edge case isn't worth the maintenance burden.
+- Don't over-engineer the watchdog. It's a Q&A oracle. Adding
+  multi-step reasoning, tool access, etc. defeats its purpose.
+- Don't try to make the daemon "smarter." It already is — it's
+  Claude Code with a system prompt. The daemon doesn't need
+  scaffolding; it needs clear inputs and clean propagation paths.
+- Don't merge the daemon and watchdog. They're deliberately separate.
+  Soft/loud distinction is core to the spec.
+- Don't conflate netrunner and daemon. The user is a participant in
+  the system, not an input the daemon receives. Goal updates,
+  netrunner messages, and direct spawns are first-class.
+
+---
+
+## What "done" looks like for a feature
+
+1. The feature works end-to-end against real claude (where applicable).
+2. It compiles cleanly.
+3. The relevant section in `cyberdeck-state.md` mentions it.
+4. If it shipped a new module: the module's purpose is clear in its
+   first docstring.
+5. If it touched the gotchas list: any new lessons are filed.
+6. The user has tested it on their real deck and confirmed.
+7. Code is committed with a sensible message.
+
+---
+
+## Quick reference: where the bodies are buried
+
+| Topic | Look at |
+|---|---|
+| App startup, sidebar layout | `tui.py` `compose` and `__init__` |
+| Daemon's input format | `daemon_session.py` `_format_outcomes` |
+| The dispatcher protocol | `dispatcher.py` + `tui.py` `_handle_event` marker scan |
+| Streaming subprocess management | `daemon.py` and `watchdog.py` `_run_streaming_*` / `_process_streaming` |
+| Event flow from constructs | `fleet.py` `_consume` + `tui.py` `_handle_*_event` handlers |
+| Profile loading & hot reload | `profile_registry.py` |
+| Why a particular comment exists | `git log` (every comment was load-bearing) |
+| Modal navigation | `tui.py` `_focus_section`, `_list_walk`, `_cycle_*_panel_tabs` |
+| Origin badges | `display.py` `chatlog_format_fleet` |
+| Connection state | `connection_monitor.py` |
+
+---
+
+## A final note
+
+This project exists because the user wanted a real cyberpunk-aesthetic
+hacker's deck — a workshop, not a sandbox. The aesthetic is part of the
+spec. Banter is welcome. Cyberpunk framing is welcome. But work
+first; banter around the work, not in place of it.
+
+The user has built something real here. Help them ship the next
+piece, and keep the standards high.

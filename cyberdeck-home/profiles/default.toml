@@ -1,0 +1,17 @@
+name = "default"
+category = "General"
+description = """
+Baseline profile for general-purpose work. No specialization, no
+addendums beyond the deck baseline. Used when no other profile fits
+or when the netrunner explicitly wants the unsteered behavior.
+"""
+
+# Empty addendums = use deck baseline as-is.
+default_daemon_addendum = ""
+default_construct_addendum = ""
+
+# Empty allowed_tools = use deck-level default tool set. Not "no tools".
+allowed_tools = []
+
+brake_profile = "default"
+default_scripts = []

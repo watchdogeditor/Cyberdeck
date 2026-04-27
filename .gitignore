@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Claude Code machine-local settings
+.claude/settings.local.json
+
+# Cyberdeck runtime working dir — keep only the profile templates,
+# ignore everything else (logs, ejection snapshots, bootstrapped
+# dispatcher script, construct work outputs).
+cyberdeck-home/*
+!cyberdeck-home/profiles/
+
+# Milestone snapshots — history, not source.
+Previous Versions/
+
+# Image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.ico
+*.svg

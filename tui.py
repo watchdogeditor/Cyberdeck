@@ -1,0 +1,6102 @@
+"""
+Cyberdeck M3: Textual TUI with keyboard navigation.
+
+One pane per construct, live-updating as events arrive. Keyboard-driven:
+Tab cycles focus, number keys jump, Enter expands, `k` kills, `n` (or
+Space) spawns a new construct interactively, `q` / Ctrl+C quit.
+
+Run:
+    python tui.py "task 1" "task 2" [...]
+    CLAUDE_BIN=./mock_claude.py python tui.py "task 1" "task 2"
+
+Env:
+    CLAUDE_BIN, CLAUDE_MODE, CYBERDECK_LOG — same as fleet.py
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import time
+from collections import deque
+from pathlib import Path
+from typing import Optional
+
+from rich.text import Text
+from rich.syntax import Syntax
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Vertical, VerticalScroll, Horizontal
+from textual.reactive import reactive
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Label, Log, RichLog, Header, Footer, Static, Input,
+    TabbedContent, TabPane, ListView, ListItem,
+)
+
+from fleet import Fleet, FleetEvent
+from construct import Construct, DEFAULT_TOOLS as CONSTRUCT_DEFAULT_TOOLS
+from daemon import Daemon, DaemonEvent, DAEMON_SYSTEM_PROMPT
+from daemon_session import DaemonSession
+from display import (
+    summarize,
+    summarize_for_activity,
+    chatlog_format_fleet,
+    chatlog_format_daemon,
+)
+from profiles import Profile
+from profile_registry import ProfileRegistry, ProfileEvent
+from session_manager import SessionManager, SessionPool, PoolEvent
+from watchdog import Watchdog, WatchdogQuestion
+from connection_monitor import (
+    ConnectionMonitor, ConnectionState, StateChangeEvent,
+)
+
+
+STATE_STYLES = {
+    "starting":   "yellow",
+    "running":    "green",
+    "done":       "cyan",
+    "failed":     "red",
+    "killed":     "orange1",
+    # Inject-only state: the construct was killed mid-flight by an
+    # interrupt-inject and its session continues in a new construct.
+    # KILLED would also be technically true (the subprocess was
+    # SIGTERM'd) but visually misleading — the netrunner pivoted, they
+    # didn't give up. Same blue family as the chevron link below.
+    "redirected": "bright_blue",
+}
+
+
+# Pane states from which no further action is meaningful: kill is a
+# no-op (subprocess is gone), inject would resume a session that's
+# either truly done or being continued by another construct (redirect
+# follow-up). Keep this in one place — three gates use it and they
+# kept drifting out of sync when new terminal-ish states landed.
+TERMINAL_PANE_STATES = ("done", "failed", "killed", "redirected")
+
+
+# RichLog widgets that should support space-to-expand. The set has two
+# uses: (1) tells action_primary which RichLogs to route to ExpandModal
+# (focused widget id must be in this set), and (2) provides the
+# friendly title each one shows up under in the modal header.
+#
+# Pane logs (#pane_log inside ConstructPane) get expanded via a
+# different code path because their id collides across panes — add
+# explicit ConstructPane handling in action_primary if/when we want
+# per-pane expand.
+_EXPANDABLE_RICHLOGS: dict[str, str] = {
+    "chatlog_log": "Chatlog",
+    "fleet_log":   "Fleet log",
+}
+
+
+# ---- deck-protocol marker parsing -----------------------------------
+# The cyberdeck dispatcher script (installed at <home>/tools/deck/
+# cyberdeck.py at startup) emits magic marker lines on its stdout
+# when a construct invokes it via Bash. We see those markers as part
+# of tool_result text from constructs and act on them server-side
+# (update Files panel etc), then strip them from the displayed text
+# so the netrunner doesn't see the protocol bytes.
+#
+# Format (kept loose-prefix-tight-suffix so accidental collisions in
+# normal output are vanishingly unlikely):
+#   __CYBERDECK::v1::ACTION::PAYLOAD__
+# - Version pinned to v1; bumps on wire-format breaks.
+# - ACTION is uppercase letters + underscores.
+# - PAYLOAD is everything after "::" up to the trailing "__".
+#   PAYLOADs may contain arbitrary chars including ":" — the regex
+#   uses non-greedy matching to avoid swallowing the closing "__".
+import re as _re
+_DECK_MARKER_RE = _re.compile(
+    r"__CYBERDECK::v1::([A-Z_]+)::(.*?)__",
+)
+
+
+def _extract_deck_markers(text: str) -> tuple[list[tuple[str, str]], str]:
+    """Pull all deck-protocol markers out of `text`. Returns
+    (events, cleaned_text) where events is a list of
+    (action, payload) tuples in occurrence order, and cleaned_text
+    is the original with marker substrings removed.
+
+    The text-cleaning is loose: marker lines often appear on a line
+    by themselves but might be inline. We just remove the marker
+    substring; if that leaves a blank line, downstream display logic
+    handles whitespace normally.
+
+    Best-effort. If the regex finds nothing, returns ([], text)
+    unchanged."""
+    if not text or "__CYBERDECK::" not in text:
+        # Fast path: no markers. The substring check avoids regex
+        # overhead on the 99%+ of tool_results that don't contain
+        # protocol bytes.
+        return [], text
+    events: list[tuple[str, str]] = []
+
+    def _capture(m: "_re.Match") -> str:
+        events.append((m.group(1), m.group(2)))
+        return ""
+
+    cleaned = _DECK_MARKER_RE.sub(_capture, text)
+    return events, cleaned
+
+
+DAEMON_STATUS_STYLES = {
+    "idle":     "dim",
+    "starting": "yellow",
+    "working":  "green",
+    "waiting":  "yellow",
+    "done":     "cyan",
+    "failed":   "red",
+    "stopped":  "orange1",
+}
+
+
+def _humanize_tokens(n: int) -> str:
+    """Compact display for large token counts. 1,234,567 -> '1.2M'."""
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.1f}M"
+
+
+def _wrap_words(words: tuple[str, ...] | list[str], max_width: int) -> list[str]:
+    """Greedy word-wrap: pack words into lines no longer than max_width.
+
+    Used by the Tools tab so the displayed tool list adjusts cleanly
+    when the underlying constant grows or shrinks. Handles the edge
+    case where a single word exceeds max_width by giving it its own
+    line — it'll still wrap at the renderer level, but at least the
+    other words don't get pulled into the overflow.
+    """
+    lines: list[str] = []
+    current = ""
+    for w in words:
+        if not current:
+            current = w
+            continue
+        candidate = current + " " + w
+        if len(candidate) <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = w
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _expandable_title(widget) -> str:
+    """Friendly title for the expand modal. Falls back to the widget's
+    id (or '(log)' if no id) when not in our registered set — better
+    something than nothing if the netrunner finds a way to focus an
+    unregistered RichLog."""
+    if widget.id and widget.id in _EXPANDABLE_RICHLOGS:
+        return _EXPANDABLE_RICHLOGS[widget.id]
+    return widget.id or "(log)"
+
+
+def _resolve_home_dir(explicit: Optional[str]) -> Path:
+    """Resolve the cyberdeck home directory and ensure it exists.
+
+    Priority: explicit (CLI arg) > $CYBERDECK_HOME env var >
+    `./cyberdeck-home` relative to the current working directory.
+
+    Subdirectories the deck writes into (.cyberdeck/, logs/, etc.) get
+    created lazily by the components that own them; this helper just
+    guarantees the top-level home dir exists so those don't trip on a
+    missing parent.
+
+    The home dir is a SOFT sandbox, not a real one — Bash tool calls
+    can `cd` anywhere they like once they're running. The point is to
+    make the construct's default Read/Glob/Write surface point at a
+    user data area instead of at the deck's own source code.
+    """
+    if explicit:
+        home = Path(explicit).expanduser().resolve()
+    else:
+        env = os.environ.get("CYBERDECK_HOME")
+        if env:
+            home = Path(env).expanduser().resolve()
+        else:
+            home = (Path.cwd() / "cyberdeck-home").resolve()
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
+class ProfileListItem(ListItem):
+    """A focusable row in the Tools tab's profile list. Stashes a
+    reference to the underlying Profile object so action handlers
+    (the launch modal in C1g.4) can retrieve the data they need
+    without doing a name → registry round-trip on every keypress.
+
+    The visible content is a single Label rendering the row text
+    (tier sigil + category/name + tool count). We compose with the
+    Label child rather than using ListItem's bare-text constructor
+    because we want full markup support."""
+
+    def __init__(self, profile, label_markup: str) -> None:
+        super().__init__(Label(label_markup, markup=True))
+        self.profile = profile
+
+
+class ScriptListItem(ListItem):
+    """A focusable row in the Tools tab's Scripts section. Each script
+    lives at <home>/tools/<category>/<filename> and is invokable by
+    constructs via Bash. C1g.4 wires space here to launch a follow-up
+    construct that's been told about this specific script (a tool
+    shortcut for "spin up a deck capability").
+
+    Carries the absolute path so the launch wiring can reference it
+    without disk re-scan, and category/name separately so display
+    can render `<dim>category/</dim><cyan>name</cyan>` consistently
+    with how profiles are shown."""
+
+    def __init__(
+        self,
+        script_path: str,
+        category: str,
+        script_name: str,
+    ) -> None:
+        super().__init__(Label(
+            f"[dim]{category}/[/dim][cyan]{script_name}[/cyan]",
+            markup=True,
+        ))
+        self.script_path = script_path
+        self.category = category
+        # Stored as `script_name` not `name` because Textual's
+        # Widget.name is a read-only property — we can't shadow it
+        # without breaking widget identity.
+        self.script_name = script_name
+
+
+class FileListItem(ListItem):
+    """A focusable row in the Files tab — one file touched (read /
+    written / edited) by some construct during this run. Carries the
+    path and the construct that produced it; C1g.4 wires space here
+    to launch a follow-up construct with the file pre-loaded into the
+    prompt (`FILE: <path>\\n\\n<your task>`).
+
+    Path display vs. storage: `file_path` is the absolute path as the
+    construct emitted it — preserved verbatim so the FILE: envelope
+    sent to the next construct can be resolved without ambiguity.
+    `display_path` is what the netrunner sees in the panel — shortened
+    to `~/...` when the path lives under cyberdeck-home so the narrow
+    Files column doesn't waste two thirds of its width on the home
+    prefix. The caller (CyberdeckApp._append_files) computes the
+    display version with App._shorten_path before constructing.
+
+    De-duplication note: the Files tab can show the same path multiple
+    times if multiple constructs touch it. That's intentional today —
+    the construct_id column tells the netrunner *who* touched what,
+    which is meaningful provenance. When that gets noisy, M5+ can add
+    a 'group by path' toggle."""
+
+    def __init__(
+        self,
+        construct_id: str,
+        file_path: str,
+        display_path: Optional[str] = None,
+    ) -> None:
+        # If the caller didn't pre-shorten, just show the raw path —
+        # avoids needing home_dir context in the item itself.
+        display = display_path if display_path is not None else file_path
+        super().__init__(Label(
+            f"[cyan]{construct_id}[/cyan]  [dim]→[/dim] {display}",
+            markup=True,
+        ))
+        self.construct_id = construct_id
+        self.file_path = file_path        # absolute, for FILE: envelope
+        self.display_path = display       # what the netrunner sees
+
+
+class GoalPane(Static, can_focus=True):
+    """Displays the netrunner's current goal. Read-only in M4a; M4b
+    will make it editable with propagation to the daemon."""
+
+    DEFAULT_CSS = """
+    GoalPane {
+        border: round $accent;
+        padding: 0 1;
+        height: auto;
+        min-height: 3;
+        margin-bottom: 1;
+    }
+    GoalPane:focus {
+        border: heavy $warning;
+        background: $boost;
+    }
+    GoalPane > #goal_text {
+        width: 100%;
+        height: auto;
+    }
+    """
+
+    def __init__(self, goal: str = "", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.goal = goal
+
+    def compose(self) -> ComposeResult:
+        yield Label("[b]YOUR GOAL[/b]", id="goal_title")
+        yield Label(self.goal or "[dim](no goal set)[/dim]", id="goal_text")
+
+    def set_goal(self, goal: str) -> None:
+        self.goal = goal
+        try:
+            self.query_one("#goal_text", Label).update(
+                goal or "[dim](no goal set)[/dim]"
+            )
+        except Exception:
+            pass  # widget may not be mounted yet
+
+
+class PoolMeter(Static, can_focus=False):
+    """Visual indicator of the session pool's fill state.
+
+    Shows a compact bar like `┃■■□┃ 2/3` where:
+      ■ = warm session ready to pull (green)
+      □ = empty slot — either warming in flight, or genuinely empty
+          (dim; the user doesn't need to distinguish these visually,
+           the count tells them everything they need to know)
+
+    Output-only: not a focus target. Updates live via update_state()
+    as PoolEvents flow in from the SessionPool."""
+
+    DEFAULT_CSS = """
+    PoolMeter {
+        height: 1;
+        padding: 0;
+        margin-bottom: 1;
+        color: $text;
+    }
+    """
+
+    # Cell glyphs. Block chars render in any terminal that supports
+    # Unicode (which is everything we care about — the deck runs on
+    # Linux with a real terminal emulator).
+    GLYPH_WARM  = "■"
+    GLYPH_EMPTY = "□"
+
+    def __init__(self, **kwargs) -> None:
+        # Initialize with a non-empty placeholder; Textual's Visual
+        # conversion chokes on truly empty Static content during
+        # display-toggle render passes.
+        super().__init__(" ", **kwargs)
+        self._warm = 0
+        self._warming = 0
+        self._target = 0
+        self._enabled = False
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Hide the meter entirely when the pool is disabled (--no-pool).
+        No point showing zero-of-zero on a small screen."""
+        self._enabled = enabled
+        self.display = enabled
+        self._refresh_display()
+
+    def update_state(self, warm: int, warming: int, target: int) -> None:
+        """Refresh the display from current pool state."""
+        self._warm = warm
+        self._warming = warming
+        self._target = target
+        self._refresh_display()
+
+    def _refresh_display(self) -> None:
+        """Re-render the visible content based on current state.
+        (Named with _refresh prefix instead of _render because Textual's
+        Widget._render is part of the rendering pipeline and must return
+        a Visual; shadowing it crashes the app.)"""
+        if not self._enabled or self._target == 0:
+            self.update(" ")  # non-empty placeholder; empty trips Visual conversion
+            return
+        # Cells fill from the left: warm cells solid, then empty slots.
+        # We don't visually distinguish "warming in flight" from "empty"
+        # — the count text tells the user how many are ready. Adding a
+        # third glyph cluttered the meter without adding info.
+        warm_cells = self.GLYPH_WARM * self._warm
+        empty_count = max(0, self._target - self._warm)
+        empty_cells = self.GLYPH_EMPTY * empty_count
+
+        bar = (
+            f"[green]{warm_cells}[/green]"
+            f"[dim]{empty_cells}[/dim]"
+        )
+        self.update(
+            f"[b]POOL[/b]  ┃{bar}┃ "
+            f"[dim]{self._warm}/{self._target}[/dim]"
+        )
+        # Force a repaint. Updates triggered from background asyncio
+        # tasks (pool warming workers) sometimes don't trigger a visible
+        # screen refresh until the user causes another event — explicit
+        # refresh ensures the meter ticks live as cells warm up.
+        self.refresh()
+
+
+class DaemonPane(Static, can_focus=False):
+    """Shows the daemon's ongoing activity — thinking, chat, status.
+    Not focusable: it's an output surface, not an interaction target.
+    Daemon interaction lives elsewhere (T to talk, e to edit goal)."""
+
+    DEFAULT_CSS = """
+    DaemonPane {
+        height: 1fr;
+        padding: 0 1;
+    }
+    DaemonPane > #daemon_header {
+        height: 1;
+    }
+    DaemonPane > #daemon_log {
+        height: 1fr;
+        border: round $accent;
+    }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.status = "idle"
+
+    def compose(self) -> ComposeResult:
+        yield Label("[b]DAEMON[/b]  [dim]\\[IDLE][/dim]", id="daemon_header")
+        # wrap=False — see WatchdogPane.compose for the full reasoning.
+        # Short version: now that this log lives in a TabbedContent,
+        # writes can happen while the tab is inactive (size=0), and
+        # wrap=True + min_width=1 caches Strips at 1-char-per-line
+        # forever. wrap=False sidesteps that. Daemon thinking lines
+        # are usually short; long ones get horizontal-scroll, which
+        # is acceptable for a glance-only log.
+        daemon_log = RichLog(
+            id="daemon_log",
+            max_lines=200,
+            markup=True,
+            wrap=False,
+        )
+        # Daemon log is focusable now (the bottom panel went tabbed
+        # and the netrunner needs to be able to focus + magnify the
+        # daemon log just like any other RichLog). Earlier this was
+        # forced can_focus=False because the bottom region wasn't a
+        # focus target at all; that's no longer true.
+        yield daemon_log
+
+    def set_status(self, status: str) -> None:
+        self.status = status
+        style = DAEMON_STATUS_STYLES.get(status, "white")
+        try:
+            self.query_one("#daemon_header", Label).update(
+                f"[b]DAEMON[/b]  [{style}]\\[{status.upper()}][/{style}]"
+            )
+        except Exception:
+            pass
+
+    def write_thinking(self, text: str) -> None:
+        self._write_line(f"[dim]› thinking:[/dim] {text}")
+
+    def write_chat(self, text: str) -> None:
+        self._write_line(f"[b]chat:[/b] {text}")
+
+    def write_action(self, action: dict) -> None:
+        atype = action.get("type", "?")
+        if atype == "spawn":
+            task = action.get("task", "")
+            preview = task if len(task) < 50 else task[:47] + "..."
+            self._write_line(f"[green]+[/green] spawn: {preview}")
+        else:
+            self._write_line(f"[dim]action:[/dim] {action}")
+
+    def write_error(self, text: str) -> None:
+        self._write_line(f"[red]error:[/red] {text}")
+
+    def write_line(self, text: str) -> None:
+        """Generic write to the daemon log, no formatting prefix."""
+        self._write_line(text)
+
+    def _write_line(self, line: str) -> None:
+        try:
+            self.query_one("#daemon_log", RichLog).write(line)
+        except Exception:
+            pass
+
+
+class WatchdogPane(Static, can_focus=False):
+    """Bottom-panel tab for the Watchdog Q&A history.
+
+    Mirror of DaemonPane in shape: small status header on top
+    (showing queue depth + busy state instead of daemon status), big
+    RichLog filling the rest with the back-and-forth Q&A.
+
+    Visual treatment differs from DaemonPane: yellow accent border
+    (vs daemon's accent color) reinforces the soft/loud distinction
+    between `t` (talk-watchdog, casual) and `T` (talk-daemon, loud)
+    even in the panel chrome. Each Q&A pair gets a visual separator
+    so you can scroll back through past questions cleanly."""
+
+    DEFAULT_CSS = """
+    WatchdogPane {
+        height: 1fr;
+        padding: 0 1;
+    }
+    WatchdogPane > #watchdog_header {
+        height: 1;
+    }
+    WatchdogPane > #watchdog_log {
+        height: 1fr;
+        border: round $warning;
+    }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+
+    def compose(self) -> ComposeResult:
+        yield Label(
+            "[b]WATCHDOG[/b]  [dim]\\[IDLE][/dim]",
+            id="watchdog_header",
+        )
+        # wrap=False is deliberate. With wrap=True + min_width=1, when
+        # the watchdog tab is INACTIVE (default — daemon tab is
+        # initial), writes to this log get pre-rendered at the
+        # widget's current width, which is 0 or 1 px until the tab
+        # activates. At width=1, RichLog wraps at 1 character per
+        # line — turning "anything going on?" into eighteen lines of
+        # one character each. The user reported seeing exactly this.
+        # The pre-rendered Strips are cached, so even after the tab
+        # activates and gets a real width, the question stays
+        # character-per-line forever.
+        #
+        # wrap=False sidesteps this: long lines just stay long, and
+        # the netrunner can scroll horizontally. In practice this
+        # doesn't bite because answers come from the model with
+        # paragraph-shaped newlines already in place — wrap was only
+        # going to help for unusual cases where the model returned
+        # one giant line. Worth the trade-off.
+        watchdog_log = RichLog(
+            id="watchdog_log",
+            max_lines=500,
+            markup=True,
+            wrap=False,
+        )
+        yield watchdog_log
+
+    def set_status(self, busy: bool, queue_depth: int) -> None:
+        """Update the header's busy/queue annotation. Three states:
+          - idle (no questions in flight or queued)
+          - thinking (one in flight, none queued)
+          - thinking + N queued (one in flight, N waiting)
+        Dim color when idle; yellow when active."""
+        if not busy and queue_depth == 0:
+            text = "[dim]\\[IDLE][/dim]"
+        elif busy and queue_depth == 0:
+            text = "[yellow]\\[THINKING...][/yellow]"
+        else:
+            text = (
+                f"[yellow]\\[THINKING... · {queue_depth} QUEUED][/yellow]"
+            )
+        try:
+            self.query_one("#watchdog_header", Label).update(
+                f"[b]WATCHDOG[/b]  {text}"
+            )
+        except Exception:
+            pass
+
+    def write_question(self, question: str) -> None:
+        """A new question was submitted. Visual separator + Q line."""
+        self._write_line(
+            f"\n[dim]──────[/dim]  "
+            f"[yellow]Q:[/yellow] {question}"
+        )
+
+    def write_answer(self, answer: str) -> None:
+        """An answer arrived. Multi-paragraph answers get rendered
+        on their own newlines (preserved here, unlike chatlog where
+        they collapse into ¶ glyphs — the dedicated tab has the
+        visual budget for proper paragraph breaks)."""
+        # Normalize line endings; let RichLog wrap naturally.
+        normalized = answer.replace("\r\n", "\n").strip()
+        self._write_line(f"[bold]A:[/bold] {normalized}")
+
+    def write_failure(self, error: str) -> None:
+        """Watchdog returned an error instead of an answer."""
+        self._write_line(f"[red]✗ failed:[/red] {error}")
+
+    def _write_line(self, line: str) -> None:
+        try:
+            self.query_one("#watchdog_log", RichLog).write(line)
+        except Exception:
+            pass
+
+
+class ConstructPane(Static, can_focus=True):
+    """One pane per construct: ID, state badge, current activity, event log.
+
+    Starts in compact mode (header + current activity only, ~3 rows).
+    Focus with Tab/number keys, expand with Enter, kill with k.
+    """
+
+    DEFAULT_CSS = """
+    ConstructPane {
+        border: round $accent;
+        padding: 0 1;
+        height: auto;
+        margin-bottom: 1;
+    }
+    ConstructPane:focus {
+        border: heavy $warning;
+        background: $boost;
+    }
+    ConstructPane > #pane_header {
+        height: 1;
+    }
+    ConstructPane > #pane_current {
+        height: 1;
+        color: $text-muted;
+    }
+    ConstructPane > #pane_log {
+        height: 0;
+        border-top: dashed $panel;
+        margin-top: 0;
+        display: none;
+    }
+    ConstructPane.-expanded > #pane_log {
+        height: 12;
+        margin-top: 1;
+        display: block;
+    }
+    /* Compact mode: terminal-state panes get out of the way. The
+     * activity line vanishes (the construct isn't doing anything
+     * anymore — it's done), the border dims, and we trim the spacing
+     * below. The header remains, and the link chevrons (if any) stay
+     * legible since they're often the most useful info on a finished
+     * pane. Compact panes can still be expanded by Space/Enter; the
+     * existing -expanded rule still applies on top. */
+    ConstructPane.-compact {
+        border: round $panel;
+        margin-bottom: 0;
+        text-style: dim;
+    }
+    ConstructPane.-compact > #pane_current {
+        display: none;
+        height: 0;
+    }
+    ConstructPane.-compact.-expanded > #pane_current {
+        display: block;
+        height: 1;
+    }
+    ConstructPane.-compact:focus {
+        border: heavy $warning;
+        text-style: not dim;
+    }
+    """
+
+    state: reactive[str] = reactive("starting")
+    expanded: reactive[bool] = reactive(False)
+    # Compact mode is set after a construct has been terminal for a
+    # grace period (see CyberdeckApp._compact_terminal_pane). The
+    # watcher just toggles the CSS class — actual moving between
+    # zones is the App's job since panes don't reach into siblings.
+    compact: reactive[bool] = reactive(False)
+
+    def __init__(
+        self,
+        construct_id: str,
+        task: str,
+        injected_from: Optional[str] = None,
+        profile_name: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.construct_id = construct_id
+        self.cd_task = task
+        self.files_written: list[str] = []
+        # Profile name in effect for this construct. Shown as a small
+        # yellow badge in the header so the netrunner can tell at a
+        # glance which steering is active. None or "default" suppresses
+        # the badge — only non-default profiles get visual weight.
+        self.profile_name: Optional[str] = profile_name
+        # Inject linkage. injected_from is set at spawn time when this
+        # construct is a turn-N+1 follow-up of an injected predecessor.
+        # injected_to is set later, when an inject targets THIS construct
+        # and a follow-up spawns from it. Either or both can be set
+        # (chained injects: A → B → C).
+        self.injected_from: Optional[str] = injected_from
+        self.injected_to: Optional[str] = None
+        # Mount-race guard. Textual's mount() is async — yielded
+        # children become query-able after a compositor cycle, not
+        # synchronously. For *fresh* constructs the subprocess startup
+        # gives mount plenty of time to flush. For *resumed* sessions
+        # (inject follow-ups), the server returns events almost
+        # instantly because the conversation is cached, and they can
+        # arrive before our children compose. In that race window,
+        # query_one() raises NoMatches, the fleet listener loop
+        # silently swallows the exception, and the pane appears empty
+        # forever. The buffer absorbs events that hit before mount,
+        # and on_mount flushes them. After mount the buffer stays
+        # empty and add_event writes through directly.
+        self._mounted: bool = False
+        # Pre-mount event queue. Stores 4-tuples of (event_kind,
+        # log_summary, activity_summary, raw) — same shape as the
+        # raw_event_buffer's records minus log_summary because raw
+        # gets re-formatted in render_buffer. on_mount drains this in
+        # order through add_event, which writes through to the Log
+        # AND appends to the buffer. raw is forwarded through.
+        self._pending_events: list[tuple[str, str, Optional[str], Optional[dict]]] = []
+        # Total add_event calls so far. Used as a "did this construct
+        # actually produce anything" signal in the finalize handler.
+        # Zero events from a state=done construct usually means a
+        # corrupted prompt got through and claude bounced silently
+        # (most often: Windows argv mangling on multiline tasks). We
+        # surface this in the pane log so the netrunner sees the
+        # anomaly instead of an inscrutably blank pane.
+        self._event_count: int = 0
+        # Mirror buffer for ExpandModal un-truncated re-render. Stores
+        # tuples of (event_kind, log_summary, raw). raw is the full
+        # stream-json dict when add_event was called with one — the
+        # render_buffer method passes that back through summarize()
+        # with untruncated=True so multi-paragraph thinking blocks
+        # and big tool_result bodies show in full inside the modal,
+        # rather than the same 500-char chop the live pane uses.
+        # raw is None for synthetic events (anomaly markers, file
+        # lists from set_files_written, etc.) — for those the
+        # log_summary already IS the full content (always short),
+        # so the buffer just hands it back as-is.
+        # maxlen mirrors the live Log widget's max_lines so the modal
+        # doesn't show events the live pane has dropped. 200 lines is
+        # plenty for human glance review of a single construct's
+        # session — overflow falls off the front in either view.
+        self._raw_event_buffer: deque = deque(maxlen=200)
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="pane_header")
+        yield Label("", id="pane_current")
+        yield Log(id="pane_log", max_lines=200, highlight=False)
+
+    def on_mount(self) -> None:
+        self._mounted = True
+        self._refresh_header()
+        # Drain any events that arrived during the mount race, in
+        # order. add_event writes directly now that _mounted is True.
+        if self._pending_events:
+            buffered = self._pending_events
+            self._pending_events = []
+            for event_kind, log_summary, activity_summary, raw in buffered:
+                self.add_event(
+                    event_kind,
+                    log_summary,
+                    activity_summary,
+                    raw=raw,
+                )
+
+    def watch_state(self, _old: str, _new: str) -> None:
+        self._refresh_header()
+
+    def watch_expanded(self, _old: bool, new: bool) -> None:
+        self.set_class(new, "-expanded")
+
+    def watch_compact(self, _old: bool, new: bool) -> None:
+        self.set_class(new, "-compact")
+
+    def set_injected_to(self, construct_id: str) -> None:
+        """Mark this pane as having been redirected to a follow-up
+        construct. Refreshes the header so the chevron link appears."""
+        self.injected_to = construct_id
+        self._refresh_header()
+
+    def _refresh_header(self) -> None:
+        style = STATE_STYLES.get(self.state, "white")
+        header = self.query_one("#pane_header", Label)
+        task_preview = self.cd_task if len(self.cd_task) < 60 else self.cd_task[:57] + "..."
+        chev = "▼" if self.expanded else "▶"
+        file_count = (
+            f"  [cyan]→ {len(self.files_written)} file(s)[/cyan]"
+            if self.files_written else ""
+        )
+        # Inject-link annotation. Two arrows because the chain has two
+        # ends and a pane can be on either side (or both, in chained
+        # injects). Outgoing (↪) points at the follow-up; incoming (↩)
+        # points back at the originator. bright_blue matches the
+        # REDIRECTED state color so the relationship reads visually.
+        inject_link = ""
+        if self.injected_to:
+            inject_link += f"  [bright_blue]↪ {self.injected_to}[/bright_blue]"
+        if self.injected_from:
+            inject_link += f"  [bright_blue]↩ {self.injected_from}[/bright_blue]"
+        # Profile badge. Skip when there's no profile or it's the
+        # default — profiles only show up when they actually deviate
+        # from baseline behavior, so the badge is signal not noise.
+        profile_badge = ""
+        if self.profile_name and self.profile_name != "default":
+            profile_badge = f"  [yellow]\\[{self.profile_name}][/yellow]"
+        header.update(
+            f"[dim]{chev}[/dim] [b]{self.construct_id}[/b]  "
+            f"[{style}]\\[{self.state.upper()}][/{style}]"
+            f"{profile_badge}  "
+            f"[dim]{task_preview}[/dim]{file_count}{inject_link}"
+        )
+
+    def add_event(
+        self,
+        event_kind: str,
+        log_summary: str,
+        activity_summary: Optional[str] = None,
+        *,
+        raw: Optional[dict] = None,
+    ) -> None:
+        """Append to the pane's event log and refresh the activity line.
+
+        log_summary feeds the expanded log (verbose, kept full).
+        activity_summary feeds the always-visible "› ..." line. If
+        None, the activity line is left alone (e.g., for events like
+        tool_result that are noise on the activity line — the
+        preceding tool_use was the informative signal).
+
+        raw is the original stream-json dict (or None for synthetic
+        events). When provided, the un-truncated re-render path in
+        render_buffer can pass it back through summarize(untruncated=
+        True) for the ExpandModal. Synthetic events without raw fall
+        through to log_summary verbatim.
+        """
+        # Counted regardless of whether we write through or buffer.
+        # The finalize handler reads this to detect "construct
+        # produced zero events" (an anomaly worth surfacing).
+        self._event_count += 1
+        # Mirror buffer for the ExpandModal. Always append, regardless
+        # of mount state — the modal pulls from the buffer, not the
+        # live Log widget, so even pre-mount events end up in the
+        # un-truncated view.
+        self._raw_event_buffer.append((event_kind, log_summary, raw))
+        # Pre-mount: stash for replay in on_mount. Without this, events
+        # for resumed sessions get silently lost to NoMatches exceptions
+        # on query_one (children aren't composed yet). After mount, this
+        # branch never fires.
+        if not self._mounted:
+            self._pending_events.append(
+                (event_kind, log_summary, activity_summary, raw)
+            )
+            return
+        try:
+            log = self.query_one("#pane_log", Log)
+            log.write_line(f"{event_kind:14s} {log_summary}")
+            if activity_summary is not None:
+                current = self.query_one("#pane_current", Label)
+                preview = (
+                    activity_summary if len(activity_summary) < 120
+                    else activity_summary[:117] + "..."
+                )
+                current.update(f"[dim]›[/dim] {preview}")
+        except Exception:
+            # Defensive: query_one can still fail in edge cases (pane
+            # being torn down, etc.). Don't let one bad write kill the
+            # event stream.
+            pass
+
+    def render_buffer(self, *, untruncated: bool = False) -> list:
+        """Re-render the pane's event buffer as a list of Text objects
+        for the ExpandModal. When untruncated is True, raw events get
+        run back through summarize(untruncated=True) so long thinking
+        blocks and big tool_results show in full. Synthetic events
+        (raw=None) pass through with their log_summary verbatim.
+
+        Returns rich.text.Text instances rather than plain strings so
+        the modal renders consistently with the chatlog provider."""
+        out: list = []
+        for event_kind, log_summary, raw in self._raw_event_buffer:
+            if raw is not None and untruncated:
+                summary = summarize(raw, untruncated=True)
+            else:
+                summary = log_summary
+            out.append(Text(f"{event_kind:14s} {summary}"))
+        return out
+
+    def set_files_written(self, files: list[str]) -> None:
+        """Update the pane with the final list of files this construct
+        created. Also dumps them into the pane log for a clear record.
+
+        These writes go through add_event so the buffer captures them
+        — synthetic event (raw=None) so the un-truncated re-render
+        keeps the same wording. Without buffering, the modal would
+        show every other event but mysteriously skip the file
+        manifest, which is one of the more useful things to see in
+        full."""
+        self.files_written = list(files)
+        self._refresh_header()
+        if files:
+            self.add_event(
+                "files",
+                f"wrote {len(files)}:",
+                activity_summary=None,
+            )
+            for fp in files:
+                # Each file gets its own buffered line — same layout
+                # the live log used to write directly.
+                self.add_event(
+                    "",
+                    f"  • {fp}",
+                    activity_summary=None,
+                )
+
+
+class NewConstructScreen(ModalScreen[Optional[str]]):
+    """Modal prompt for a new construct task. Returns the task string
+    on submit, or None if cancelled."""
+
+    CSS = """
+    NewConstructScreen {
+        align: center middle;
+    }
+    #dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: round $primary;
+    }
+    #dialog > Label {
+        margin-bottom: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("[b]Spawn new construct[/b]  [dim](Esc to cancel)[/dim]")
+            yield Input(placeholder="task for the new construct...", id="task_input")
+
+    def on_mount(self) -> None:
+        self.query_one("#task_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        task = event.value.strip()
+        self.dismiss(task or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class LaunchScreen(ModalScreen[Optional[str]]):
+    """Launch modal triggered by space on a focused list item in the
+    Tools or Files tab. Shows a context line describing what's being
+    launched (profile name, file path), takes a single task input,
+    returns the task string on submit (None on cancel).
+
+    The caller (CyberdeckApp.action_primary) keeps the context object
+    around and composes the full launch — for profiles, that means
+    spawning with profile=ctx_profile; for files, prepending the
+    `FILE: <path>\\n\\n` envelope to the task before spawning. The
+    modal itself is context-agnostic past the header text — it only
+    collects the user's task input.
+
+    Single-input modal, so no Tab dance needed (the LimitsScreen
+    cycle-on-tab fix lives at App level and would handle it for free
+    if we ever add fields)."""
+
+    CSS = """
+    LaunchScreen {
+        align: center middle;
+    }
+    #launch_dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: round $accent;
+    }
+    #launch_dialog > Label {
+        margin-bottom: 1;
+        width: 100%;
+    }
+    #launch_context {
+        color: $accent;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, header_markup: str, context_markup: str) -> None:
+        """header_markup is the bold title line ("Launch with profile",
+        "Launch with file"). context_markup is the highlighted detail
+        — profile name + tier + tool count, or file path + originating
+        construct. Both are markup strings, rendered as Labels."""
+        super().__init__()
+        self.header_markup = header_markup
+        self.context_markup = context_markup
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="launch_dialog"):
+            yield Label(
+                f"[b]{self.header_markup}[/b]  "
+                f"[dim](Esc to cancel)[/dim]"
+            )
+            yield Label(self.context_markup, id="launch_context")
+            yield Input(
+                placeholder="task for the construct...",
+                id="task_input",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#task_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        task = event.value.strip()
+        self.dismiss(task or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TalkDaemonScreen(ModalScreen[Optional[str]]):
+    """Modal prompt for `T` (talk-to-daemon). Single Input field;
+    returns the message string on submit, None on cancel.
+
+    Counterpart to AskWatchdogScreen, deliberately distinct in tone:
+      - Watchdog (`t`, lowercase): informational, async, free, yellow.
+        "What's going on?" — observer query.
+      - Daemon  (`T`, uppercase):  plan-affecting, sync-ish, expensive,
+        green/primary. "Stop spawning fetches; switch to summarizing"
+        — directive input.
+
+    The visual treatment (primary border vs warning) mirrors the soft/
+    loud distinction from the spec's `t` vs `T` design. Color and
+    placeholder text reinforce that what you type here will steer the
+    daemon's plan, not just sit in a question queue.
+
+    Delivery model: messages are stashed on DaemonSession via
+    set_pending_netrunner_message and surface to the daemon at the
+    next outcome turn (same break-point as goal updates). If the
+    netrunner sends multiple messages before the next break, they
+    all stack and get delivered together. Force-push (interrupt
+    in-flight turn) is M5+ — for now the wake event keeps idle
+    delivery prompt.
+
+    A small queue-depth hint shows pending messages (rare — usually
+    zero, occasionally 1-2 if rapid-firing) so the netrunner sees
+    "your message will arrive after these N already-queued ones."
+    """
+
+    CSS = """
+    TalkDaemonScreen {
+        align: center middle;
+    }
+    #talk_dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: round $primary;
+    }
+    #talk_dialog > Label {
+        margin-bottom: 1;
+        width: 100%;
+    }
+    #talk_queue_hint {
+        color: $primary;
+    }
+    #talk_no_session_hint {
+        color: $error;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(
+        self,
+        pending_count: int = 0,
+        session_running: bool = True,
+    ) -> None:
+        super().__init__()
+        self.pending_count = pending_count
+        self.session_running = session_running
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="talk_dialog"):
+            yield Label(
+                "[b]Talk to the Daemon[/b]  "
+                "[dim](Esc to cancel · plan-affecting, sync)[/dim]"
+            )
+            if not self.session_running:
+                # Without a session, there's no daemon to talk TO.
+                # Surface the constraint clearly rather than letting
+                # the netrunner type a message into the void. They
+                # can still submit — the message gets dropped; we'll
+                # tell them so post-submit too.
+                yield Label(
+                    "[b red]No daemon session is currently running.[/b red]  "
+                    "Press [b]e[/b] to set a goal and start one — your "
+                    "message will be lost if you submit now.",
+                    id="talk_no_session_hint",
+                )
+            elif self.pending_count > 0:
+                hint = (
+                    f"[dim]queue:[/dim] {self.pending_count} message(s) "
+                    "already pending delivery to the daemon — yours "
+                    "joins them at the next natural break."
+                )
+                yield Label(hint, id="talk_queue_hint")
+            yield Input(
+                placeholder=(
+                    "course-correct, ask, or add context — "
+                    "the daemon weighs this on its next turn..."
+                ),
+                id="message_input",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#message_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        message = event.value.strip()
+        self.dismiss(message or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class AskWatchdogScreen(ModalScreen[Optional[str]]):
+    """Modal prompt for `t` (talk-to-watchdog). Single Input field;
+    returns the question string on submit, None on cancel.
+
+    Distinct from a daemon chat (`T`, future) by gravity — `t` is
+    informational, async, free; `T` is plan-affecting, sync, expensive.
+    The visual treatment is intentionally low-key (yellow accent vs
+    daemon's green) to reinforce the "casual, not load-bearing"
+    framing.
+
+    A small queue-depth hint shows when there are already questions
+    in flight so the netrunner knows "your question goes behind 2
+    others" without having to peek at the chatlog. If queue is empty
+    the hint is suppressed — no point telling them nothing's queued.
+    """
+
+    CSS = """
+    AskWatchdogScreen {
+        align: center middle;
+    }
+    #ask_dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: round $warning;
+    }
+    #ask_dialog > Label {
+        margin-bottom: 1;
+        width: 100%;
+    }
+    #ask_queue_hint {
+        color: $warning;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, queue_depth: int = 0, busy: bool = False) -> None:
+        super().__init__()
+        self.queue_depth = queue_depth
+        self.busy = busy
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ask_dialog"):
+            yield Label(
+                "[b]Ask the Watchdog[/b]  "
+                "[dim](Esc to cancel · async, informational)[/dim]"
+            )
+            # Queue-depth hint only renders when relevant. Computing
+            # the wording here keeps the compose method declarative
+            # and avoids a watch_*-style update later.
+            ahead = self.queue_depth + (1 if self.busy else 0)
+            if ahead > 0:
+                hint = (
+                    f"[dim]queue:[/dim] {ahead} question(s) ahead of "
+                    "yours — your answer arrives in the chatlog when "
+                    "they finish."
+                )
+                yield Label(hint, id="ask_queue_hint")
+            yield Input(
+                placeholder=(
+                    "what's cx-A doing? did the daemon respawn anything? ..."
+                ),
+                id="question_input",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#question_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        question = event.value.strip()
+        self.dismiss(question or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class GoalSetScreen(ModalScreen[Optional[str]]):
+    """Modal prompt for setting (or replacing) the daemon's goal.
+    Returns the goal text on submit, or None if cancelled."""
+
+    CSS = """
+    GoalSetScreen {
+        align: center middle;
+    }
+    #goal_dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: round $primary;
+    }
+    #goal_dialog > Label {
+        margin-bottom: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, current_goal: str = "", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.current_goal = current_goal
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="goal_dialog"):
+            title = "Edit goal" if self.current_goal else "Set goal"
+            yield Label(f"[b]{title}[/b]  [dim](Esc to cancel, Enter to commit)[/dim]")
+            yield Input(
+                value=self.current_goal,
+                placeholder="what should the daemon do?",
+                id="goal_input",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#goal_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        goal = event.value.strip()
+        self.dismiss(goal or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class InjectScreen(ModalScreen[Optional[tuple[str, str, str]]]):
+    """Compose-and-deliver modal for injection into a focused construct.
+    Returns (mode, message, construct_id) on submit, or None on cancel.
+
+    Mode is 'queue' or 'interrupt'. The opener pre-selects mode based on
+    which key was pressed (q vs Q); inside the modal, `f` flips mode if
+    the netrunner changes their mind mid-thought, matching the spec's
+    soft/loud convention.
+
+    The construct_id is threaded through the result so the handler can
+    target the *original* construct that was focused at modal-open time.
+    Re-reading focus after dismiss is wrong: focus may move while the
+    modal is up (a finalize event auto-focuses the next pane, the user
+    Tabs while typing, etc.) and the inject would land on the wrong
+    construct."""
+
+    CSS = """
+    InjectScreen {
+        align: center middle;
+    }
+    #inject_dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: round $primary;
+    }
+    #inject_dialog > Label {
+        margin-bottom: 1;
+        width: 100%;
+        height: auto;
+    }
+    #inject_mode_label {
+        text-style: bold;
+    }
+    #inject_target_label {
+        color: $text-muted;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+        # No F-key flip-mode binding here. The Input child widget grabs
+        # all alphabetic keys for text entry, so a Binding on 'f' would
+        # never fire — the user's 'f' would just type the letter into
+        # the message. q/Q already pre-select the mode at modal-open
+        # time; flipping mid-modal is a feature nobody needs.
+    ]
+
+    def __init__(
+        self,
+        construct_id: str,
+        construct_task: str,
+        mode: str = "queue",
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.construct_id = construct_id
+        self.construct_task = construct_task
+        # Validate mode; fall back to queue if caller passed garbage
+        self.mode = mode if mode in ("queue", "interrupt") else "queue"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="inject_dialog"):
+            yield Label(self._mode_label_text(), id="inject_mode_label")
+            yield Label(
+                f"target: [b]{self.construct_id}[/b]  "
+                f"[dim]({self._task_preview()})[/dim]",
+                id="inject_target_label",
+            )
+            yield Input(
+                placeholder="message to inject...",
+                id="inject_input",
+            )
+            yield Label(
+                "[b]Enter[/b] send  ·  [b]Esc[/b] cancel",
+            )
+
+    def _task_preview(self) -> str:
+        return (
+            self.construct_task[:50] + "..."
+            if len(self.construct_task) > 50
+            else self.construct_task
+        )
+
+    def _mode_label_text(self) -> str:
+        if self.mode == "interrupt":
+            return (
+                "[red b]INTERRUPT-INJECT[/red b]  "
+                "[dim](kill current work, redirect with new message)[/dim]"
+            )
+        return (
+            "[yellow b]QUEUE-INJECT[/yellow b]  "
+            "[dim](deliver at next natural break)[/dim]"
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#inject_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        message = event.value.strip()
+        if not message:
+            self.dismiss(None)
+            return
+        # Include the originally-targeted construct_id so the handler
+        # doesn't have to re-derive it from focus (which may have
+        # shifted while the modal was up).
+        self.dismiss((self.mode, message, self.construct_id))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class LimitsScreen(ModalScreen[Optional[dict]]):
+    """View and adjust runtime caps for the active session.
+
+    Returns a dict of {field_name: new_value} on submit, or None on
+    cancel. Caller applies the changes.
+
+    v1 scope: user-triggered viewer/adjuster only. Pause-on-cap-hit
+    behavior (auto-open + resume semantics) is deferred until the
+    daemon grows a 'paused' state — that bleeds into goal-edit
+    territory which we're holding off on. For now: user presses `l`,
+    sees current caps, adjusts what they want, accepts. If the
+    fleet has ALREADY hit a cap and halted, raising the cap won't
+    auto-restart the session — they need to set a new goal."""
+
+    CSS = """
+    LimitsScreen {
+        align: center middle;
+    }
+    #limits_dialog {
+        width: 70;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: round $primary;
+    }
+    #limits_dialog > Label {
+        margin-bottom: 1;
+        width: 100%;
+        height: auto;
+    }
+    #limits_title {
+        text-style: bold;
+    }
+    .limits_row {
+        height: 3;
+        margin-bottom: 0;
+    }
+    .limits_row > Label {
+        width: 32;
+        height: 3;
+        content-align: left middle;
+    }
+    .limits_row > Input {
+        width: 16;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+        Binding("ctrl+s", "submit", "Save", show=True),
+    ]
+
+    def __init__(
+        self,
+        max_concurrent: int,
+        max_total_spawns: int,
+        current_live: int,
+        current_spawned: int,
+        cost_so_far: float,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.initial_max_concurrent = max_concurrent
+        self.initial_max_total_spawns = max_total_spawns
+        self.current_live = current_live
+        self.current_spawned = current_spawned
+        self.cost_so_far = cost_so_far
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="limits_dialog"):
+            yield Label("[b]LIMITS[/b]", id="limits_title")
+            yield Label(
+                f"Currently: [cyan]{self.current_live}[/cyan] live  ·  "
+                f"[cyan]{self.current_spawned}[/cyan] total spawned  ·  "
+                f"[cyan]${self.cost_so_far:.4f}[/cyan] cost"
+            )
+            yield Label(
+                "[dim]Adjust caps below. Tab between fields, Enter or "
+                "Ctrl+S to save, Esc to cancel.[/dim]"
+            )
+            with Horizontal(classes="limits_row"):
+                yield Label("max concurrent constructs:")
+                yield Input(
+                    value=str(self.initial_max_concurrent),
+                    id="input_max_concurrent",
+                    # type="integer" restricts keystrokes to digits +
+                    # optional leading minus. Editing keys (backspace,
+                    # arrows, home/end, etc.) still work. Saves us
+                    # from having to validate in action_submit() —
+                    # bad input can't be entered in the first place.
+                    type="integer",
+                )
+            with Horizontal(classes="limits_row"):
+                yield Label("max total spawns this session:")
+                yield Input(
+                    value=str(self.initial_max_total_spawns),
+                    id="input_max_total_spawns",
+                    type="integer",
+                )
+            yield Label(
+                "[dim]Hard ceiling on max_concurrent is 9 (matches "
+                "the keymap's number-key real estate). Setting "
+                "max_total_spawns to 0 means 'no spawn cap' — "
+                "use with caution.[/dim]"
+            )
+
+    def on_mount(self) -> None:
+        # Focus the first input so user can immediately type/edit
+        try:
+            self.query_one("#input_max_concurrent", Input).focus()
+        except Exception:
+            pass
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter on any input commits all values
+        self.action_submit()
+
+    def action_submit(self) -> None:
+        """Parse inputs, validate, return dict of updates to apply.
+        On any parse/validation error, reject silently (caller leaves
+        state untouched). Defensive design — bad input shouldn't
+        break the modal."""
+        try:
+            mc_str = self.query_one("#input_max_concurrent", Input).value.strip()
+            mts_str = self.query_one("#input_max_total_spawns", Input).value.strip()
+            mc = int(mc_str)
+            mts = int(mts_str)
+        except (ValueError, AttributeError):
+            # Bad input — toast back via dismissal of None. Caller
+            # will treat as cancel; user can re-open if desired.
+            self.dismiss(None)
+            return
+
+        # Apply hard ceiling on max_concurrent (spec: 9 max).
+        # Below 1 makes no sense either.
+        if mc < 1:
+            mc = 1
+        if mc > 9:
+            mc = 9
+        # max_total_spawns: 0 means "no cap" (a legitimate choice);
+        # negatives are nonsense.
+        if mts < 0:
+            mts = 0
+
+        self.dismiss({
+            "max_concurrent": mc,
+            "max_total_spawns": mts,
+        })
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class KeybindsScreen(ModalScreen[None]):
+    """Modal overlay displaying the full keybinds map. Triggered by `?`.
+    Lives in the netrunner's pocket: any time you forget a key, ? brings
+    it up. Esc dismisses."""
+
+    CSS = """
+    KeybindsScreen {
+        align: center middle;
+    }
+    #keybinds_dialog {
+        width: 90;
+        height: auto;
+        max-height: 90%;
+        padding: 1 2;
+        background: $panel;
+        border: round $accent;
+    }
+    #keybinds_dialog > Label {
+        margin-bottom: 1;
+    }
+    /* Scroll container for the body — when content exceeds dialog
+       max-height (e.g. on smaller terminals or after future
+       additions), the body scrolls instead of clipping the bottom
+       sections. Today's content fits without scrolling, but this
+       prevents the regression we just hit. */
+    #keybinds_scroll {
+        height: 1fr;
+        max-height: 100%;
+    }
+    #keybinds_body {
+        height: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close", show=True),
+        Binding("question_mark", "dismiss", "Close", show=False),
+        Binding("space", "dismiss", "Close", show=False),
+    ]
+
+    # Static map of bindings. Kept here (rather than auto-derived from
+    # CyberdeckApp.BINDINGS) because the spec wants logical grouping and
+    # human-readable descriptions, not a mechanical key dump.
+    # Sections shown in the help modal. Slimmed to what actually
+    # works today — stubbed bindings (t/T/E/c/Shift+C/p/r/f, plus N
+    # invisible-spawn) are intentionally NOT listed here. They reappear
+    # when their action lands, not before — listing them as if they
+    # work makes the modal lie to the netrunner. Esc/Enter are listed
+    # in NAVIGATION/PRIMARY rather than getting their own MODAL section
+    # since they behave the same in modals as everywhere else.
+    SECTIONS = [
+        ("NAVIGATION", [
+            ("w / s", "Scroll focused widget up / down. Pauses "
+                      "auto-follow on scroll-up; resumes at bottom."),
+            ("a / d", "Scroll focused widget left / right "
+                      "(when content overflows)."),
+            ("W / S", "Walk focus up / down within current section."),
+            ("A / D", "Cross sections (sidebar ↔ main ↔ right)."),
+            ("Tab / Shift+Tab", "Cycle focus within current section."),
+            ("1–9 / Ctrl+1–9", "Jump to element N in section / "
+                                "construct N globally."),
+            ("Esc", "Unfocus / cancel modal."),
+        ]),
+        ("PRIMARY", [
+            ("Space", "Primary interact with focused element "
+                      "(pane expand toggle, goal edit, future: "
+                      "list-item launch)."),
+            ("z", "Zoom focused widget — fullscreen reader with "
+                   "un-truncated content."),
+            ("Enter", "Submit / accept (universal in modals)."),
+        ]),
+        ("CONSTRUCTS", [
+            ("n", "Spawn new construct."),
+            ("k / K", "Soft-kill / hard-kill focused construct."),
+            ("q / Q", "Queue-inject / interrupt-inject focused "
+                      "construct."),
+        ]),
+        ("RUN CONTROL", [
+            ("e", "Edit / set goal."),
+            ("l", "Open Limits modal."),
+            ("Ctrl+F", "EJECT — emergency halt with confirm modal."),
+            ("Ctrl+Q", "Quit."),
+            ("?", "Show / dismiss this help."),
+        ]),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="keybinds_dialog"):
+            yield Label("[b]CYBERDECK KEYBINDS[/b]  [dim](Esc / ? / Space to close)[/dim]")
+            with VerticalScroll(id="keybinds_scroll"):
+                yield Static(self._build_keybinds_text(), id="keybinds_body")
+
+    def _build_keybinds_text(self) -> str:
+        lines = []
+        for section, entries in self.SECTIONS:
+            lines.append(f"[b]{section}[/b]")
+            for key, desc in entries:
+                # Pad keys to consistent width for readability
+                lines.append(f"  [cyan]{key:<22s}[/cyan] {desc}")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    def action_dismiss(self) -> None:
+        self.dismiss(None)
+
+
+class EjectScreen(ModalScreen[bool]):
+    """Deliberate-consent modal for EJECT. Two-step confirmation with a
+    visible countdown: open with Ctrl+F, confirm with Space within
+    the window, or Esc / timeout to cancel harmlessly.
+
+    Returns True if confirmed, False otherwise."""
+
+    CSS = """
+    EjectScreen {
+        align: center middle;
+    }
+    #eject_dialog {
+        width: 60;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: heavy $error;
+    }
+    #eject_dialog > Label {
+        margin-bottom: 1;
+        /* Width: 100% lets the label fill the dialog; height: auto
+         * lets it grow vertically when text wraps. Without these,
+         * a long line just clips at the right edge. */
+        width: 100%;
+        height: auto;
+    }
+    #eject_title {
+        color: $error;
+        text-style: bold;
+    }
+    #eject_countdown {
+        color: $warning;
+    }
+    """
+
+    BINDINGS = [
+        Binding("space", "confirm", "Confirm EJECT", show=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    # How long the user has to confirm before the modal auto-cancels.
+    # Long enough to be deliberate, short enough that an accidental
+    # Ctrl+F doesn't leave a lingering modal.
+    CONFIRM_WINDOW_SECS = 3.0
+
+    # Refresh interval for the countdown bar. Smooth-ish without being
+    # a CPU drain.
+    TICK_INTERVAL_SECS = 0.05
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="eject_dialog"):
+            yield Label("⚠  EJECT CONFIRMATION  ⚠", id="eject_title")
+            yield Label(
+                "This will SIGKILL every running construct, halt the daemon, "
+                "and write a postmortem snapshot to disk.\n"
+                "There is no resume.",
+            )
+            yield Label("", id="eject_countdown")
+            yield Label(
+                "[b]SPACE[/b] to confirm  ·  [b]ESC[/b] to cancel",
+            )
+
+    def on_mount(self) -> None:
+        self._elapsed = 0.0
+        self._tick_timer = self.set_interval(
+            self.TICK_INTERVAL_SECS, self._tick
+        )
+        self._refresh_countdown()
+
+    def _tick(self) -> None:
+        self._elapsed += self.TICK_INTERVAL_SECS
+        if self._elapsed >= self.CONFIRM_WINDOW_SECS:
+            self._tick_timer.stop()
+            self.dismiss(False)
+            return
+        self._refresh_countdown()
+
+    def _refresh_countdown(self) -> None:
+        remaining = max(0.0, self.CONFIRM_WINDOW_SECS - self._elapsed)
+        # 20-cell progress bar showing time remaining (drains as time elapses)
+        cell_count = 20
+        filled = int(round(cell_count * remaining / self.CONFIRM_WINDOW_SECS))
+        bar = "█" * filled + "░" * (cell_count - filled)
+        try:
+            self.query_one("#eject_countdown", Label).update(
+                f"[red]{bar}[/red]  [dim]{remaining:.1f}s remaining[/dim]"
+            )
+        except Exception:
+            pass
+
+    def action_confirm(self) -> None:
+        if hasattr(self, "_tick_timer"):
+            self._tick_timer.stop()
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        if hasattr(self, "_tick_timer"):
+            self._tick_timer.stop()
+        self.dismiss(False)
+
+
+class EjectedScreen(ModalScreen[str]):
+    """Post-EJECT screen. Shows the snapshot path and offers two ways
+    out: return to idle (cleanup, stay alive) or quit entirely.
+
+    Returns 'idle' or 'quit' to indicate the netrunner's choice."""
+
+    CSS = """
+    EjectedScreen {
+        align: center middle;
+    }
+    #ejected_dialog {
+        width: 70;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: heavy $error;
+    }
+    #ejected_dialog > Label {
+        margin-bottom: 1;
+        width: 100%;
+        height: auto;
+    }
+    #ejected_title {
+        color: $error;
+        text-style: bold;
+    }
+    #ejected_path {
+        color: $text-muted;
+    }
+    """
+
+    BINDINGS = [
+        Binding("i", "return_idle", "Return to idle", show=True),
+        Binding("q", "quit_app", "Quit", show=True),
+        # Esc as alias for "return to idle" — the gentler default
+        Binding("escape", "return_idle", "", show=False),
+    ]
+
+    def __init__(self, snapshot_path: Optional[Path], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.snapshot_path = snapshot_path
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ejected_dialog"):
+            yield Label("◆  EJECTED  ◆", id="ejected_title")
+            yield Label(
+                "All constructs killed. Daemon halted. Fleet drained."
+            )
+            if self.snapshot_path is not None:
+                yield Label(
+                    f"Snapshot: {self.snapshot_path}",
+                    id="ejected_path",
+                )
+            else:
+                yield Label(
+                    "[red]Snapshot write failed (see fleet log)[/red]",
+                    id="ejected_path",
+                )
+            yield Label(
+                "[b]I[/b] return to idle  ·  [b]Q[/b] quit",
+            )
+
+    def action_return_idle(self) -> None:
+        self.dismiss("idle")
+
+    def action_quit_app(self) -> None:
+        self.dismiss("quit")
+
+
+class ExpandModal(ModalScreen[None]):
+    """A near-fullscreen reader for any RichLog-shaped widget on the deck.
+
+    Triggered by pressing space while focused on an "expandable" log
+    (chatlog, files, tools, fleet log, pane logs). Takes a SNAPSHOT of
+    the source widget's content at open time and renders it in a
+    larger, comfortably-readable surface so long log lines that get
+    chopped off in a narrow panel are readable in full.
+
+    Snapshot, not live mirror — the modal doesn't keep updating as new
+    events arrive. Press `r` inside to refresh from the live source,
+    or close + reopen. This keeps the implementation simple (no event
+    routing, no listener bookkeeping) and matches the netrunner's
+    intent: open the modal to READ something, not to monitor.
+    """
+
+    CSS = """
+    ExpandModal {
+        align: center middle;
+    }
+    #expand_dialog {
+        width: 90%;
+        height: 90%;
+        padding: 1 2;
+        background: $panel;
+        border: round $accent;
+    }
+    #expand_title {
+        height: 1;
+        margin-bottom: 1;
+        color: $accent;
+    }
+    #expand_hint {
+        height: 1;
+        margin-top: 1;
+        color: $text-muted;
+    }
+    #expand_body {
+        height: 1fr;
+        background: $surface;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close", show=True),
+        # `z` toggles the modal — same key opens it (action_expand on
+        # the App), pressing again closes. Mirrors the muscle memory.
+        Binding("z", "dismiss", "Close", show=False),
+        Binding("r", "refresh", "Refresh", show=True),
+        # Scroll inside the body. The App's own w/s bindings don't
+        # reach here because modal screens are exclusive — keys go
+        # to the modal's BINDINGS first. Without these, the modal
+        # was a dead-end for keyboard-only readers (esp. on long
+        # files via the file viewer). w/s line-scroll, PgUp/PgDn
+        # page, Home/End jump.
+        Binding("w", "scroll_up",       "↑",        show=False),
+        Binding("s", "scroll_down",     "↓",        show=False),
+        Binding("pageup", "page_up",    "Page ↑",   show=False),
+        Binding("pagedown", "page_down","Page ↓",   show=False),
+        Binding("home", "scroll_top",   "Top",      show=False),
+        Binding("end", "scroll_bottom", "Bottom",   show=False),
+    ]
+
+    def __init__(
+        self,
+        title: str,
+        snapshot_lines: list,
+        source_widget_id: Optional[str] = None,
+        provider: Optional["Callable[[], list]"] = None,
+    ) -> None:
+        super().__init__()
+        self.title_text = title
+        # The snapshot is a list of pre-rendered lines. Each entry can
+        # be either:
+        #   - a markup string (from chatlog provider): RichLog parses
+        #     [color]...[/color] tags and renders styled.
+        #   - a rich.text.Text object (from _snapshot_richlog): RichLog
+        #     renders with the embedded Style info — preserves the
+        #     original colors of fleet_log entries, the green daemon
+        #     pane, etc.
+        # RichLog.write() accepts both. The modal doesn't have to
+        # disambiguate.
+        #
+        # Two refresh paths:
+        #   1. provider — a closure that re-renders content from
+        #      source-of-truth (e.g. chatlog event buffer with
+        #      untruncated=True). Takes precedence on refresh.
+        #   2. source_widget_id — a registered RichLog id we can
+        #      re-snapshot from at refresh time. Used for widgets
+        #      whose displayed content IS the truth (fleet_log,
+        #      files_list, tools_list — formatted in-place).
+        # If neither is set, refresh is a no-op.
+        self.snapshot_lines = snapshot_lines
+        self.source_widget_id = source_widget_id
+        self.provider = provider
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="expand_dialog"):
+            yield Label(f"[b]{self.title_text}[/b]", id="expand_title")
+            yield RichLog(
+                id="expand_body",
+                max_lines=10000,
+                # markup=True so chatlog color spans render in the
+                # modal too (the live chatlog uses markup; provider-
+                # rendered lines pass through with their markup intact).
+                # Snapshots from non-chatlog widgets contain plain
+                # text only — markup=True passes those through fine.
+                markup=True,
+                wrap=True,
+                # Big min_width so even short lines lay out without the
+                # one-char-per-row pathology. The modal is wide enough
+                # that this is always honored, never floor-clamped.
+                min_width=40,
+                auto_scroll=False,
+            )
+            yield Label(
+                "[dim]Esc / z close · r refresh · w/s scroll · "
+                "PgUp/PgDn page[/dim]",
+                id="expand_hint",
+            )
+
+    def on_mount(self) -> None:
+        self._populate()
+
+    # ---- scroll actions -----------------------------------------------
+    # All scroll actions target #expand_body (the inner RichLog).
+    # Best-effort guards because the body might not exist if the modal
+    # is mid-mount or torn down — we'd rather no-op than crash on a
+    # late keypress.
+
+    def _body(self) -> Optional[RichLog]:
+        try:
+            return self.query_one("#expand_body", RichLog)
+        except Exception:
+            return None
+
+    def action_scroll_up(self) -> None:
+        b = self._body()
+        if b is not None:
+            b.scroll_up(animate=False)
+
+    def action_scroll_down(self) -> None:
+        b = self._body()
+        if b is not None:
+            b.scroll_down(animate=False)
+
+    def action_page_up(self) -> None:
+        b = self._body()
+        if b is not None:
+            b.scroll_page_up(animate=False)
+
+    def action_page_down(self) -> None:
+        b = self._body()
+        if b is not None:
+            b.scroll_page_down(animate=False)
+
+    def action_scroll_top(self) -> None:
+        b = self._body()
+        if b is not None:
+            b.scroll_home(animate=False)
+
+    def action_scroll_bottom(self) -> None:
+        b = self._body()
+        if b is not None:
+            b.scroll_end(animate=False)
+
+    def action_refresh(self) -> None:
+        """Re-fetch content. Uses the provider if registered (re-renders
+        from raw source), else re-snapshots from the named widget,
+        else no-op."""
+        if self.provider is not None:
+            try:
+                self.snapshot_lines = self.provider()
+            except Exception:
+                pass
+            self._populate()
+            return
+        if self.source_widget_id is None or self.app is None:
+            return
+        try:
+            source = self.app.query_one(
+                f"#{self.source_widget_id}", RichLog
+            )
+        except Exception:
+            return
+        self.snapshot_lines = _snapshot_richlog(source)
+        self._populate()
+
+    def _populate(self) -> None:
+        """Render the current snapshot into the modal's body."""
+        try:
+            body = self.query_one("#expand_body", RichLog)
+        except Exception:
+            return
+        body.clear()
+        for line in self.snapshot_lines:
+            body.write(line)
+
+
+def _snapshot_richlog(widget) -> list:
+    """Pull the visible content out of a log widget into a list of
+    renderables suitable for write to another RichLog. Used by
+    ExpandModal at open time and on refresh.
+
+    Returns a list of `rich.text.Text` objects (NOT plain strings) so
+    style information from the source widget is preserved when
+    rendered in the modal. RichLog.write accepts both str and Rich
+    renderables; Text objects render as-styled, no markup re-parse
+    needed.
+
+    Two source-widget shapes are handled:
+      - RichLog: widget.lines is list[Strip], each Strip iterates
+        Segments with .text + .style. We append each segment to a
+        Text object preserving its Style → modal shows original
+        colors/styles intact.
+      - Log: widget.lines is list[str] (no styling exists on these).
+        Wrapped in plain Text with no style.
+
+    The two-shape support lets the same helper work for the
+    ConstructPane inner pane_log (a Log) and any focusable RichLog
+    (chatlog, fleet_log, files_list, tools_list)."""
+    out: list = []
+    for line in widget.lines:
+        if isinstance(line, str):
+            # Log widget — plain text, no style to preserve.
+            out.append(Text(line.rstrip()))
+            continue
+        # RichLog Strip — collapse segments into a styled Text. Each
+        # segment carries text + a Style; we append both to keep the
+        # original color/bold/dim info that the live widget shows.
+        text_obj = Text()
+        try:
+            for seg in line:
+                text_obj.append(seg.text, style=seg.style or "")
+        except (AttributeError, TypeError):
+            # Defensive fallback if Textual changes Strip's iteration
+            # contract — better something readable than a crash.
+            text_obj = Text(str(line).rstrip())
+        # Trim trailing whitespace from the end of the line.
+        text_obj.rstrip()
+        out.append(text_obj)
+    return out
+
+
+class CyberdeckApp(App):
+    """M3 TUI: keyboard-driven cyberdeck over the fleet."""
+
+    # How long a pane stays in its full state after entering a terminal
+    # state before getting compacted and pushed to the bottom. Long
+    # enough for a glance at the final result; short enough that the
+    # netrunner's active pane list stays uncluttered. Tweakable; not
+    # currently surfaced as a CLI flag because no one will ever touch it.
+    COMPACT_DELAY_SECS = 3.0
+
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+    #top_area {
+        layout: horizontal;
+        height: 1fr;
+    }
+    #sidebar {
+        width: 32;
+        background: $panel;
+        border-right: solid $primary;
+        padding: 1;
+    }
+    #sidebar_info {
+        margin-bottom: 1;
+    }
+    #sidebar_log_label {
+        margin-top: 1;
+    }
+    #fleet_log {
+        height: 1fr;
+        margin-top: 1;
+    }
+    #main {
+        padding: 1;
+        width: 1fr;
+    }
+    #right_panel {
+        width: 34;
+        background: $panel;
+        border-left: solid $primary;
+        padding: 0 1;
+    }
+    #right_panel TabbedContent {
+        height: 1fr;
+    }
+    #files_list, #tools_list, #chatlog_log {
+        height: 1fr;
+        padding: 0 1;
+    }
+    #daemon_bar {
+        height: 11;
+        border-top: solid $primary;
+        background: $panel;
+        padding: 0 1;
+    }
+    /* Right-panel content lists (Chatlog / Files / Tools) get a heavy
+     * border when focused so the netrunner can clearly see they're "in"
+     * the panel. WASD or Tab navigation lands focus here directly. */
+    #files_list:focus, #tools_list:focus, #chatlog_log:focus {
+        border: heavy $warning;
+    }
+    /* Bottom-panel logs get the same treatment so the focus state
+     * reads the same across the deck. */
+    #daemon_log:focus, #watchdog_log:focus {
+        border: heavy $warning;
+    }
+    """
+
+    BINDINGS = [
+        # Quit. ctrl+q is plenty — we don't need a redundant ctrl+c
+        # (which historically maps to SIGINT in shells; the deck
+        # interprets it the same as ctrl+q if anyone wires it back,
+        # but having one canonical quit key reduces footer clutter).
+        Binding("ctrl+q", "quit", "Quit"),
+
+        # EJECT — emergency halt with deliberate-consent confirmation.
+        # Priority so it fires even if some other binding would consume
+        # Ctrl+F. The modal it opens still requires a deliberate confirm.
+        Binding("ctrl+f", "open_eject", "EJECT", show=False, priority=True),
+
+        # Section nav (WASD, no wrap)
+        # WASD navigation (no wrap). The model:
+        #   w / a / s / d — "act on what you have." Lowercase keys
+        #     work WITHIN the focused widget. On a RichLog: scroll up/
+        #     down/left/right by line/column. On a list (future
+        #     C1g.2/3): step between items. On a ConstructPane: scroll
+        #     its inner pane_log. The most common navigation verb in
+        #     normal use, so it gets the easy keys.
+        #   W / A / S / D — "go somewhere else." Uppercase keys MOVE
+        #     focus. W/S walks prev/next focusable in the current
+        #     section. A/D crosses sections horizontally
+        #     (sidebar ↔ main ↔ right_panel). The amplifier metaphor:
+        #     shift = bigger leap.
+        #
+        # Capital letters not "shift+w" because (a) it matches the
+        # existing Q/K/T pattern and (b) it's a single keycode for
+        # eventual custom-hardware input scenarios where there's no
+        # modifier-state to track.
+        Binding("w", "scroll_up",     "↑ in",       show=False),
+        Binding("a", "scroll_left",   "← in",       show=False),
+        Binding("s", "scroll_down",   "↓ in",       show=False),
+        Binding("d", "scroll_right",  "→ in",       show=False),
+        Binding("W", "list_up",       "↑ focus",    show=False),
+        Binding("A", "section_left",  "← section",  show=False),
+        Binding("S", "list_down",     "↓ focus",    show=False),
+        Binding("D", "section_right", "→ section",  show=False),
+
+        # Focus cycle within section
+        # Focus cycle within section. Priority so Textual's built-in
+        # focus traversal (which would walk into TabbedContent's tab
+        # buttons) doesn't eat the keypress before us.
+        Binding("tab", "focus_next_in_section", "Next", show=False, priority=True),
+        Binding("shift+tab", "focus_prev_in_section", "Prev", show=False, priority=True),
+
+        # Element jump within section
+        Binding("1", "jump(1)", show=False),
+        Binding("2", "jump(2)", show=False),
+        Binding("3", "jump(3)", show=False),
+        Binding("4", "jump(4)", show=False),
+        Binding("5", "jump(5)", show=False),
+        Binding("6", "jump(6)", show=False),
+        Binding("7", "jump(7)", show=False),
+        Binding("8", "jump(8)", show=False),
+        Binding("9", "jump(9)", show=False),
+
+        # Global construct jump (Ctrl+1-9)
+        Binding("ctrl+1", "jump_construct(1)", show=False),
+        Binding("ctrl+2", "jump_construct(2)", show=False),
+        Binding("ctrl+3", "jump_construct(3)", show=False),
+        Binding("ctrl+4", "jump_construct(4)", show=False),
+        Binding("ctrl+5", "jump_construct(5)", show=False),
+        Binding("ctrl+6", "jump_construct(6)", show=False),
+        Binding("ctrl+7", "jump_construct(7)", show=False),
+        Binding("ctrl+8", "jump_construct(8)", show=False),
+        Binding("ctrl+9", "jump_construct(9)", show=False),
+
+        # Primary actions
+        #   space — primary "interact" with focused element. Today:
+        #     toggles ConstructPane expand/collapse, edits goal pane.
+        #     Once C1g.4 lands, it'll also launch a construct from a
+        #     focused list item (Tools/Files).
+        #   z — universal "zoom focused widget." Opens ExpandModal on
+        #     any RichLog or routes to the inner pane_log when a
+        #     ConstructPane is focused. Single-keycode (works in every
+        #     terminal, GPIO-friendly) — we tried shift+space but most
+        #     terminals don't transmit a distinct shift+space event,
+        #     so it was a no-op for the netrunner even though it
+        #     worked in synthetic pilot tests.
+        Binding("space", "primary", "Primary"),
+        Binding("enter", "primary", "", show=False),
+        Binding("z", "expand", "Zoom", show=False),
+        Binding("escape", "unfocus", "Unfocus", show=False),
+
+        # Construct interaction (soft/loud pairs)
+        Binding("q", "queue_inject", "Q-inject", show=False),
+        Binding("Q", "interrupt_inject", "I-inject", show=False),
+        Binding("k", "kill_focused", "Kill"),
+        Binding("K", "hard_kill_focused", "Hard-kill", show=False),
+
+        # Daemon / goal
+        Binding("t", "talk_watchdog", "Ask", show=False),
+        Binding("T", "talk_daemon", "Talk", show=False),
+        Binding("e", "edit_goal", "Goal"),
+        Binding("E", "toggle_daemon_pause", "Pause", show=False),
+
+        # Spawn (visible/invisible pair)
+        Binding("n", "new_construct", "New"),
+        Binding("N", "new_construct_invisible", "New(inv)", show=False),
+
+        # Routing / wiring
+        Binding("r", "wire_route", "Wire", show=False),
+
+        # Plugins / tools
+        Binding("c", "plugin_quickfire", "Capture", show=False),
+        Binding("C", "plugin_picker", "", show=False),
+        Binding("p", "toggle_airgap", "Airgap", show=False),
+        Binding("l", "open_limits", "Limits", show=False),
+
+        # Help / keybinds overlay
+        Binding("question_mark", "show_keybinds", "Help"),
+    ]
+
+    def __init__(
+        self,
+        tasks: list[str],
+        claude_bin: str,
+        permission_mode: str,
+        log_path: Optional[Path],
+        goal: Optional[str] = None,
+        daemon_bin: Optional[str] = None,
+        max_concurrent: int = 5,
+        max_total_spawns: int = 20,
+        streaming_mode: bool = True,
+        use_pool: bool = True,
+        pool_size: int = 3,
+        home_dir: Optional[Path] = None,
+        profiles_dir: Optional[Path] = None,
+        default_profile_name: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self.tasks = tasks
+        self.claude_bin = claude_bin
+        self.permission_mode = permission_mode
+        # Home dir is the soft-sandbox cwd for every construct, daemon,
+        # and pool warming subprocess. Logs and the session manifest
+        # also default-locate under here. Everything the deck WRITES is
+        # under home; everything it RUNS (its own .py source) is wherever
+        # python was invoked from. Keep that boundary clean.
+        self.home_dir = (
+            home_dir if home_dir is not None
+            else _resolve_home_dir(None)
+        )
+        # Bootstrap deck-protocol dispatcher script. Cyberdeck ships
+        # with dispatcher.py; on every startup we (re)write that
+        # source to <home>/tools/deck/cyberdeck.py so constructs can
+        # invoke `python <home>/tools/deck/cyberdeck.py <subcmd>` via
+        # their Bash tool to talk back to the deck UI. Idempotent —
+        # overwrite-on-startup means dispatcher updates ship
+        # automatically. The netrunner shouldn't edit the deck/
+        # subdir; that's owned by cyberdeck. Other tool categories
+        # under <home>/tools/ are netrunner/construct territory.
+        try:
+            self._bootstrap_deck_dispatcher()
+        except Exception:
+            # Never fail app startup over the dispatcher. If write
+            # fails (read-only fs, permissions), constructs just
+            # won't have deck-control protocol available — they'll
+            # still spawn and run normally without it.
+            pass
+        # Profiles dir defaults to <home>/profiles. The registry will
+        # create it if missing on start. Explicit --profiles-dir
+        # overrides for testing or shared profile sets across multiple
+        # home dirs.
+        self.profiles_dir = (
+            profiles_dir if profiles_dir is not None
+            else self.home_dir / "profiles"
+        )
+        # Profile name to apply to all spawned constructs in this run.
+        # Resolved against the registry at goal-start time (the registry
+        # may not have finished its initial scan when __init__ runs).
+        # If the name doesn't resolve, we fall back to "no profile"
+        # behavior and surface a chatlog warning. Until C1e wires the
+        # daemon up to pick profiles per-spawn, this is the only knob
+        # the netrunner has for steering profile use.
+        #
+        # When the netrunner doesn't pass --default-profile, we use
+        # "default" — the registry seeds default.toml on disk if it's
+        # missing, so the file always exists and the netrunner can edit
+        # it to tweak baseline behavior. Tracking explicit-vs-implicit
+        # only matters for log noise: the resolved-profile line is
+        # silent when default+implicit (the boring case), printed
+        # otherwise (anything the netrunner cares about).
+        self._default_profile_name = default_profile_name or "default"
+        self._default_profile_explicit = default_profile_name is not None
+        self.default_profile: Optional[Profile] = None
+        # Log path defaults to <home>/cyberdeck.log when not explicitly
+        # set. Explicit --log overrides home placement.
+        self.log_path = (
+            log_path if log_path is not None
+            else self.home_dir / "cyberdeck.log"
+        )
+        self.goal = goal
+        # Daemon binary can differ from construct binary (for mocking)
+        self.daemon_bin = daemon_bin or claude_bin
+        self.max_concurrent = max_concurrent
+        self.max_total_spawns = max_total_spawns
+        self.streaming_mode = streaming_mode
+        self.use_pool = use_pool
+        self.pool_size = pool_size
+        self.fleet: Optional[Fleet] = None
+        self.daemon: Optional[Daemon] = None
+        self.session: Optional[DaemonSession] = None
+        self.session_manager: Optional[SessionManager] = None
+        self.session_pool: Optional[SessionPool] = None
+        self._daemon_task: Optional[asyncio.Task] = None
+        # Profile registry is always live, regardless of goal mode.
+        # Started in on_mount, shut down in on_unmount. Listens to
+        # disk and pushes events into _handle_profile_event so the
+        # Tools tab can stay in sync.
+        self.profile_registry = ProfileRegistry(
+            self.profiles_dir,
+            on_event=self._handle_profile_event,
+        )
+        # Watchdog Q&A oracle. Async question→answer pipe backed by
+        # one-shot `claude -p` invocations. The simpler half of the
+        # spec'd Watchdog (tripwires + blacklist still deferred).
+        # Started in on_mount, shut down in on_unmount.
+        #
+        # Substrate note: spec calls for a local 7B model so the
+        # watchdog runs "free." We're using cloud Claude until D1
+        # lands; tokens cost real money on each ask. See watchdog.py
+        # for the swap point.
+        self.watchdog = Watchdog(
+            claude_bin=self.claude_bin,
+        )
+        # Connection monitor — heartbeats api.anthropic.com:443 to
+        # detect Online/Degraded/Offline transitions. Per spec line
+        # 114: "sidebar status reflects current state at all times."
+        # Today: indicator + chatlog announcement on transition.
+        # Future M5+: spawn-blocking on Degraded/Offline, daemon
+        # parking, recovery flow. This monitor exposes the state +
+        # events that those consumers will subscribe to.
+        self.connection_monitor = ConnectionMonitor(
+            on_state_change=self._handle_connection_change,
+        )
+        self.panes: dict[str, ConstructPane] = {}
+        self.goal_pane: Optional[GoalPane] = None
+        self.daemon_pane: Optional[DaemonPane] = None
+        self.watchdog_pane: Optional[WatchdogPane] = None
+        self.pool_meter: Optional[PoolMeter] = None
+        # Pending injections: construct_id -> (mode, message, session_id, prior_task).
+        # Populated when the user submits InjectScreen; consumed in
+        # _handle_meta when the targeted construct finalizes (queue
+        # mode) or just after the kill has flushed (interrupt mode).
+        # Either way, we spawn a follow-up Construct via --resume so
+        # the injected message lands as the next user turn in the
+        # same session.
+        self._pending_injections: dict[
+            str, tuple[str, str, str, str]
+        ] = {}
+
+        # Chatlog event buffer. Holds the last N raw events that fed
+        # the chatlog so the ExpandModal can re-render with looser
+        # truncation caps. Each entry is (kind_marker, raw_event)
+        # where kind_marker is "fleet" or "daemon" and raw_event is
+        # the original FleetEvent or DaemonEvent. Bounded so an
+        # extremely long-running session doesn't accumulate forever.
+        # Per-event memory is bounded by the formatter's own caps in
+        # untruncated mode (5000 chars max per line), so this buffer
+        # is at most ~5MB at full saturation. Not a concern.
+        self._chatlog_event_buffer: deque = deque(maxlen=1000)
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        with Horizontal(id="top_area"):
+            # LEFT: sidebar — goal, counters, fleet log
+            with Vertical(id="sidebar"):
+                yield Label("[b]CYBERDECK[/b]")
+                yield Label("[dim]m5.3: pool live[/dim]")
+                # Connection status indicator. Single Label, color-
+                # coded per state. Updates from ConnectionMonitor's
+                # on_state_change callback. Sits high in the sidebar
+                # because the spec calls for "sidebar status reflects
+                # current state at all times" — it's a glance-check,
+                # not buried.
+                yield Label(
+                    "[green]●[/green] online",
+                    id="connection_status",
+                )
+                yield Label("", id="sidebar_info")
+                # Pool meter sits between sidebar info and the goal pane
+                # so it's the first state widget the netrunner sees. It
+                # hides itself entirely when --no-pool is set.
+                self.pool_meter = PoolMeter(id="pool_meter")
+                yield self.pool_meter
+                # Goal pane is always mounted. In idle state it shows
+                # "(no goal set)"; once a goal lands it updates inline.
+                self.goal_pane = GoalPane(self.goal or "", id="goal_pane")
+                yield self.goal_pane
+                yield Label("[b]fleet log[/b]", id="sidebar_log_label")
+                fleet_log_widget = RichLog(
+                    id="fleet_log",
+                    markup=True,
+                    wrap=True,
+                    max_lines=500,
+                    auto_scroll=True,
+                    min_width=10,
+                )
+                # Focusable on purpose — the netrunner needs to be able
+                # to focus and space-to-expand the fleet log just like
+                # the right-panel logs. WASD navigation still works:
+                # focus lands here as part of the left-section cycle.
+                yield fleet_log_widget
+
+            # CENTER: main — construct panes stack here. Single zone
+            # because Textual's remove+remount re-runs compose() and
+            # blows away the moved widget's children (i.e., the pane's
+            # log content). We preserve order via move_child instead:
+            # active panes at the top, terminal panes pushed to the
+            # bottom by _move_pane_to_bottom on completion. Visual
+            # separation comes from the .-compact CSS class, not from
+            # a separate container.
+            with VerticalScroll(id="main", can_focus=False):
+                pass  # construct panes added dynamically on spawn
+
+            # RIGHT: files/tools tabs. Always mounted; the active tab's
+            # content list is the focus target. Tab/Shift+Tab within
+            # this section swaps which tab is active and refocuses
+            # the new content (handled in _cycle_in_section). The tab
+            # buttons themselves aren't focus targets — Textual's
+            # convention is that tabs are meta-controls; content is what
+            # users interact with.
+            with Vertical(id="right_panel"):
+                # Tab order matters: Chatlog goes first because it's
+                # the most useful at-a-glance view. Files and Tools
+                # are reference-only; the chatlog is *what's
+                # happening right now*. New tabs append to the right.
+                with TabbedContent(initial="chatlog_tab", id="right_panel_tabs"):
+                    with TabPane("Chatlog", id="chatlog_tab"):
+                        yield RichLog(
+                            id="chatlog_log",
+                            max_lines=1000,
+                            markup=True,
+                            # No-wrap is deliberate. The right panel is
+                            # narrow (~15-25 cols) and chatlog lines
+                            # frequently include daemon thinking up to
+                            # 120 chars. With wrap=True, anything
+                            # multi-word produced one-word-per-line
+                            # vomit that lost any sense of "this is one
+                            # log entry." With wrap=False, lines clip
+                            # at the visible right edge and the
+                            # netrunner can scroll horizontally on the
+                            # rare occasion they want the full text.
+                            # Per-line readability beats per-line
+                            # completeness for a streaming log view.
+                            wrap=False,
+                            min_width=10,
+                            auto_scroll=True,
+                        )
+                    with TabPane("Files", id="files_tab"):
+                        # Files tab is a ListView of FileListItems —
+                        # each file touched by a construct becomes a
+                        # focusable row. C1g.4 wires space here to
+                        # launch a follow-up construct with the file
+                        # pre-loaded. Same architecture as Tools tab.
+                        # No header label needed — empty state is
+                        # handled by an in-list placeholder.
+                        yield ListView(id="files_list")
+                    with TabPane("Tools", id="tools_tab"):
+                        # Tools tab is now a structured layout with
+                        # focusable list items, not a flat RichLog.
+                        # Profile rows can be selected (C1g.4 will wire
+                        # Tools tab is now a structured layout with
+                        # focusable list items, not a flat RichLog.
+                        # Profile rows can be selected (C1g.4 wires
+                        # space → launch modal); script rows too
+                        # (will become a "spin up a construct
+                        # configured for this script" shortcut).
+                        # Scripts populate from <home>/tools/<cat>/<file>.
+                        with VerticalScroll(id="tools_panel_scroll"):
+                            yield Label(
+                                "[b]PROFILES[/b]  [dim](0)[/dim]",
+                                id="tools_profiles_header",
+                            )
+                            yield ListView(id="tools_profile_list")
+                            yield Label(
+                                "[b]SCRIPTS[/b]  [dim](0)[/dim]",
+                                id="tools_scripts_header",
+                            )
+                            # Renamed id from tools_construct_list →
+                            # tools_scripts_list. Same widget shape;
+                            # different content (disk-scanned scripts
+                            # instead of hardcoded built-ins). Built-
+                            # ins were a category mismatch with the
+                            # spec's tool-registry concept anyway —
+                            # they're Claude Code's surface, not the
+                            # deck's registered capabilities.
+                            yield ListView(id="tools_scripts_list")
+                            # No directory reference labels — the
+                            # netrunner knows where ~/profiles and
+                            # ~/tools live; the path text was just
+                            # vertical noise.
+
+        # BOTTOM: tabbed Daemon + Watchdog. Both surfaces are
+        # output-only logs the netrunner can focus + magnify with z.
+        # The id="daemon_bar" stays on the wrapper TabbedContent so
+        # existing focus-section navigation (grid_neighbors etc.)
+        # finds the bottom region by the same name. Inner tab
+        # cycling reuses the right-panel pattern (W/S walks past
+        # the section's last focusable → swap inner tab).
+        self.daemon_pane = DaemonPane()
+        self.watchdog_pane = WatchdogPane()
+        with TabbedContent(initial="daemon_tab", id="daemon_bar"):
+            with TabPane("Daemon", id="daemon_tab"):
+                yield self.daemon_pane
+            with TabPane("Watchdog", id="watchdog_tab"):
+                yield self.watchdog_pane
+
+        yield Footer()
+
+    def _refresh_tools_panel(self) -> None:
+        """Re-populate the Tools tab's ListViews and header labels from
+        the current profile registry state. Called on registry
+        scan_complete and once at mount time. Idempotent — clears each
+        list and rebuilds.
+
+        The static footer (DAEMON / PERMISSIONS / Future...) is set in
+        compose and never updated here — it doesn't depend on registry
+        state. The dir-line is updated because it depends on
+        self.profiles_dir which is fixed at startup, but we still
+        repopulate it during refresh in case the netrunner ever gains
+        the ability to reconfigure (deferred)."""
+        try:
+            profile_list = self.query_one(
+                "#tools_profile_list", ListView
+            )
+            scripts_list = self.query_one(
+                "#tools_scripts_list", ListView
+            )
+            header = self.query_one(
+                "#tools_profiles_header", Label
+            )
+            scripts_header = self.query_one(
+                "#tools_scripts_header", Label
+            )
+        except Exception:
+            # Pre-mount or test harness without right panel.
+            return
+
+        # Profiles section. Items are sorted by category then by name
+        # within each category. Each item carries the Profile object so
+        # downstream handlers (C1g.4 launch modal) can read its data
+        # without a registry round-trip.
+        profiles_by_cat = self.profile_registry.by_category()
+        total = sum(len(ps) for ps in profiles_by_cat.values())
+        header.update(f"[b]PROFILES[/b]  [dim]({total})[/dim]")
+
+        # Clear-and-repopulate. ListView's clear() removes all items;
+        # we then mount each fresh ProfileListItem. Mount happens
+        # synchronously enough that the items are queryable
+        # immediately (which we need so the registered focus handling
+        # picks them up).
+        profile_list.clear()
+        if total == 0:
+            # Empty-state placeholder — also a list item so the empty
+            # list still has SOMETHING focusable, but it's marked as
+            # disabled (the CSS will dim it). Avoids the awkward case
+            # of "press tab into an empty list, focus disappears".
+            empty_item = ListItem(Label(
+                "[dim](no profiles — drop a .toml in the dir below)[/dim]",
+                markup=True,
+            ))
+            empty_item.disabled = True
+            profile_list.append(empty_item)
+        else:
+            tier_sigil = {
+                "paranoid": "[green]P[/green]",
+                "default":  "[dim]D[/dim]",
+                "yolo":     "[red]Y[/red]",
+            }
+            for cat, profiles_in_cat in profiles_by_cat.items():
+                for p in profiles_in_cat:
+                    sigil = tier_sigil.get(
+                        p.brake_profile, "[dim]?[/dim]"
+                    )
+                    count = (
+                        f"[dim]{len(p.allowed_tools)}t[/dim]"
+                        if p.allowed_tools
+                        else "[dim]·[/dim]"
+                    )
+                    # Format: "P Engineering/code_reviewer  3t"
+                    # Category prefix replaces the standalone header
+                    # line we used to render — works in a flat list
+                    # without needing non-focusable header rows.
+                    label_markup = (
+                        f"{sigil} [dim]{cat}/[/dim]"
+                        f"[cyan]{p.name}[/cyan]  {count}"
+                    )
+                    profile_list.append(
+                        ProfileListItem(p, label_markup)
+                    )
+
+        # Scripts section. Disk-scanned from <home>/tools/<cat>/<file>.
+        # The dispatcher (tools/deck/cyberdeck.py) shows up here on
+        # first run because bootstrap writes it. Constructs that
+        # produce useful one-shot scripts can save them under
+        # tools/<category>/ and they'll appear here next refresh.
+        scripts = self._scan_scripts()
+        scripts_header.update(
+            f"[b]SCRIPTS[/b]  [dim]({len(scripts)})[/dim]"
+        )
+        scripts_list.clear()
+        if not scripts:
+            empty_item = ListItem(Label(
+                "[dim](no scripts — drop one in ~/tools/"
+                "<category>/)[/dim]",
+                markup=True,
+            ))
+            empty_item.disabled = True
+            scripts_list.append(empty_item)
+        else:
+            for path, category, name in scripts:
+                scripts_list.append(
+                    ScriptListItem(path, category, name)
+                )
+
+    def _handle_profile_event(self, event: ProfileEvent) -> None:
+        """Receive a registry event. We coalesce display updates by
+        only re-rendering on 'scan_complete' (which fires after a batch
+        of changes settles); individual added/changed/removed events
+        are no-ops here. scan_error gets surfaced in the chatlog so
+        the netrunner sees their broken TOML quickly."""
+        if event.kind == "scan_error":
+            # Show the error inline in the chatlog. Keep it short —
+            # the full path + reason is in stderr already (and in the
+            # event itself for any future log surface).
+            err = (event.error or "?").replace("\n", " ")
+            if len(err) > 120:
+                err = err[:117] + "..."
+            self._chatlog_write(
+                f"[red]profile error:[/red] {err}"
+            )
+            return
+        if event.kind == "scan_complete":
+            self._refresh_tools_panel()
+            # Also surface a one-liner in the chatlog so changes are
+            # visible even if the netrunner is on a different tab.
+            count = len(self.profile_registry.all())
+            self._chatlog_write(
+                f"[yellow]profiles updated[/yellow] [dim]({count} loaded)[/dim]"
+            )
+
+    def on_mount(self) -> None:
+        self.title = "Cyberdeck"
+        self._refresh_subtitle()
+        # Populate the Tools tab from current registry state. Empty at
+        # startup; the registry's first scan_complete event will refill
+        # via _handle_profile_event → _refresh_tools_panel. Calling it
+        # here ensures the construct-tools list is populated even in
+        # the rare case of a delayed first scan.
+        self._refresh_tools_panel()
+        # Set initial daemon status
+        if self.daemon_pane is not None:
+            self.daemon_pane.set_status("idle")
+        # Initialize the pool meter. If use_pool is False, hide it
+        # entirely. If True, prime with target=pool_size, all empty —
+        # cells fill from the left as warming completes.
+        if self.pool_meter is not None:
+            self.pool_meter.set_enabled(self.use_pool)
+            if self.use_pool:
+                self.pool_meter.update_state(
+                    warm=0, warming=0, target=self.pool_size,
+                )
+        # Start the profile registry. Runs independently of goal mode,
+        # so the Tools tab is live whether or not a goal is set. The
+        # registry's first scan will fire 'scan_complete' which calls
+        # _refresh_tools_panel, replacing the placeholder render above.
+        # Direct create_task rather than run_worker because (a) start()
+        # is a quick one-shot; the long-lived watcher it spawns is its
+        # own task; and (b) Textual's run_worker has been finicky with
+        # quick-returning coroutines in test harnesses.
+        self._profile_registry_start_task = asyncio.create_task(
+            self.profile_registry.start(),
+            name="profile-registry-start",
+        )
+        # Watchdog worker loop. Idempotent start; runs until
+        # on_unmount tears it down. Independent of fleet/daemon —
+        # always available so the netrunner can ask questions even
+        # when no goal is set.
+        self._watchdog_start_task = asyncio.create_task(
+            self.watchdog.start(),
+            name="watchdog-start",
+        )
+        # ConnectionMonitor heartbeats start immediately. Independent
+        # of fleet/daemon lifecycle — the indicator should be live
+        # from the moment the deck opens, not just during sessions.
+        self._connection_monitor_start_task = asyncio.create_task(
+            self.connection_monitor.start(),
+            name="connection-monitor-start",
+        )
+        self.run_worker(self._drive_fleet(), exclusive=True, name="fleet")
+
+    def _refresh_subtitle(self) -> None:
+        """Update the window subtitle based on current state."""
+        if self.goal:
+            preview = self.goal[:40] + "..." if len(self.goal) > 40 else self.goal
+            self.sub_title = f"goal: {preview}"
+        else:
+            self.sub_title = "idle — press 'e' to set a goal"
+
+    async def _drive_fleet(self) -> None:
+        # Single SessionManager for the lifetime of this app instance.
+        # Loaded eagerly so cross-restart reuse can validate prior-run
+        # warm sessions against staleness before the pool starts.
+        # Manifest lives under the home dir so it migrates with the
+        # rest of the deck's user data — survives source-tree moves,
+        # stays out of git when source is checked in, etc.
+        self.session_manager = SessionManager(
+            manifest_path=self.home_dir / ".cyberdeck" / "sessions.json",
+        )
+        self.session_manager.load()
+
+        # Boot recovery: clean up the manifest from the prior run.
+        # Orphaned in_use sessions become expired (their subprocess is
+        # gone). Stale warm sessions also expire (>5h old). Fresh
+        # warm sessions survive — the pool will reuse them, saving us
+        # from re-warming on every launch.
+        recovery = self.session_manager.boot_recovery()
+        reused_warm_count = len(self.session_manager.filter(
+            kind="construct", state="warm"
+        ))
+
+        # Sync the meter with reality BEFORE the pool starts. If we
+        # have warm sessions inherited from a prior run, the pool's
+        # start() won't emit any "warmed" events for them — they're
+        # already warm. So we update the meter directly to reflect the
+        # inherited count; without this, the meter would stay at 0/N
+        # until the next pool event (potentially never on a fully-
+        # reused boot).
+        if self.pool_meter is not None and self.use_pool:
+            self.pool_meter.update_state(
+                warm=reused_warm_count,
+                warming=0,
+                target=self.pool_size,
+            )
+
+        # Session pool: pre-warms default-profile constructs in the
+        # background. M5.3b lands the pool itself; M5.3c will have the
+        # daemon actually pull from it. With --no-pool, we skip pool
+        # creation entirely (cheap mock testing, metered connections).
+        # Pool warming subprocesses share the home dir with everyone
+        # else — they're constructs, just very short-lived ones.
+        if self.use_pool:
+            self.session_pool = SessionPool(
+                manager=self.session_manager,
+                target_size=self.pool_size,
+                claude_bin=self.claude_bin,
+                on_event=self._handle_pool_event,
+                cwd=str(self.home_dir),
+            )
+
+        self.fleet = Fleet(
+            claude_bin=self.claude_bin,
+            permission_mode=self.permission_mode,
+            log_path=self.log_path,
+            install_signal_handlers=False,  # Textual owns SIGINT
+            quiet=True,  # no console print; TUI renders instead
+            max_concurrent=self.max_concurrent,
+            session_manager=self.session_manager,
+            session_pool=self.session_pool,
+            cwd=str(self.home_dir),
+            deck_addendum=self._build_deck_addendum(),
+        )
+        self.fleet.add_listener(self._handle_event)
+        fleet_log = self.query_one("#fleet_log", RichLog)
+        async with self.fleet as fleet:
+            self._refresh_sidebar_info()
+            fleet_log.write(f"[b]start:[/b] {fleet.run_id}")
+            # Surface the home dir on startup. One-time log line so the
+            # netrunner sees where constructs will be reading/writing.
+            # Skipped if the home dir is the cwd (i.e., legacy behavior
+            # / no isolation) — that's not worth a log line.
+            try:
+                if self.home_dir.resolve() != Path.cwd().resolve():
+                    fleet_log.write(
+                        f"[dim]home: {self.home_dir}[/dim]"
+                    )
+            except Exception:
+                pass
+
+            # Surface boot recovery info. Three numbers a netrunner
+            # might care about: how many warm sessions we inherit from
+            # the prior run, how many entries we expired due to age
+            # or orphaning. Quiet if nothing happened.
+            if reused_warm_count > 0:
+                fleet_log.write(
+                    f"[dim]reused {reused_warm_count} warm session(s) "
+                    f"from prior run[/dim]"
+                )
+            if recovery["orphaned"]:
+                fleet_log.write(
+                    f"[dim]expired {len(recovery['orphaned'])} orphaned "
+                    f"session(s) from prior run[/dim]"
+                )
+            if recovery["stale"]:
+                fleet_log.write(
+                    f"[dim]expired {len(recovery['stale'])} stale "
+                    f"session(s) (>5h old)[/dim]"
+                )
+
+            # Resolve the active profile via the registry. Wait for
+            # the registry's initial scan to complete first so we look
+            # up against a populated map (start() runs in parallel with
+            # the fleet driver). If the name doesn't resolve — typo'd
+            # flag, missing file, scan error — fall back to no profile
+            # rather than crashing.
+            #
+            # Logging policy:
+            #   default + implicit  → silent (boring; baseline behavior)
+            #   default + explicit  → silent too (same effect)
+            #   non-default         → log the profile + category
+            #   unresolved          → log the error + available names
+            try:
+                await self._profile_registry_start_task
+            except Exception:
+                pass
+            resolved = self.profile_registry.get(
+                self._default_profile_name
+            )
+            if resolved is not None:
+                self.default_profile = resolved
+                if resolved.name != "default":
+                    fleet_log.write(
+                        f"[yellow]profile:[/yellow] {resolved.name} "
+                        f"[dim]({resolved.category})[/dim]"
+                    )
+            else:
+                available = ", ".join(
+                    p.name for p in self.profile_registry.all()
+                ) or "(none loaded)"
+                fleet_log.write(
+                    f"[red]profile not found:[/red] "
+                    f"{self._default_profile_name!r} — "
+                    f"available: {available}"
+                )
+
+            # Begin pool warming in the background. Returns immediately;
+            # warming happens in fire-and-forget asyncio tasks. The
+            # PoolMeter widget shows progress visually; no need to
+            # narrate it in the fleet log. The pool's start() already
+            # accounts for already-warm sessions in the manifest and
+            # only warms the difference — so reused warm sessions
+            # mean fewer subprocess spawns at launch.
+            if self.session_pool is not None:
+                await self.session_pool.start()
+
+            # If launched with a goal, start the daemon immediately.
+            # Otherwise we sit in idle until the netrunner sets a goal
+            # via `e`, which calls _start_daemon_task.
+            if self.goal is not None:
+                self._start_daemon_task()
+
+            try:
+                await fleet.run(self.tasks, keep_alive=True)
+            except Exception as e:
+                fleet_log.write(f"[red]error: {e!r}[/red]")
+
+            # Ensure daemon is stopped at shutdown
+            if self.session is not None:
+                await self.session.shutdown()
+            if self._daemon_task is not None:
+                try:
+                    await self._daemon_task
+                except Exception:
+                    pass
+
+            # Cancel any in-flight warming. Already-warm sessions stay
+            # in the manifest as 'warm' for next launch (cross-restart
+            # reuse lands in M5.3e).
+            if self.session_pool is not None:
+                await self.session_pool.shutdown()
+
+            # Stop the profile registry's poll loop. Idempotent — safe
+            # if start() never finished or hadn't been called.
+            await self.profile_registry.shutdown()
+
+            # Stop the watchdog worker. Cancels any in-flight question
+            # subprocess; queued questions are dropped (matches EJECT
+            # semantics — snapshot + halt, no graceful drain).
+            await self.watchdog.shutdown()
+
+            # Stop the connection monitor heartbeat loop.
+            await self.connection_monitor.shutdown()
+
+            fleet_log.write("[b]complete[/b]")
+
+    def _handle_pool_event(self, event: PoolEvent) -> None:
+        """Update the RAM meter from pool state changes. Most events
+        update the meter visually and are silent in the log; failures
+        still surface there for diagnostics."""
+        # Update the meter on every event — counts may have shifted.
+        if self.pool_meter is not None:
+            self.pool_meter.update_state(
+                warm=event.warm_count,
+                warming=event.warming_count,
+                target=event.target_size,
+            )
+        # Surface failures in the fleet log (rare; signal to investigate).
+        if event.kind == "warm_failed":
+            try:
+                fleet_log = self.query_one("#fleet_log", RichLog)
+                fleet_log.write(
+                    f"[red]pool: warm failed:[/red] {event.error}"
+                )
+            except Exception:
+                pass
+
+    def _handle_connection_change(self, event: StateChangeEvent) -> None:
+        """ConnectionMonitor callback: state transitioned. Updates the
+        sidebar indicator + announces in chatlog so the netrunner
+        sees the moment the deck went degraded/offline (or recovered).
+
+        Color coding:
+          green ●  online    — normal operation
+          yellow ◐ degraded  — connection unstable; remote work risky
+          red ●    offline   — no connection at all
+
+        Filled vs partial-filled glyphs (●/◐) reinforce the meaning
+        for color-blind netrunners — degraded is visually distinct
+        from both online and offline regardless of color rendering.
+        """
+        glyph_color = {
+            ConnectionState.ONLINE:   ("●", "green"),
+            ConnectionState.DEGRADED: ("◐", "yellow"),
+            ConnectionState.OFFLINE:  ("●", "red"),
+        }.get(event.new_state, ("?", "dim"))
+        glyph, color = glyph_color
+        try:
+            indicator = self.query_one("#connection_status", Label)
+            indicator.update(
+                f"[{color}]{glyph}[/{color}] {event.new_state.value}"
+            )
+        except Exception:
+            # Pre-mount or test harness without sidebar — ignore.
+            pass
+        # Chatlog announcement so the transition is anchored in the
+        # event timeline. Useful when a netrunner comes back to a
+        # session and wonders "did I lose connection at some point?"
+        # Suppress the announcement if the App is still composing
+        # (chatlog widget not yet mounted) — the initial Online
+        # state doesn't need a "you came online!" announcement.
+        try:
+            self._chatlog_write(
+                f"[{color}]\\[connection][/{color}] "
+                f"[dim]{event.old_state.value} →[/dim] "
+                f"[b {color}]{event.new_state.value}[/b {color}]  "
+                f"[dim]{event.reason}[/dim]"
+            )
+        except Exception:
+            pass
+
+    def _start_daemon_task(self) -> None:
+        """Kick off a daemon session worker for the current goal.
+        Caller must have set self.goal before calling this."""
+        if self.goal is None or self.fleet is None:
+            return
+        if self._daemon_task is not None and not self._daemon_task.done():
+            return  # already running
+        self._daemon_task = asyncio.create_task(self._drive_daemon())
+
+    def _build_daemon_system_prompt(self) -> str:
+        """Compose the daemon's system prompt with profile awareness.
+
+        Returns the baseline DAEMON_SYSTEM_PROMPT extended with:
+          - A PROFILES catalog listing every loaded profile (name,
+            category, description, allowed_tools).
+          - Profile-switching rules including the privesc guardrail.
+          - The active profile's default_daemon_addendum, if non-empty.
+
+        Called once per session start. If the registry hasn't loaded
+        anything yet (race), the catalog will be sparse but the prompt
+        is still well-formed — the active profile's addendum is the
+        important bit for steering, the catalog is for delegation hints.
+        """
+        sections: list[str] = [DAEMON_SYSTEM_PROMPT]
+
+        # Profile catalog
+        profiles_loaded = self.profile_registry.all()
+        if profiles_loaded:
+            catalog: list[str] = [
+                "",
+                "PROFILES — available steering configurations for spawns:",
+                "",
+            ]
+            for p in profiles_loaded:
+                tool_str = (
+                    ", ".join(p.allowed_tools)
+                    if p.allowed_tools
+                    else "all baseline tools"
+                )
+                desc_short = " ".join(p.description.split())  # collapse newlines
+                if len(desc_short) > 200:
+                    desc_short = desc_short[:197] + "..."
+                catalog.append(
+                    f"- {p.name} ({p.category}, brake={p.brake_profile}): "
+                    f"tools={tool_str}\n"
+                    f"  {desc_short}"
+                )
+            sections.append("\n".join(catalog))
+
+        # Profile-switching rules — the daemon needs to know it CAN
+        # vary profile per spawn, and it needs to know the rules.
+        active_name = (
+            self.default_profile.name if self.default_profile else "default"
+        )
+        active_tier = (
+            self.default_profile.brake_profile
+            if self.default_profile else "default"
+        )
+        sections.append(
+            "\nPROFILE SELECTION:\n"
+            f"The active profile for this run is: {active_name} "
+            f"(brake tier: {active_tier})\n"
+            "\n"
+            "By default, every spawn action runs under the active profile.\n"
+            "You MAY override per-spawn by adding a `profile` field to the\n"
+            "spawn action, e.g.:\n"
+            '  {"type": "spawn", "task": "...", "profile": "code_reviewer"}\n'
+            "\n"
+            "RULES (enforced; violations are rejected and logged):\n"
+            "Two security axes apply, and BOTH must clear:\n"
+            "\n"
+            "  1. BRAKE TIER: paranoid < default < yolo (stricter to looser)\n"
+            "     You may pick a profile at the SAME tier or STRICTER.\n"
+            "     You may NEVER pick a profile at a LOOSER tier — that\n"
+            "     would lower the permission-prompt frequency the\n"
+            "     netrunner set for this run.\n"
+            "\n"
+            "  2. ALLOWED TOOLS: picked profile's tool set must be a\n"
+            "     subset of active's. Empty allowed_tools means 'all\n"
+            "     baseline tools' on either side.\n"
+            "\n"
+            "If a pick violates EITHER axis, the spawn falls back to the\n"
+            "active profile and a security event is logged. The netrunner\n"
+            "is the only party who can elevate; you cannot hand yourself\n"
+            "capabilities the netrunner did not grant.\n"
+            "\n"
+            "If unsure whether a profile would escalate, omit the\n"
+            "field — the active profile applies."
+        )
+
+        # Active profile's daemon-side addendum
+        if (self.default_profile is not None
+                and self.default_profile.default_daemon_addendum.strip()):
+            sections.append(
+                "\nACTIVE PROFILE STEERING — additional guidance for this run:\n"
+                + self.default_profile.default_daemon_addendum.strip()
+            )
+
+        return "\n".join(sections)
+
+    async def _drive_daemon(self) -> None:
+        """Run a daemon session against the current goal. Returns to
+        idle on completion (does not kill the app)."""
+        assert self.goal is not None
+        assert self.fleet is not None
+
+        # Build the daemon's system prompt with profile context baked
+        # in. Two additions on top of the baseline DAEMON_SYSTEM_PROMPT:
+        #
+        #   1. A PROFILES section listing every loaded profile with
+        #      its category, description, and tool set. Tells the
+        #      daemon what tools are available for delegation.
+        #   2. The active profile's default_daemon_addendum, if any.
+        #      This is the netrunner's run-level steering for the
+        #      daemon itself (not for spawned constructs).
+        #
+        # Profile-switching rules are documented in the prompt so the
+        # daemon knows it CAN ask for a non-default profile per spawn,
+        # but also knows the privesc rule (de-escalate only).
+        system_prompt = self._build_daemon_system_prompt()
+
+        self.daemon = Daemon(
+            claude_bin=self.daemon_bin,
+            streaming_mode=self.streaming_mode,
+            cwd=str(self.home_dir),
+            system_prompt=system_prompt,
+        )
+        self.session = DaemonSession(
+            daemon=self.daemon,
+            fleet=self.fleet,
+            on_daemon_event=self._handle_daemon_event,
+            max_total_spawns=self.max_total_spawns,
+            default_profile=self.default_profile,
+            # Wire the registry as the profile resolver so the daemon's
+            # per-spawn profile picks land against live profile data.
+            profile_lookup=self.profile_registry.get,
+        )
+
+        if self.daemon_pane is not None:
+            self.daemon_pane.set_status("working")
+
+        try:
+            await self.session.run(self.goal)
+        except Exception as e:
+            if self.daemon_pane is not None:
+                self.daemon_pane.write_error(repr(e))
+                self.daemon_pane.set_status("failed")
+        finally:
+            # Return to idle: clear the daemon/session refs and reset
+            # the goal so the netrunner can set a new one. The app
+            # stays alive; only the daemon session ends.
+            self._return_to_idle()
+
+    def _return_to_idle(self) -> None:
+        """Reset daemon state so the app is ready for a new goal."""
+        self.daemon = None
+        self.session = None
+        self._daemon_task = None
+        self.goal = None
+        if self.goal_pane is not None:
+            self.goal_pane.set_goal("")
+        if self.daemon_pane is not None:
+            self.daemon_pane.set_status("idle")
+            self.daemon_pane.write_line(
+                "[dim]— session complete; press 'e' to set a new goal —[/dim]"
+            )
+        self._refresh_subtitle()
+        self._refresh_sidebar_info()
+
+    def _handle_daemon_event(self, event: DaemonEvent) -> None:
+        """Route a daemon event to the daemon pane and log it."""
+        if self.daemon_pane is None:
+            return
+        if event.kind == "thinking":
+            self.daemon_pane.write_thinking(event.payload.get("text", ""))
+        elif event.kind == "chat":
+            self.daemon_pane.write_chat(event.payload.get("text", ""))
+        elif event.kind == "action":
+            self.daemon_pane.write_action(event.payload.get("action", {}))
+        elif event.kind == "status":
+            self.daemon_pane.set_status(event.payload.get("status", "?"))
+        elif event.kind == "error":
+            self.daemon_pane.write_error(event.payload.get("text", ""))
+        # 'started' and 'raw' aren't rendered in the daemon pane —
+        # 'raw' is for eventual full logging, 'started' is implicit.
+
+        # Mirror the salient daemon traffic into the chatlog. Daemon
+        # actions are skipped here intentionally — the fleet emits a
+        # spawn meta event a moment later that already announces them
+        # from the receiving end, and we'd rather not double-log.
+        line = chatlog_format_daemon(event)
+        if line is not None:
+            self._chatlog_write(line)
+            self._chatlog_event_buffer.append(("daemon", event))
+
+    def _handle_event(self, fevent: FleetEvent) -> None:
+        """Called from Fleet on the same event loop; safe to touch widgets."""
+        # Deck-protocol markers: scan tool_result text for cyberdeck
+        # dispatcher emissions BEFORE formatters render anything, so
+        # the markers get cleaned out of the displayed text. This
+        # mutates fevent.payload in-place (sets a cleaned `text`
+        # field) so downstream formatters and the chatlog event
+        # buffer all see the clean version.
+        self._scan_and_dispatch_deck_markers(fevent)
+
+        if fevent.kind == "meta":
+            self._handle_meta(fevent)
+        else:
+            self._handle_event_kind(fevent)
+        # Mechanical chatlog: zero-token render of whatever just
+        # happened. The formatter returns None for events we don't
+        # want to surface (system_init, tool_result, allowed
+        # rate_limits, etc.) — that's the whole filter. If the line
+        # rendered, also buffer the raw event so the ExpandModal can
+        # re-render in untruncated mode.
+        line = chatlog_format_fleet(fevent)
+        if line is not None:
+            self._chatlog_write(line)
+            self._chatlog_event_buffer.append(("fleet", fevent))
+        # Keep sidebar counters / cost live. Cheap enough to do per event;
+        # Textual only repaints when the Label's content actually changes.
+        self._refresh_sidebar_info()
+
+    def _scan_and_dispatch_deck_markers(self, fevent: FleetEvent) -> None:
+        """Pre-process a fleet event for deck-protocol markers.
+
+        Markers arrive in tool_result text (constructs invoke the
+        dispatcher via Bash; Bash captures stdout; stdout becomes the
+        tool_result's content text). We scan that text, pull out any
+        `__CYBERDECK::v1::ACTION::PAYLOAD__` substrings, dispatch the
+        side effect for each, and replace the text with the cleaned
+        version so the formatter doesn't render protocol bytes.
+
+        Mutates fevent.payload in place. No-op if the event isn't a
+        tool_result, has no text content, or contains no markers."""
+        if fevent.kind != "event":
+            return
+        if fevent.payload.get("event_kind") != "tool_result":
+            return
+        # tool_result text lives at payload['raw']['message']['content'][i]['content']
+        # for a content block; the construct might also emit a top-level
+        # 'text' field depending on streaming variant. Try both, scan
+        # whichever we find.
+        raw = fevent.payload.get("raw") or {}
+        message = raw.get("message") or {}
+        blocks = message.get("content") or []
+        if not isinstance(blocks, list):
+            return
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            content = block.get("content")
+            # tool_result content can be a string OR a list of
+            # content-typed dicts. Handle both.
+            if isinstance(content, str):
+                events, cleaned = _extract_deck_markers(content)
+                if events:
+                    block["content"] = cleaned
+                    for action, payload in events:
+                        self._dispatch_deck_marker(
+                            action, payload, fevent.construct_id,
+                        )
+            elif isinstance(content, list):
+                for sub in content:
+                    if not isinstance(sub, dict):
+                        continue
+                    text = sub.get("text")
+                    if not isinstance(text, str):
+                        continue
+                    events, cleaned = _extract_deck_markers(text)
+                    if events:
+                        sub["text"] = cleaned
+                        for action, payload in events:
+                            self._dispatch_deck_marker(
+                                action, payload, fevent.construct_id,
+                            )
+
+    def _dispatch_deck_marker(
+        self,
+        action: str,
+        payload: str,
+        construct_id: str,
+    ) -> None:
+        """Apply a single deck-protocol side effect.
+
+        action and payload come straight from the dispatcher script's
+        stdout. construct_id is the construct that emitted the
+        marker — used as the FileListItem's owner column so the
+        netrunner sees who surfaced what.
+
+        Unknown actions are logged to fleet log and ignored — keeps
+        forward-compat with future dispatcher versions that emit
+        actions this deck build doesn't handle yet."""
+        if action == "FILES_ADD":
+            # payload is an absolute path. _append_files handles
+            # display shortening to ~/... form.
+            self._append_files(construct_id, [payload])
+            return
+        if action == "FILES_REMOVE":
+            self._remove_file_from_panel(payload)
+            return
+        # Unknown / future action.
+        self._notify_fleet_log(
+            f"[dim]deck protocol: unknown action "
+            f"'{action}' from {construct_id} (ignored)[/dim]"
+        )
+
+    def _remove_file_from_panel(self, abs_path: str) -> None:
+        """Remove the first FileListItem with matching file_path
+        from the Files tab. No-op if not present (idempotent — a
+        construct removing a path that wasn't there isn't an error).
+
+        Match is on normalized path (same comparison _append_files
+        uses) so a `cyberdeck files remove` of a path that was
+        added with a different separator style still finds and
+        removes the entry."""
+        try:
+            files_lv = self.query_one("#files_list", ListView)
+        except Exception:
+            return
+        try:
+            target_key = os.path.normcase(os.path.normpath(abs_path))
+        except Exception:
+            target_key = abs_path
+        for item in list(files_lv.children):
+            if not isinstance(item, FileListItem):
+                continue
+            try:
+                item_key = os.path.normcase(os.path.normpath(item.file_path))
+            except Exception:
+                item_key = item.file_path
+            if item_key == target_key:
+                item.remove()
+                return
+
+    def _refresh_sidebar_info(self) -> None:
+        """Update the sidebar counters: spawned/finalized/cost/caps."""
+        if self.fleet is None:
+            return
+        try:
+            info = self.query_one("#sidebar_info", Label)
+        except Exception:
+            return
+        active = self.fleet.total_spawned - self.fleet.total_finalized
+        cost = self.fleet.total_cost_usd
+        # Format tokens compactly: 1,234,567 → "1.2M", 12345 → "12k"
+        tin = _humanize_tokens(self.fleet.total_tokens_in)
+        tout = _humanize_tokens(self.fleet.total_tokens_out)
+        lines = [
+            f"run:  [b]{self.fleet.run_id}[/b]",
+            f"bin:  {self.claude_bin}",
+            f"spawn: {self.fleet.total_spawned}/{self.max_total_spawns}  "
+            f"live: {active}/{self.max_concurrent}",
+            f"cost: [b]${cost:.2f}[/b]  tok: {tin}→{tout}",
+        ]
+        info.update("\n".join(lines))
+
+    def _bootstrap_deck_dispatcher(self) -> None:
+        """Write the deck-protocol dispatcher script into
+        <home>/tools/deck/cyberdeck.py. Idempotent — overwrites every
+        startup so the script always matches what cyberdeck expects.
+
+        The dispatcher source is loaded from cyberdeck/dispatcher.py
+        in the running cyberdeck package; we read its bytes and copy
+        them to the target path. This way the dispatcher stays in
+        sync with whatever the deck-side parser expects: bumping the
+        protocol on one side automatically bumps both."""
+        # Locate dispatcher.py inside the cyberdeck package directory
+        # — same directory as this tui.py module.
+        src = Path(__file__).resolve().parent / "dispatcher.py"
+        if not src.is_file():
+            # Source missing (perhaps an unusual install). Bail
+            # quietly — the construct will run without the protocol;
+            # we just won't have add-to-files-panel capability.
+            return
+        deck_dir = self.home_dir / "tools" / "deck"
+        deck_dir.mkdir(parents=True, exist_ok=True)
+        target = deck_dir / "cyberdeck.py"
+        target.write_bytes(src.read_bytes())
+        # Best-effort exec bit on Unix; no-op on Windows (the script
+        # is invoked via `python <path>` anyway, so chmod isn't
+        # strictly needed — the convention is just nice on Unix).
+        try:
+            target.chmod(0o755)
+        except (NotImplementedError, OSError):
+            pass
+
+    def _scan_scripts(self) -> list[tuple[str, str, str]]:
+        """Scan <home>/tools/ for scripts. Each script lives at
+        <home>/tools/<category>/<filename> — flat one-level deep,
+        with the parent directory name as category. Returns a list
+        of (abs_path, category, name) tuples sorted by category then
+        name. Empty list if tools/ doesn't exist yet (first run
+        before bootstrap, or a netrunner who deleted it).
+
+        Naming convention:
+          - `name` is the filename WITHOUT extension. `cyberdeck.py`
+            displays as `cyberdeck`.
+          - Files DIRECTLY in tools/ (no category subdir) are
+            ignored. Spec says scripts have a category; we honor
+            that here to keep the panel structured.
+          - Hidden files (starting with .) and `__pycache__` are
+            skipped — Python build artifacts shouldn't show up as
+            launchable scripts.
+
+        Cheap to call repeatedly: small directory tree, no parsing
+        per file, no caching needed at this scale."""
+        scripts: list[tuple[str, str, str]] = []
+        tools_dir = self.home_dir / "tools"
+        if not tools_dir.is_dir():
+            return scripts
+        for category_dir in sorted(tools_dir.iterdir()):
+            if not category_dir.is_dir():
+                continue
+            if category_dir.name.startswith("."):
+                continue
+            if category_dir.name == "__pycache__":
+                continue
+            category = category_dir.name
+            for script_file in sorted(category_dir.iterdir()):
+                if not script_file.is_file():
+                    continue
+                if script_file.name.startswith("."):
+                    continue
+                # Strip extension for display. `cyberdeck.py` →
+                # `cyberdeck`. `scan_wifi.sh` → `scan_wifi`. Files
+                # without an extension stay as-is.
+                name = script_file.stem
+                scripts.append(
+                    (str(script_file.resolve()), category, name)
+                )
+        return scripts
+
+    def _build_deck_addendum(self) -> str:
+        """System-prompt addendum that describes the deck-control
+        utilities every construct can use. Joined into the
+        --append-system-prompt arg by Construct alongside any
+        profile-specific addendum.
+
+        We pass the absolute dispatcher path here (rather than
+        relying on PATH) because:
+          (a) Constructs run with cwd=cyberdeck-home but their PATH
+              isn't extended, so `cyberdeck` wouldn't resolve.
+          (b) Telling the construct exact bytes to invoke is
+              clearer than hoping it figures out invocation form.
+
+        The addendum is short by design — Claude Code's system prompt
+        is already verbose and this is one of several addenda. We
+        get the point across in 4 lines and move on."""
+        dispatcher = self.home_dir / "tools" / "deck" / "cyberdeck.py"
+        return (
+            f"You have access to a deck-control utility at "
+            f"{dispatcher}. Invoke it via the Bash tool to surface "
+            f"files in the netrunner's UI panel:\n"
+            f"  python {dispatcher} files add <path>\n"
+            f"  python {dispatcher} files remove <path>\n"
+            f"Use this when you produce a file the netrunner should "
+            f"see in their Files panel — finished outputs, generated "
+            f"reports, etc. Don't surface every intermediate scratch "
+            f"file. Paths can be absolute or relative to your cwd."
+        )
+
+    def _shorten_path(self, p: str) -> str:
+        """Render `p` with `~/` substituted for the cyberdeck home
+        prefix when applicable. Used by Files tab display so the
+        narrow column doesn't burn two-thirds of its width on the
+        home path on every row.
+
+        '~/' here means cyberdeck-home (the soft-sandbox dir,
+        defaults to cyberdeck-home/), NOT the OS user home. The
+        construct's perspective is that ~ is the deck's working
+        root — that's the convention we mirror.
+
+        Falls back to the original path string if it isn't under
+        home (e.g., constructs touching /tmp scratch files), or if
+        Path() can't parse it for any reason. Best-effort
+        cosmetics — never crashes file display over a weird path."""
+        try:
+            path_obj = Path(p)
+            rel = path_obj.relative_to(self.home_dir)
+            return f"~/{rel.as_posix()}"
+        except (ValueError, OSError):
+            return p
+
+    def _append_files(self, construct_id: str, files: list[str]) -> None:
+        """Append files to the right-panel Files tab. Each entry
+        becomes a focusable FileListItem so C1g.4 can wire space →
+        launch-with-file-context. Best-effort — no-op if the widget
+        isn't mounted (m3 mode / pre-mount race / test harness
+        without the right panel).
+
+        De-dupes by NORMALIZED absolute path: if a path is already
+        in the panel under any equivalent form, skip it. This lets
+        BOTH the auto-surface path (finalize meta event with
+        files-touched list) AND the dispatcher path (explicit
+        cyberdeck files add invocation) coexist without producing
+        duplicate entries when they refer to the same file.
+        Provenance (which construct surfaced it) goes to whichever
+        path got there first.
+
+        Why normalized rather than literal: on Windows in particular,
+        `C:\\Users\\...\\foo.md` and `C:/Users/.../foo.md` are the
+        same file but compare unequal as strings. The dispatcher
+        does `Path(p).resolve()` which can normalize one way; the
+        construct's Write capture preserves whatever the model
+        passed. Without normalization, identical files double up
+        (this was the "Files panel double-listing" report). Same
+        applies to redundant separators (`a//b`), trailing slashes,
+        and `.` segments. We match on
+        `os.path.normcase(os.path.normpath(p))` which collapses all
+        of those without touching displayed paths.
+        """
+        try:
+            files_lv = self.query_one("#files_list", ListView)
+        except Exception:
+            return
+
+        def _norm(p: str) -> str:
+            # normpath collapses `.`, `..`, redundant separators.
+            # normcase folds case + slash style on Windows (no-op on
+            # POSIX). Combined, two paths to the same file collide.
+            try:
+                return os.path.normcase(os.path.normpath(p))
+            except Exception:
+                return p  # never crash the panel over a path quirk
+
+        existing_keys = {
+            _norm(item.file_path)
+            for item in files_lv.children
+            if isinstance(item, FileListItem)
+        }
+        for fp in files:
+            key = _norm(fp)
+            if key in existing_keys:
+                continue
+            display = self._shorten_path(fp)
+            files_lv.append(FileListItem(construct_id, fp, display_path=display))
+            existing_keys.add(key)
+
+    def _chatlog_write(self, line: str) -> None:
+        """Append a single chatlog line with an HH:MM:SS dim-prefix.
+
+        The line is expected to already include color/markup from the
+        formatter; this helper just stamps a timestamp on the front and
+        writes to the right-panel chatlog RichLog.
+
+        No-op if the chatlog widget isn't mounted (m3/keyboard-only mode,
+        or pre-mount race). Mechanical extraction is best-effort by
+        design — dropping a line never breaks anything else."""
+        try:
+            chatlog = self.query_one("#chatlog_log", RichLog)
+        except Exception:
+            return
+        # Defensive: collapse any embedded newlines to spaces so the
+        # write is guaranteed to be one logical entry. Tool inputs
+        # (especially WebSearch queries and unknown-tool fallbacks)
+        # can occasionally contain \n that would otherwise produce
+        # multi-strip writes that look like data corruption when
+        # the panel is narrow.
+        if "\n" in line or "\r" in line:
+            line = line.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        ts = time.strftime("%H:%M:%S", time.localtime())
+        chatlog.write(f"[dim]{ts}[/dim]  {line}")
+
+    def _render_chatlog_buffer(self, *, untruncated: bool = False) -> list[str]:
+        """Re-render the chatlog event buffer to a list of formatted
+        strings. Used by the ExpandModal so the modal can show
+        un-truncated content (untruncated=True passes through to the
+        formatters' looser sanity caps).
+
+        Each entry includes the HH:MM:SS prefix that _chatlog_write
+        normally stamps on, derived from the buffered event's own
+        timestamp so the modal's lines line up with what the live
+        chatlog showed (give or take async ordering).
+
+        Returns lines suitable for direct write to a RichLog with
+        markup=True; the caller doesn't need to do further formatting.
+        """
+        out: list[str] = []
+        for kind, event in self._chatlog_event_buffer:
+            try:
+                if kind == "fleet":
+                    line = chatlog_format_fleet(event, untruncated=untruncated)
+                elif kind == "daemon":
+                    line = chatlog_format_daemon(event, untruncated=untruncated)
+                else:
+                    line = None
+            except Exception:
+                # A buggy formatter shouldn't take down the modal —
+                # skip the line and continue.
+                continue
+            if line is None:
+                continue
+            # Same newline-collapse as _chatlog_write so the modal's
+            # lines stay one-strip-each.
+            if "\n" in line or "\r" in line:
+                line = line.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+            ts = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
+            out.append(f"[dim]{ts}[/dim]  {line}")
+        return out
+
+    def _handle_meta(self, fevent: FleetEvent) -> None:
+        ptype = fevent.payload.get("type")
+        fleet_log = self.query_one("#fleet_log", RichLog)
+        if ptype == "spawned":
+            task = fevent.payload.get("task", "")
+            parent_id = fevent.payload.get("parent_id")
+            # When this is an inject follow-up, the actual task sent to
+            # claude has a "[Netrunner halted/added...]" framing prefix.
+            # That's right for the model; wrong for the pane preview
+            # (verbose, repetitive across every inject). Strip it so the
+            # pane shows the user's actual message. The framed prompt
+            # still goes to claude unchanged — this is display-only.
+            display_task = task
+            if parent_id is not None and task.startswith("[Netrunner"):
+                marker = "]\n\n"
+                idx = task.find(marker)
+                if idx != -1:
+                    display_task = task[idx + len(marker):]
+            self._spawn_pane(
+                fevent.construct_id, display_task,
+                injected_from=parent_id,
+                profile_name=fevent.payload.get("profile_name"),
+            )
+            # If this spawn has a parent (i.e., it's an inject follow-up),
+            # update the parent pane to show the outgoing chevron link.
+            # The parent's REDIRECTED state was set at finalize time;
+            # this completes the visual story by pointing at the
+            # destination.
+            if parent_id is not None:
+                parent_pane = self.panes.get(parent_id)
+                if parent_pane is not None:
+                    parent_pane.set_injected_to(fevent.construct_id)
+                fleet_log.write(
+                    f"[cyan]+[/cyan] {fevent.construct_id}  "
+                    f"[dim](continuing {parent_id})[/dim]"
+                )
+            else:
+                fleet_log.write(f"[cyan]+[/cyan] {fevent.construct_id}")
+        elif ptype == "finalized":
+            pane = self.panes.get(fevent.construct_id)
+            files = fevent.payload.get("files_written") or []
+            # Peek (don't pop) at the pending injection so we can decide
+            # the visual state. Pop happens just below, after we've used
+            # the metadata to drive the followup spawn.
+            pending = self._pending_injections.get(fevent.construct_id)
+            finalized_state = fevent.payload.get("state", "?")
+            final_output = fevent.payload.get("final_output") or ""
+            if pane is not None:
+                if pending is not None and pending[0] == "interrupt":
+                    # Interrupt-inject: we killed the construct, but the
+                    # session continues in a new construct. KILLED would
+                    # be technically true but visually misleading — show
+                    # REDIRECTED instead. Queue-inject leaves the natural
+                    # finalized state (DONE/FAILED/etc.) since the work
+                    # genuinely completed before the followup.
+                    pane.state = "redirected"
+                else:
+                    pane.state = finalized_state
+                if files:
+                    pane.set_files_written(files)
+                # Anomaly check: a construct that ran cleanly but
+                # produced zero stream-json events AND no output is
+                # almost always a sign that something went wrong silently
+                # — most notoriously, Windows argv mangling on multiline
+                # tasks (claude receives garbage, exits 0, emits nothing).
+                # Surface it loudly in the pane log so the netrunner
+                # doesn't have to guess why their inject "worked but
+                # didn't do anything." Skip for killed/redirected — those
+                # were terminated before they had time to produce events,
+                # which is expected, not anomalous.
+                if (pane._event_count == 0
+                        and finalized_state == "done"
+                        and not final_output.strip()
+                        and not files):
+                    pane.add_event(
+                        "anomaly",
+                        "(no stream-json events received — subprocess "
+                        "exited 0 with no output)",
+                        "no events received",
+                    )
+            runtime = fevent.payload.get("runtime", 0)
+            file_suffix = f" [cyan]→ {len(files)} file(s)[/cyan]" if files else ""
+            display_state = (
+                "redirected"
+                if (pending is not None and pending[0] == "interrupt")
+                else finalized_state
+            )
+            # State-aware glyph + color so the netrunner can scan the
+            # log and tell at a glance which constructs ended cleanly,
+            # which were terminated, and which got redirected. Falls
+            # back to a neutral marker for unknown states.
+            glyph_style = {
+                "done":       ("✓", "cyan"),
+                "failed":     ("✗", "red"),
+                "killed":     ("×", "orange1"),
+                "redirected": ("↪", "bright_blue"),
+            }.get(display_state, ("·", "dim"))
+            glyph, color = glyph_style
+            fleet_log.write(
+                f"[{color}]{glyph}[/{color}] {fevent.construct_id}: "
+                f"{display_state} ({runtime:.1f}s){file_suffix}"
+            )
+            # Files panel auto-surface: every file the construct
+            # touched gets pushed to the Files tab (per spec — sourced
+            # from the files_written capture in the construct event
+            # stream). _append_files de-dupes by absolute path, so
+            # constructs that ALSO call the cyberdeck dispatcher to
+            # explicitly surface a file don't double-up here.
+            #
+            # The dispatcher path remains useful for the case where a
+            # construct discovers a pre-existing file via Glob/LS
+            # (didn't touch it via Read/Write/Edit so it wouldn't be
+            # in `files`) and wants to put it on the netrunner's
+            # radar.
+            if files:
+                self._append_files(fevent.construct_id, files)
+            # Pending injections still need to fire on finalize:
+            pending = self._pending_injections.pop(
+                fevent.construct_id, None,
+            )
+            if pending is not None:
+                self.run_worker(
+                    self._spawn_injected_followup(
+                        fevent.construct_id, *pending,
+                    ),
+                    name=f"inject-{fevent.construct_id}",
+                )
+            # Schedule this pane to compact and pin to the bottom after
+            # the grace period. Done/failed/killed/redirected all qualify
+            # — they're all "this construct is finished doing things."
+            # The netrunner can still expand them; they just stop hogging
+            # screen real estate by default.
+            self._schedule_compact_pane(fevent.construct_id)
+        # run_start / run_end are noise in the TUI; logged to file regardless
+
+    def _handle_event_kind(self, fevent: FleetEvent) -> None:
+        pane = self.panes.get(fevent.construct_id)
+        if pane is None:
+            return  # event arrived before pane mounted; shouldn't happen but safe
+        if pane.state == "starting":
+            pane.state = "running"
+        event_kind = fevent.payload.get("event_kind", "?")
+        raw = fevent.payload.get("raw", {})
+        # Two summaries with different jobs: log_summary is the verbose
+        # archival line that fills the expanded log; activity_summary
+        # is the "what's it doing right now" line on the always-visible
+        # row. summarize_for_activity returns None for noise events
+        # (system_init, tool_result), letting the prior activity line
+        # persist instead of being overwritten with plumbing details.
+        log_summary = summarize(raw)
+        activity_summary = summarize_for_activity(raw)
+        pane.add_event(event_kind, log_summary, activity_summary, raw=raw)
+
+    def _spawn_pane(
+        self,
+        construct_id: str,
+        task: str,
+        injected_from: Optional[str] = None,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        pane = ConstructPane(
+            construct_id, task,
+            injected_from=injected_from,
+            profile_name=profile_name,
+        )
+        self.panes[construct_id] = pane
+        main = self.query_one("#main", VerticalScroll)
+        main.mount(pane)
+        # If there are already terminal (compact) panes pinned at the
+        # bottom, hop the new pane above them. mount() puts the new
+        # widget at the end of the children list by default; we push
+        # it before the first compact pane so the order stays:
+        #   [active panes]  ← new one lands here
+        #   [compact / terminal panes pinned at bottom]
+        first_compact = next(
+            (p for p in self.panes.values() if p.compact and p is not pane),
+            None,
+        )
+        if first_compact is not None:
+            try:
+                main.move_child(pane, before=first_compact)
+            except Exception:
+                # move_child can race against the mount; if it fails
+                # the pane just stays at the end of main, mixed in
+                # with the compact panes. Cosmetic, not fatal.
+                pass
+
+    def _schedule_compact_pane(self, construct_id: str) -> None:
+        """Plan to compact this pane after a short grace period.
+
+        The delay (COMPACT_DELAY_SECS) lets the netrunner glance at
+        the result before it shrinks. If the pane is already gone by
+        the time the timer fires (e.g., EJECT cleared it), the worker
+        just returns. No-op if the pane is already compact."""
+        existing = self.panes.get(construct_id)
+        if existing is None or existing.compact:
+            return
+        self.run_worker(
+            self._compact_pane_after_delay(construct_id, self.COMPACT_DELAY_SECS),
+            name=f"compact-{construct_id}",
+        )
+
+    async def _compact_pane_after_delay(
+        self, construct_id: str, delay: float,
+    ) -> None:
+        """Wait `delay` seconds, then mark the pane compact, force-collapse
+        it, and move it to the bottom of #main. Idempotent: if called
+        twice for the same pane the second invocation is a no-op."""
+        await asyncio.sleep(delay)
+        pane = self.panes.get(construct_id)
+        if pane is None or pane.compact:
+            return
+        pane.compact = True
+        # Force-collapse on transition. The user can re-expand later;
+        # we just don't want a fully-expanded log eating screen real
+        # estate at the bottom by default.
+        pane.expanded = False
+        # Move to the bottom of #main. move_child is sync and preserves
+        # child widget state — important because the pane's log content
+        # (everything the construct produced) lives in a child RichLog
+        # that we want to keep around for autopsy.
+        try:
+            main = self.query_one("#main", VerticalScroll)
+            children = list(main.children)
+            if children and children[-1] is not pane:
+                main.move_child(pane, after=children[-1])
+        except Exception:
+            # If move fails, the compact styling alone still de-emphasizes
+            # the pane. Visual order won't be perfect but nothing's broken.
+            pass
+
+    async def action_quit(self) -> None:
+        # Tell fleet to kill constructs, then let the worker finish.
+        # If Textual exits before fleet fully tears down, the Fleet's
+        # async-context-manager cleanup may not run — that's acceptable
+        # for a quick quit. The NDJSON log is flushed per-write anyway.
+        if self.fleet is not None:
+            self.fleet.shutdown()
+        self.exit()
+
+    # ---- EJECT (emergency halt) ----------------------------------------
+
+    def action_open_eject(self) -> None:
+        """Open the EJECT confirmation modal. The modal handles the
+        deliberate-consent step; if confirmed, _do_eject does the
+        actual halting."""
+        # Don't stack EJECT modals if one's already open
+        if isinstance(self.screen, (EjectScreen, EjectedScreen)):
+            return
+        self.push_screen(EjectScreen(), self._handle_eject_confirmed)
+
+    def _handle_eject_confirmed(self, confirmed: bool) -> None:
+        """Callback from EjectScreen. Confirmed=True means commit;
+        False means user cancelled or timed out."""
+        if not confirmed:
+            return
+        # Run the eject as a worker so we don't block the UI on cleanup.
+        self.run_worker(self._do_eject(), exclusive=False, name="eject")
+
+    async def _do_eject(self) -> None:
+        """The actual destruction. SIGKILL all constructs, halt the
+        daemon, drain queues, write a postmortem snapshot, then show
+        the post-eject screen.
+
+        Critical: every kill is AWAITED before we proceed. Earlier
+        versions only signaled shutdown and let the loop catch up
+        eventually, which let constructs run to completion before the
+        kill propagated. EJECT is the "I want this to STOP NOW" path —
+        we wait for processes to actually die before showing 'EJECTED'."""
+        # Snapshot FIRST, while state is still readable. If we kill
+        # everything before snapshotting, we lose the postmortem.
+        snapshot_path: Optional[Path] = None
+        try:
+            snapshot_path = self._write_ejection_snapshot()
+        except Exception as e:
+            try:
+                self.query_one("#fleet_log", RichLog).write(
+                    f"[red]eject: snapshot failed:[/red] {e!r}"
+                )
+            except Exception:
+                pass
+
+        # Kill all live constructs DIRECTLY and WAIT. Bypassing
+        # fleet.shutdown() (which only sets a flag) means we don't
+        # rely on the run loop to notice — we kill them ourselves.
+        # Construct.kill() does SIGTERM-then-SIGKILL with a 2s timeout
+        # per construct; we run them in parallel.
+        if self.fleet is not None:
+            try:
+                live = [
+                    c for c in self.fleet._constructs
+                    if c.state.value not in ("done", "failed", "killed")
+                ]
+                if live:
+                    await asyncio.gather(
+                        *(c.kill() for c in live),
+                        return_exceptions=True,
+                    )
+                # Now signal the fleet's run loop to exit too. With all
+                # constructs killed, this is mostly a no-op but keeps
+                # state consistent.
+                self.fleet.shutdown()
+            except Exception:
+                pass
+
+        # Cancel the daemon task and WAIT for it to actually unwind.
+        # Without the await, _do_eject returns while the daemon's
+        # _drive_daemon coroutine is still mid-step.
+        if self._daemon_task is not None and not self._daemon_task.done():
+            self._daemon_task.cancel()
+            try:
+                await self._daemon_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if self.session is not None:
+            try:
+                await self.session.shutdown()
+            except Exception:
+                pass
+
+        # Cancel pool warming (already-warm sessions remain in manifest
+        # and stay valid for next launch — eject doesn't invalidate them).
+        if self.session_pool is not None:
+            try:
+                await self.session_pool.shutdown()
+            except Exception:
+                pass
+
+        # Surface in fleet log too — the user might miss the modal at
+        # first if the screen flashed.
+        try:
+            self.query_one("#fleet_log", RichLog).write(
+                "[red b]EJECTED[/red b]"
+            )
+        except Exception:
+            pass
+
+        # Show post-eject modal with snapshot path + return-or-quit.
+        # By now: constructs killed, daemon cancelled, pool stopped.
+        self.push_screen(
+            EjectedScreen(snapshot_path=snapshot_path),
+            self._handle_post_eject_choice,
+        )
+
+    def _handle_post_eject_choice(self, choice: Optional[str]) -> None:
+        """User picked 'idle' (return to goal-select) or 'quit'."""
+        if choice == "quit":
+            self.exit()
+            return
+        # 'idle' or None (Esc): clean up and return to idle state.
+        # Most of the cleanup already happened in _do_eject; we just
+        # need to reset the UI state and let the user start over.
+
+        # Clear the construct panes from the prior run. After eject,
+        # the panes show killed constructs that are no longer
+        # meaningful — wipe the slate so the next run starts clean.
+        try:
+            main_container = self.query_one("#main", VerticalScroll)
+            for pane in list(self.panes.values()):
+                try:
+                    pane.remove()
+                except Exception:
+                    pass
+            self.panes.clear()
+        except Exception:
+            pass
+
+        self._return_to_idle()
+
+        # Reset pool meter to "warming from scratch" — the prior
+        # session pool was shutdown'd, the new fleet will warm fresh.
+        if self.pool_meter is not None and self.use_pool:
+            self.pool_meter.update_state(
+                warm=0, warming=0, target=self.pool_size,
+            )
+
+        # Restart the fleet worker so the user can spawn fresh
+        # constructs after EJECT. exclusive=True cancels any
+        # leftover fleet worker.
+        self.run_worker(self._drive_fleet(), exclusive=True, name="fleet")
+
+    def _write_ejection_snapshot(self) -> Optional[Path]:
+        """Write a JSON postmortem of the current run. Returns the
+        path on success, raises on failure (caller handles the log)."""
+        if self.fleet is None:
+            return None
+        # File alongside the run log (same parent dir as cyberdeck.log).
+        log_dir = self.log_path.parent if self.log_path else Path(".")
+        snapshot_path = log_dir / f"ejected-{self.fleet.run_id}.json"
+
+        # Build the snapshot. Be defensive about every field — eject
+        # is a "things may already be on fire" path; we want to write
+        # what we can rather than fail because one attribute is None.
+        snapshot: dict = {
+            "ejected_at": time.time(),
+            "run_id": self.fleet.run_id,
+            "reason": "user_eject",
+            "fleet": {
+                "total_spawned": getattr(self.fleet, "total_spawned", 0),
+                "total_finalized": getattr(self.fleet, "total_finalized", 0),
+                "total_cost_usd": getattr(self.fleet, "total_cost_usd", 0.0),
+                "total_tokens_in": getattr(self.fleet, "total_tokens_in", 0),
+                "total_tokens_out": getattr(self.fleet, "total_tokens_out", 0),
+            },
+            "constructs": [],
+            "daemon": None,
+            "goal": self.goal,
+        }
+
+        # Per-construct dump
+        try:
+            for c in getattr(self.fleet, "_constructs", []):
+                snapshot["constructs"].append({
+                    "id": c.id,
+                    "task": getattr(c, "task", ""),
+                    "state": c.state.value if hasattr(c, "state") else "?",
+                    "session_id": getattr(c, "session_id", None),
+                    "exit_code": getattr(c, "exit_code", None),
+                    "runtime": getattr(c, "runtime", None),
+                    "files_written": list(getattr(c, "files_written", [])),
+                    "final_output": (getattr(c, "final_output", "") or "")[:2048],
+                })
+        except Exception:
+            pass  # partial snapshot is better than no snapshot
+
+        # Daemon state
+        if self.daemon is not None:
+            try:
+                snapshot["daemon"] = {
+                    "id": getattr(self.daemon, "id", None),
+                    "session_id": getattr(self.daemon, "_session_id", None),
+                    "claude_bin": getattr(self.daemon, "claude_bin", None),
+                }
+            except Exception:
+                pass
+
+        # Atomic write: serialize to temp, then rename. Same pattern as
+        # session manifest, for the same reason — a crash mid-write
+        # shouldn't leave a half-written postmortem.
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = snapshot_path.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2, default=str)
+        os.replace(tmp_path, snapshot_path)
+        return snapshot_path
+
+    # ---- M3 navigation + actions ---------------------------------------
+
+    def _pane_list(self) -> list[ConstructPane]:
+        """Ordered list of mounted construct panes in *visual* order.
+
+        Uses the actual children of #main so move_child reordering
+        (active panes above, compact ones below) is reflected in
+        keyboard navigation. Falls back to dict-insertion order if
+        the container isn't mounted yet."""
+        try:
+            main = self.query_one("#main", VerticalScroll)
+            return [c for c in main.children if isinstance(c, ConstructPane)]
+        except Exception:
+            return list(self.panes.values())
+
+    def _focused_pane(self) -> Optional[ConstructPane]:
+        f = self.focused
+        return f if isinstance(f, ConstructPane) else None
+
+    # ---- focus / section navigation ------------------------------------
+
+    # Section adjacency map. A section is a structural region of the
+    # screen; widgets focused within a section determine which one is
+    # "active." Adjacency is spatial (no wrap) per the keymap spec.
+    #
+    # Layout:
+    #     ┌────────┬──────┬────────────┐
+    #     │sidebar │ main │right_panel │
+    #     ├────────┴──────┴────────────┤
+    #     │       daemon_bar           │
+    #     └────────────────────────────┘
+    _SECTION_NEIGHBORS = {
+        # section_id -> {direction: neighbor_section_id_or_None}
+        "sidebar":     {"up": None,  "down": "daemon_bar", "left": None,        "right": "main"},
+        "main":        {"up": None,  "down": "daemon_bar", "left": "sidebar",   "right": "right_panel"},
+        "right_panel": {"up": None,  "down": "daemon_bar", "left": "main",      "right": None},
+        "daemon_bar":  {"up": "main", "down": None,        "left": None,        "right": None},
+    }
+
+    # All four sections are always mounted in M5.2+. Daemon idle state
+    # means "no goal active," not "no daemon panel exists."
+    def _available_sections(self) -> set[str]:
+        return {"sidebar", "main", "right_panel", "daemon_bar"}
+
+    def _section_of(self, widget) -> Optional[str]:
+        """Walk up the widget tree to find which section a widget lives in."""
+        node = widget
+        while node is not None:
+            wid = getattr(node, "id", None)
+            if wid in self._SECTION_NEIGHBORS:
+                return wid
+            node = getattr(node, "parent", None)
+        return None
+
+    def _current_section(self) -> str:
+        """Best guess at the active section based on focus. Defaults to
+        'main' if nothing is focused (the most useful place to land)."""
+        focused = self.focused
+        if focused is not None:
+            section = self._section_of(focused)
+            if section is not None:
+                return section
+        return "main"
+
+    def _focus_section(self, section: str) -> None:
+        """Move focus to the canonical first widget of a section.
+        No-op if the section isn't mounted (e.g., right_panel in m3)."""
+        if section not in self._available_sections():
+            return
+
+        if section == "main":
+            panes = self._pane_list()
+            if panes:
+                panes[0].focus()
+            return
+
+        if section == "sidebar":
+            # Goal pane is the only focusable in the sidebar. In m3
+            # mode (no goal) there's nothing focusable; this is a no-op.
+            if self.goal_pane is not None:
+                self.goal_pane.focus()
+            return
+
+        if section == "right_panel":
+            # Focus the content list of the active tab (Files or Tools).
+            # Tab cycling within this section swaps the active tab and
+            # refocuses the new content — see _cycle_in_section. Tab
+            # buttons themselves aren't focus targets (Textual
+            # convention; tabs are meta-controls, content is focused).
+            target = self._right_panel_active_content()
+            if target is not None:
+                target.focus()
+            return
+
+        if section == "daemon_bar":
+            # Bottom panel went tabbed (Daemon + Watchdog). Focus the
+            # active tab's RichLog so keyboard nav (uppercase S into
+            # daemon_bar) lands on the actual focusable target.
+            # Mirrors right_panel handling above.
+            target = self._bottom_panel_active_content()
+            if target is not None:
+                target.focus()
+            return
+
+    def action_list_up(self) -> None:
+        """w: move focus to the previous focusable in the current
+        section. Pure focus traversal — no scroll handling. Use W
+        (capital) to scroll the focused log up.
+        """
+        self._list_walk(direction="up")
+
+    def action_list_down(self) -> None:
+        """s: mirror of action_list_up. Pure focus traversal."""
+        self._list_walk(direction="down")
+
+    def action_section_left(self) -> None:
+        self._jump_section("left")
+
+    def action_section_right(self) -> None:
+        self._jump_section("right")
+
+    def action_scroll_up(self) -> None:
+        """W: scroll the focused log up by one line. Also flips the
+        log out of auto-scroll/follow mode so new events don't yank
+        the viewport back to the bottom while the netrunner is reading.
+        Auto-scroll re-engages when they scroll all the way back to
+        the bottom (standard tail -f / chat-app convention).
+
+        No-op if focused widget isn't scrollable or already at top."""
+        self._scroll_focused(direction="up")
+
+    def action_scroll_down(self) -> None:
+        """S: scroll the focused log down by one line. If this lands
+        the viewport at the bottom edge, auto-scroll re-engages so
+        new events resume tailing."""
+        self._scroll_focused(direction="down")
+
+    def action_scroll_left(self) -> None:
+        """A: scroll the focused log left by one column. Useful when
+        we have horizontal scroll (chatlog with wrap=False, long log
+        lines)."""
+        self._scroll_focused(direction="left")
+
+    def action_scroll_right(self) -> None:
+        """D: scroll the focused log right by one column."""
+        self._scroll_focused(direction="right")
+
+    def _scroll_focused(self, direction: str) -> None:
+        """Implementation of lowercase w/a/s/d — "act on what you have"
+        within the focused widget. Behavior depends on widget type:
+
+          - RichLog / ScrollView / generic scrollable: scroll by line
+            (vertical) or column (horizontal). Manages auto_scroll
+            state per the follow-tail convention:
+            * Scrolling up disables auto_scroll (netrunner is reading
+              history; don't yank them back).
+            * Scrolling down to the bottom re-enables auto_scroll
+              (netrunner is back at the live edge; resume tailing).
+            Horizontal scrolls don't touch auto_scroll — that's
+            only a vertical-axis concept.
+
+          - ListView: w/s steps the cursor between items (the natural
+            unit for a discrete list); a/d are no-ops because list
+            items are full-width and have no horizontal axis. We
+            don't try to fake it with viewport-scroll — stepping is
+            what the netrunner means.
+
+          - ConstructPane: focus target is the pane (so q/k/etc.
+            land), but the scrollable content is the inner pane_log.
+            Resolve to the inner widget before scrolling.
+        """
+        focused = self.focused
+        if focused is None:
+            return
+
+        # ListView: w/s = step item, a/d = no-op. Done before the
+        # generic scroll path because ListView ALSO has scroll_<dir>
+        # methods that would scroll the viewport — but viewport-
+        # scrolling a list of discrete items doesn't match the
+        # netrunner's intent.
+        if isinstance(focused, ListView):
+            if direction == "up":
+                focused.action_cursor_up()
+            elif direction == "down":
+                focused.action_cursor_down()
+            # a/d intentionally do nothing — lists are vertical.
+            return
+
+        # ConstructPane → its inner pane_log. The pane is the focus
+        # target (so it can receive inject/kill/etc. actions), but the
+        # scrollable surface is the log inside it.
+        target = focused
+        if isinstance(focused, ConstructPane):
+            try:
+                target = focused.query_one("#pane_log")
+            except Exception:
+                return
+        # Duck-type: any scrollable widget exposes scroll_<dir> methods.
+        scroll_method = getattr(target, f"scroll_{direction}", None)
+        if scroll_method is None:
+            return
+        scroll_method(animate=False)
+        # Auto-scroll management for vertical scrolls only.
+        if direction == "up" and hasattr(target, "auto_scroll"):
+            target.auto_scroll = False
+        elif direction == "down" and hasattr(target, "auto_scroll"):
+            if getattr(target, "is_vertical_scroll_end", False):
+                target.auto_scroll = True
+
+    def _list_walk(self, direction: str) -> None:
+        """Implementation of W/S — pure focus traversal. Walk to the
+        prev/next focusable in the current section. At the edge of
+        the section, fall through to the first focusable of the
+        up/down neighbor section.
+
+        Cross-section fall-through matters because some sections only
+        have one focusable (right_panel's active tab content,
+        daemon_bar's active tab log). Without fall-through, W/S in
+        those sections is dead — you can't get OUT of right_panel
+        downward, and you can't get INTO daemon_bar at all (a/d only
+        navigates left/right). Fall-through lets a netrunner press S
+        from right_panel and land in daemon_bar's active log, which
+        is the natural "go to the next thing below" gesture.
+
+        Empty neighbor sections are skipped transitively (same as
+        _jump_section). No wrap at the layout edges.
+        """
+        focused = self.focused
+        section = self._current_section()
+        focusables = self._focusables_in_section(section)
+
+        if not focusables:
+            # Nothing focusable here — try to fall through immediately.
+            self._fall_through_to_neighbor(section, direction)
+            return
+
+        try:
+            idx = focusables.index(focused)
+        except (ValueError, AttributeError):
+            # Nothing focused in this section yet — pick a sensible
+            # starting point based on direction.
+            idx = 0 if direction == "down" else len(focusables) - 1
+            focusables[idx].focus()
+            return
+
+        if direction == "up":
+            new_idx = idx - 1
+            if new_idx < 0:
+                # At top of section; fall through upward.
+                self._fall_through_to_neighbor(section, "up")
+                return
+        else:
+            new_idx = idx + 1
+            if new_idx >= len(focusables):
+                # At bottom of section; fall through downward.
+                self._fall_through_to_neighbor(section, "down")
+                return
+        focusables[new_idx].focus()
+
+    def _fall_through_to_neighbor(self, section: str, direction: str) -> None:
+        """Walk to the up/down neighbor section's first focusable,
+        skipping empty sections transitively. If the direct chain
+        dead-ends because we walked through empty sections to a None
+        terminator, fall back to any non-source populated section so
+        the netrunner doesn't get trapped.
+
+        The trap was: daemon_bar.up = main; main is empty (no
+        constructs spawned); main.up = None. Without the fallback,
+        pressing W from daemon_bar with an empty main is a no-op,
+        and the netrunner has no keyboard route back upward.
+
+        The fallback is conditional on having WALKED into at least
+        one section. At a true layout edge (e.g., sidebar pressing W
+        with sidebar.up = None) we stay put — the user is at the
+        boundary, not stuck.
+
+        direction is 'up' or 'down'.
+        """
+        current = section
+        walked = False  # did we step into at least one neighbor?
+        for _ in range(len(self._SECTION_NEIGHBORS)):
+            neighbor = self._SECTION_NEIGHBORS[current][direction]
+            if neighbor is None:
+                break
+            walked = True
+            if self._focusables_in_section(neighbor):
+                self._focus_section(neighbor)
+                return
+            current = neighbor
+        # Direct chain ended. Stay put if we never moved (layout edge);
+        # otherwise jump to any populated non-source section.
+        if not walked:
+            return
+        # Lexical preference: sidebar > main > right_panel > daemon_bar.
+        # In practice this fires for "W from daemon_bar with empty main"
+        # and lands the netrunner in sidebar (goal/fleet_log) — the
+        # closest populated section above.
+        for fallback in ("sidebar", "main", "right_panel", "daemon_bar"):
+            if fallback == section:
+                continue
+            if self._focusables_in_section(fallback):
+                self._focus_section(fallback)
+                return
+
+    def _jump_section(self, direction: str) -> None:
+        """Move focus to the neighbor section in the given direction.
+        Skips empty sections transitively — if `main` has no constructs
+        yet, pressing `d` from `sidebar` lands in `right_panel`. This
+        keeps a/d navigation responsive in idle state where the layout
+        is mostly empty.
+
+        If no non-empty section exists in that direction, stays put.
+
+        As of C1g.1, only "left" / "right" are reachable from
+        keybindings; "up" / "down" are kept for completeness but no
+        action ties to them — w/s now walk within-section instead.
+        """
+        current = self._current_section()
+        # Walk in the given direction, skipping empty sections, up to a
+        # safety bound. Four sections total; we never need >4 hops.
+        section = current
+        for _ in range(len(self._SECTION_NEIGHBORS)):
+            neighbor = self._SECTION_NEIGHBORS[section][direction]
+            if neighbor is None:
+                return  # edge of layout, no wrap
+            if self._focusables_in_section(neighbor):
+                self._focus_section(neighbor)
+                return
+            section = neighbor  # empty; keep walking same direction
+        # No non-empty section found in this direction; stay put.
+
+    def action_focus_next_in_section(self) -> None:
+        """Tab cycle: move to the next focusable widget within the
+        current section. Uses Textual's built-in focus_next but
+        constrained to within-section bounds.
+
+        When a modal is active, defer to the modal's standard focus
+        traversal — section-bounded cycling is a cyberdeck-deck
+        concept that doesn't apply inside a two-input dialog. Without
+        this delegation, Tab in a modal would do nothing (the App's
+        priority Tab binding fires, but `_cycle_in_section` doesn't
+        find any focusables in the deck section the modal is
+        obscuring).
+        """
+        from textual.screen import ModalScreen
+        if isinstance(self.screen, ModalScreen):
+            self.screen.focus_next()
+            return
+        self._cycle_in_section(forward=True)
+
+    def action_focus_prev_in_section(self) -> None:
+        from textual.screen import ModalScreen
+        if isinstance(self.screen, ModalScreen):
+            self.screen.focus_previous()
+            return
+        self._cycle_in_section(forward=False)
+
+    def _focusables_in_section(self, section: str) -> list:
+        """Ordered list of focusable widgets within a section. The
+        order defines tab traversal."""
+        if section == "main":
+            return list(self._pane_list())
+        if section == "sidebar":
+            # goal_pane up top, fleet_log below it. Both focusable
+            # since C1g.1: fleet_log gained focus targeting so w/s
+            # can scroll it. Order matters — w/s walks them in this
+            # order top-to-bottom.
+            items: list = []
+            if self.goal_pane is not None:
+                items.append(self.goal_pane)
+            try:
+                items.append(self.query_one("#fleet_log", RichLog))
+            except Exception:
+                pass
+            return items
+        if section == "right_panel":
+            # Right panel returns whatever focusables the active tab
+            # exposes. Tools tab has TWO ListViews (profiles +
+            # construct tools), each independently focusable; W/S
+            # walks between them. The other tabs each have one
+            # RichLog.
+            return self._right_panel_focusables()
+        if section == "daemon_bar":
+            # Bottom panel went tabbed (Daemon + Watchdog). Active tab's
+            # log is the focusable target. Same shape as right_panel:
+            # only one focusable at a time, since the inactive tab's
+            # content isn't mounted.
+            return self._bottom_panel_focusables()
+        return []
+
+    def _bottom_panel_focusables(self) -> list:
+        """Active bottom-panel tab's focusable content. Mirrors
+        _right_panel_focusables. The TabbedContent that wraps both
+        bottom panes has id='daemon_bar'; we query by that id and
+        ask for its `active` attribute."""
+        try:
+            tabs = self.query_one("#daemon_bar", TabbedContent)
+            if tabs.active == "daemon_tab":
+                return [self.query_one("#daemon_log", RichLog)]
+            if tabs.active == "watchdog_tab":
+                return [self.query_one("#watchdog_log", RichLog)]
+        except Exception:
+            return []
+        return []
+
+    def _bottom_panel_active_content(self):
+        focusables = self._bottom_panel_focusables()
+        return focusables[0] if focusables else None
+
+    def _right_panel_focusables(self) -> list:
+        """Ordered list of focusable widgets in the active right-panel
+        tab. Used by _focusables_in_section and (first element only)
+        by _right_panel_active_content for the tab-cycle code path
+        that just wants 'wherever focus should land when this tab
+        becomes active'."""
+        try:
+            tabs = self.query_one("#right_panel_tabs", TabbedContent)
+            active_tab = tabs.active
+            if active_tab == "chatlog_tab":
+                return [self.query_one("#chatlog_log", RichLog)]
+            if active_tab == "files_tab":
+                return [self.query_one("#files_list", ListView)]
+            if active_tab == "tools_tab":
+                return [
+                    self.query_one("#tools_profile_list", ListView),
+                    self.query_one("#tools_scripts_list", ListView),
+                ]
+        except Exception:
+            return []
+        return []
+
+    def _right_panel_active_content(self):
+        """Default focus target when the right panel becomes the
+        active section — first focusable in the active tab. Used by
+        the tab-cycle code (Tab on the right panel switches tabs and
+        focuses the new tab's first item)."""
+        focusables = self._right_panel_focusables()
+        return focusables[0] if focusables else None
+
+    def _cycle_in_section(self, forward: bool) -> None:
+        section = self._current_section()
+        # Right panel and bottom panel are both tabbed: cycling = swap
+        # the active tab. Single focusable per tab since inactive
+        # content isn't mounted.
+        if section == "right_panel":
+            self._cycle_right_panel_tabs(forward)
+            return
+        if section == "daemon_bar":
+            self._cycle_bottom_panel_tabs(forward)
+            return
+        focusables = self._focusables_in_section(section)
+        if not focusables:
+            return
+        focused = self.focused
+        try:
+            idx = focusables.index(focused)
+        except (ValueError, AttributeError):
+            idx = -1 if forward else 0
+        new_idx = (idx + 1) % len(focusables) if forward else (idx - 1) % len(focusables)
+        focusables[new_idx].focus()
+
+    def _cycle_bottom_panel_tabs(self, forward: bool) -> None:
+        """Swap the active tab in the bottom panel (Daemon ↔ Watchdog)
+        and focus the new tab's content. Mirror of
+        _cycle_right_panel_tabs."""
+        try:
+            tabs = self.query_one("#daemon_bar", TabbedContent)
+        except Exception:
+            return
+        order = ["daemon_tab", "watchdog_tab"]
+        try:
+            cur_idx = order.index(tabs.active)
+        except ValueError:
+            cur_idx = 0
+        new_idx = (cur_idx + 1) % len(order) if forward else (cur_idx - 1) % len(order)
+        tabs.active = order[new_idx]
+        target = self._bottom_panel_active_content()
+        if target is not None:
+            target.focus()
+
+    def _cycle_right_panel_tabs(self, forward: bool) -> None:
+        """Swap the active tab in right_panel (Chatlog -> Files -> Tools)
+        and focus the new tab's content."""
+        try:
+            tabs = self.query_one("#right_panel_tabs", TabbedContent)
+        except Exception:
+            return
+        # Chatlog is the default landing tab; cycle proceeds rightward
+        # through the visual tab order. Adding a fourth tab? Just append.
+        order = ["chatlog_tab", "files_tab", "tools_tab"]
+        try:
+            cur_idx = order.index(tabs.active)
+        except ValueError:
+            cur_idx = 0
+        new_idx = (cur_idx + 1) % len(order) if forward else (cur_idx - 1) % len(order)
+        tabs.active = order[new_idx]
+        # Refocus the new content
+        target = self._right_panel_active_content()
+        if target is not None:
+            target.focus()
+
+    def action_unfocus(self) -> None:
+        self.set_focus(None)
+
+    def action_jump(self, n: int) -> None:
+        """Jump to element N within the current section."""
+        section = self._current_section()
+        focusables = self._focusables_in_section(section)
+        if 1 <= n <= len(focusables):
+            focusables[n - 1].focus()
+
+    def action_jump_construct(self, n: int) -> None:
+        """Global jump to construct N regardless of current section."""
+        panes = self._pane_list()
+        if 1 <= n <= len(panes):
+            panes[n - 1].focus()
+
+    # ---- primary action (Space / Enter on focused element) -------------
+
+    def action_primary(self) -> None:
+        """Space/Enter: do the contextually-obvious INTERACT on the
+        focused element.
+
+        - Construct pane (header) → toggle expand/collapse in layout
+        - Goal pane → start editing
+        - ListView focused with a ProfileListItem highlighted → C1g.4
+          will launch a construct using that profile. Today: surface
+          a 'not yet implemented' message in the fleet log so the
+          netrunner sees the wire-up working without misleading them.
+        - ListView focused with a ScriptListItem highlighted → eventual
+          shortcut for spinning up a one-off construct that exercises
+          just that tool. Today: same fleet-log message.
+        - Otherwise → no-op
+
+        The ExpandModal "magnify this widget" route lives on `z`
+        (action_expand) so it doesn't collide with these list-item
+        interactions.
+        """
+        focused = self.focused
+        if isinstance(focused, ConstructPane):
+            focused.expanded = not focused.expanded
+            return
+        if focused is self.goal_pane and self.goal_pane is not None:
+            self.action_edit_goal()
+            return
+
+        # Bottom-panel logs: space = open the contextually-obvious
+        # modal. Daemon log → action_talk_daemon (currently a stub
+        # that toasts "not yet implemented"; this binding wires the
+        # primary-action affordance now so when the modal lands the
+        # netrunner muscle-memory just works). Watchdog log →
+        # action_talk_watchdog. Same shape as Tools and Files panels:
+        # focus the surface, hit space, primary action fires.
+        # Try blocks scoped to query_one only — if action_* is
+        # missing or raises, that's a real bug we want to surface.
+        try:
+            daemon_log = self.query_one("#daemon_log", RichLog)
+        except Exception:
+            daemon_log = None
+        if daemon_log is not None and focused is daemon_log:
+            self.action_talk_daemon()
+            return
+        try:
+            watchdog_log = self.query_one("#watchdog_log", RichLog)
+        except Exception:
+            watchdog_log = None
+        if watchdog_log is not None and focused is watchdog_log:
+            self.action_talk_watchdog()
+            return
+
+        # ListView path. The ListView itself is the focus target;
+        # `.highlighted_child` is the item currently under the
+        # cursor. We dispatch on its TYPE so future list flavors
+        # (FileListItem in C1g.3, etc.) can each get their own
+        # branch without leaking knowledge into the generic handler.
+        if isinstance(focused, ListView):
+            highlighted = focused.highlighted_child
+            if isinstance(highlighted, ProfileListItem):
+                # Push LaunchScreen with profile context. The callback
+                # composes the spawn with profile= set; user input
+                # becomes the task verbatim.
+                p = highlighted.profile
+                tier_sigil = {
+                    "paranoid": "[green]P[/green]",
+                    "default":  "[dim]D[/dim]",
+                    "yolo":     "[red]Y[/red]",
+                }.get(p.brake_profile, "[dim]?[/dim]")
+                tool_count = (
+                    f"{len(p.allowed_tools)} tools"
+                    if p.allowed_tools else "all tools"
+                )
+                self.push_screen(
+                    LaunchScreen(
+                        header_markup="Launch with profile",
+                        context_markup=(
+                            f"{tier_sigil} [cyan]{p.name}[/cyan]  "
+                            f"[dim]({p.category} · {tool_count} · "
+                            f"{p.brake_profile})[/dim]"
+                        ),
+                    ),
+                    self._make_launch_handler(profile=p),
+                )
+                return
+            if isinstance(highlighted, ScriptListItem):
+                # C1g.4-future: launch a construct configured to use
+                # this script as its primary tool. For now just a
+                # status line so the wiring is testable. The
+                # ProfileListItem launch path is the existing analog.
+                self._notify_fleet_log(
+                    f"[dim yellow]script[/dim yellow] "
+                    f"[dim]{highlighted.category}/[/dim]"
+                    f"[cyan]{highlighted.script_name}[/cyan]: "
+                    f"[dim]launch shortcut not yet "
+                    f"implemented[/dim]"
+                )
+                return
+            if isinstance(highlighted, FileListItem):
+                # Display uses the shortened path so the modal context
+                # line matches what the netrunner saw in the list.
+                # The FILE: envelope (composed in _make_launch_handler)
+                # uses the absolute file_path so the spawned construct
+                # can resolve it unambiguously.
+                self.push_screen(
+                    LaunchScreen(
+                        header_markup="Launch with file",
+                        context_markup=(
+                            f"[cyan]{highlighted.display_path}[/cyan]  "
+                            f"[dim](from {highlighted.construct_id})[/dim]"
+                        ),
+                    ),
+                    self._make_launch_handler(
+                        file_path=highlighted.file_path,
+                    ),
+                )
+                return
+            # Other ListView (none today) — no-op.
+            return
+        # No primary action defined for whatever is focused.
+
+    def _notify_fleet_log(self, line: str) -> None:
+        """Write a one-shot status line to the fleet log. Used for
+        'not yet implemented' notices and similar netrunner-facing
+        feedback that doesn't rise to the level of a chatlog event.
+        Best-effort; failures are absorbed (pre-mount race or m3
+        keyboard-only mode)."""
+        try:
+            fleet_log = self.query_one("#fleet_log", RichLog)
+            fleet_log.write(line)
+        except Exception:
+            pass
+
+    def _make_launch_handler(
+        self,
+        *,
+        profile=None,
+        file_path: Optional[str] = None,
+    ):
+        """Build a callback for LaunchScreen.dismiss() that knows how
+        to compose the spawn for the given context.
+
+        - profile=<Profile>: spawn with that profile, task verbatim.
+        - file_path=<str>: spawn with the active default profile,
+          task wrapped in the FILE: envelope so the construct's
+          initial prompt makes the file context explicit.
+        - Both: profile takes precedence on profile selection; file
+          envelope still applies to the task. (Today we don't push
+          this combination from anywhere — list items are
+          single-context — but the helper handles it cleanly.)
+
+        Returning a closure keeps the spawn logic out of the modal
+        itself (the modal only collects a string). The closure
+        captures `self` and the context, so when the modal dismisses,
+        the closure has everything it needs to fire."""
+        def handler(task: Optional[str]) -> None:
+            if not task:
+                return  # cancel or empty
+            if self.fleet is None:
+                self._notify_fleet_log(
+                    "[red]launch failed:[/red] "
+                    "[dim]no active fleet (set a goal first?)[/dim]"
+                )
+                return
+            # Compose the final task. File context goes in front of
+            # the user's input as a one-shot framing line — the
+            # construct sees it as part of the initial prompt and
+            # treats the file as a primary input.
+            final_task = task
+            if file_path:
+                final_task = f"FILE: {file_path}\n\n{task}"
+            # Profile picks: explicit (from list item) > default.
+            spawn_profile = profile if profile is not None else self.default_profile
+            # Fleet log status line so the netrunner sees the spawn
+            # ack — same shape as _handle_new_task (the n-key path).
+            preview = task[:24] + ("..." if len(task) > 24 else "")
+            origin_label = (
+                f"profile={profile.name}" if profile is not None
+                else f"file={file_path}" if file_path
+                else "n-key"
+            )
+            self._notify_fleet_log(
+                f"[bright_blue]⟳[/bright_blue] launch ({origin_label}): {preview}"
+            )
+            # origin="netrunner" — Tools/Files launch is human-driven.
+            # (Local var renamed to origin_label to avoid shadowing the
+            # spawn kwarg; both are about provenance but at different
+            # granularities — origin_label is descriptive for the log
+            # line, origin is the categorical attribution flag.)
+            self.run_worker(
+                self.fleet.spawn(
+                    final_task,
+                    profile=spawn_profile,
+                    origin="netrunner",
+                ),
+                name="spawn",
+            )
+        return handler
+
+    def action_expand(self) -> None:
+        """z: open ExpandModal on the focused widget.
+
+        Universal magnifier — works on any RichLog (chatlog, fleet
+        log, files, tools, future per-pane logs) and on ConstructPane
+        (routes to the pane's inner log). Snapshot at open time;
+        `r` inside refreshes from the source.
+
+        For chatlog and pane logs, the modal uses an "untruncated"
+        re-render of the source events so long content (multi-paragraph
+        thinking, large tool_results) shows in full rather than being
+        chopped at the same 500-char cap the live view uses.
+        """
+        focused = self.focused
+        if focused is None:
+            return
+
+        # ConstructPane → re-render its event buffer untruncated for
+        # the modal. Same provider-closure pattern as the chatlog: the
+        # modal pulls from the buffer (raw events kept around) and
+        # re-formats with summarize(untruncated=True), so long thinking
+        # blocks and big tool_results show in full rather than the
+        # 500-char chop the live pane uses. `r` inside the modal calls
+        # the provider again — useful when the construct produces new
+        # events while the modal is open.
+        if isinstance(focused, ConstructPane):
+            title = f"Pane log — {focused.construct_id}"
+            pane = focused
+            self.push_screen(ExpandModal(
+                title=title,
+                snapshot_lines=pane.render_buffer(untruncated=True),
+                source_widget_id=None,
+                provider=lambda p=pane: p.render_buffer(untruncated=True),
+            ))
+            return
+
+        # RichLog with un-truncated provider (chatlog, future pane
+        # logs). The provider closure re-renders raw events with
+        # untruncated=True so the modal shows the full content, not
+        # the live-view-trimmed snapshot.
+        if isinstance(focused, RichLog) and focused.id == "chatlog_log":
+            title = "Chatlog (full content)"
+            self.push_screen(ExpandModal(
+                title=title,
+                snapshot_lines=self._render_chatlog_buffer(untruncated=True),
+                source_widget_id="chatlog_log",
+                provider=lambda: self._render_chatlog_buffer(untruncated=True),
+            ))
+            return
+
+        # Any other RichLog (fleet_log, files_list, tools_list) —
+        # snapshot the live widget. These are formatted in-place
+        # without per-event truncation, so the snapshot IS the content.
+        if isinstance(focused, RichLog):
+            title = _expandable_title(focused)
+            source_id = (
+                focused.id
+                if focused.id in _EXPANDABLE_RICHLOGS
+                else None
+            )
+            snapshot = _snapshot_richlog(focused)
+            self.push_screen(ExpandModal(
+                title=title,
+                snapshot_lines=snapshot,
+                source_widget_id=source_id,
+            ))
+            return
+
+        # ListView path: focus is on the ListView itself; the
+        # highlighted child is what we want to view. Each list-item
+        # type loads its content from a different source on disk.
+        # `r` (refresh in modal) re-reads from disk so edits made
+        # while the modal is open show up.
+        if isinstance(focused, ListView):
+            highlighted = focused.highlighted_child
+            if isinstance(highlighted, FileListItem):
+                self._open_file_view(
+                    highlighted.file_path,
+                    display_path=highlighted.display_path,
+                )
+                return
+            if isinstance(highlighted, ProfileListItem):
+                # The profile's source path lives on the registry
+                # entry. Read fresh from disk rather than using
+                # already-loaded TOML values — the disk version
+                # includes comments and the netrunner's exact
+                # whitespace, which is what they typically want to
+                # see when "viewing the profile."
+                src_path = getattr(highlighted.profile, "source_path", None)
+                title = f"Profile: {highlighted.profile.name}"
+                if src_path:
+                    self._open_file_view(str(src_path), title=title)
+                else:
+                    # Built-in or registry-internal profile with no
+                    # source file — render the dataclass repr as a
+                    # fallback. Rare path; default profile usually
+                    # gets seeded to disk on first run.
+                    self._open_text_view(
+                        title=title,
+                        text=repr(highlighted.profile),
+                    )
+                return
+            if isinstance(highlighted, ScriptListItem):
+                title = (
+                    f"Script: {highlighted.category}/"
+                    f"{highlighted.script_name}"
+                )
+                self._open_file_view(
+                    highlighted.script_path, title=title,
+                )
+                return
+            return  # ListView with non-viewable item → no-op
+
+    def _open_file_view(
+        self,
+        path: str,
+        *,
+        title: Optional[str] = None,
+        display_path: Optional[str] = None,
+    ) -> None:
+        """Open ExpandModal with the contents of `path`. Title defaults
+        to a "File: <shortened path>" header. Errors (missing file,
+        permission denied, binary content) surface as a single-line
+        error in the modal rather than crashing — viewing should be
+        forgiving."""
+        if title is None:
+            short = display_path or self._shorten_path(path)
+            title = f"File: {short}"
+
+        provider = lambda p=path: self._load_file_lines(p)
+        snapshot = provider()
+        self.push_screen(ExpandModal(
+            title=title,
+            snapshot_lines=snapshot,
+            source_widget_id=None,
+            provider=provider,  # `r` re-reads from disk
+        ))
+
+    def _open_text_view(self, *, title: str, text: str) -> None:
+        """Open ExpandModal with arbitrary text content. Used as the
+        fallback for list-items that don't map cleanly to a file
+        (e.g. registry-internal profiles)."""
+        lines = text.splitlines() or [text]
+        self.push_screen(ExpandModal(
+            title=title,
+            snapshot_lines=lines,
+            source_widget_id=None,
+        ))
+
+    @staticmethod
+    def _load_file_lines(path: str) -> list:
+        """Read `path` and return its lines for the modal. Failure
+        modes folded into a single error line so the modal can render
+        them like any other content. UTF-8 with replacement so a
+        weird byte doesn't kill the read; size cap so we don't load
+        a 5GB log into RAM.
+
+        For files with a recognized language extension, the entire
+        content goes back as a single Rich Syntax renderable — RichLog
+        renders it line-by-line with pygments-driven syntax highlighting.
+        Falls back to plain-text-with-bracket-escape for unknown
+        extensions, which keeps `[default]` TOML headers from being
+        eaten by the markup parser.
+        """
+        SIZE_CAP = 2_000_000  # 2MB — generous for source/profile/log
+        try:
+            import os as _os
+            size = _os.path.getsize(path)
+            if size > SIZE_CAP:
+                return [
+                    f"[red]file is {size:,} bytes "
+                    f"(over {SIZE_CAP:,} cap); "
+                    f"open it directly to read[/red]",
+                    "",
+                    f"[dim]path: {path}[/dim]",
+                ]
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            if not content:
+                return [f"[dim](empty file: {path})[/dim]"]
+
+            # Try syntax highlighting. If we recognize the file as a
+            # language pygments understands, return a Syntax renderable
+            # in a single-element list. RichLog.write accepts any
+            # Renderable and renders it across multiple visible lines
+            # — w/s scrolling still works line-by-line because each
+            # highlighted line is its own Strip in the viewport.
+            lang = CyberdeckApp._detect_file_language(path, content)
+            if lang is not None:
+                try:
+                    syntax = Syntax(
+                        content,
+                        lang,
+                        # github-dark: balanced, prose-friendly, no
+                        # token backgrounds, muted compared to
+                        # ansi_dark (which used the full ANSI palette
+                        # and felt aggressive). Looks like what
+                        # GitHub / VSCode show by default.
+                        theme="github-dark",
+                        # Line numbers off. The gutter Rich draws for
+                        # them has a slightly tinted background that
+                        # reads as "highlight" — visual weight without
+                        # navigation value for short files. If a netrunner
+                        # needs line numbers for a long source file,
+                        # they're more likely to open it in their
+                        # editor anyway. The modal is for "skim what's
+                        # in here", not "find line 247".
+                        line_numbers=False,
+                        # Source code shouldn't wrap mid-line; reading
+                        # is easier when the visual structure (indent,
+                        # alignment) is preserved. w/s + Home/End nav
+                        # works regardless. Long lines scroll
+                        # horizontally via the body's natural overflow.
+                        word_wrap=False,
+                        # Inherit the terminal/panel background so
+                        # the code area sits flush with the modal
+                        # surface, no second background showing
+                        # through.
+                        background_color="default",
+                    )
+                    return [syntax]
+                except Exception:
+                    # Pygments lexer error or some other rendering
+                    # issue — fall through to plain text rather than
+                    # showing nothing. Whatever broke, the netrunner
+                    # still wants to read the file.
+                    pass
+
+            # Plain-text fallback. Escape opening brackets so the
+            # markup parser doesn't reinterpret literal brackets in
+            # config files / source as color tags.
+            return [line.replace("[", "\\[") for line in content.splitlines()]
+        except FileNotFoundError:
+            return [f"[red]file not found:[/red] {path}"]
+        except PermissionError:
+            return [f"[red]permission denied:[/red] {path}"]
+        except OSError as e:
+            return [f"[red]read failed:[/red] {e}"]
+        except Exception as e:
+            return [f"[red]unexpected error reading file:[/red] {e!r}"]
+
+    # Extension → pygments language name. Conservative coverage —
+    # the most common file types a netrunner would view from the
+    # deck. Pygments knows hundreds more; if you want one added,
+    # check `pygments.lexers.find_lexer_class_by_name(...)` works
+    # and add the extension here.
+    _EXT_TO_LANG = {
+        ".py": "python",
+        ".pyw": "python",
+        ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+        ".toml": "toml",
+        ".md": "markdown", ".markdown": "markdown",
+        ".json": "json", ".jsonl": "json",
+        ".yaml": "yaml", ".yml": "yaml",
+        ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+        ".ts": "typescript",
+        ".tsx": "tsx", ".jsx": "jsx",
+        ".html": "html", ".htm": "html",
+        ".css": "css", ".scss": "scss",
+        ".rs": "rust",
+        ".go": "go",
+        ".c": "c", ".h": "c",
+        ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+        ".java": "java",
+        ".rb": "ruby",
+        ".sql": "sql",
+        ".xml": "xml",
+        ".lua": "lua",
+        ".vim": "vim",
+        ".dockerfile": "dockerfile",
+        ".tf": "hcl",  # terraform
+        ".tfvars": "hcl",
+        ".ini": "ini",
+        ".cfg": "ini",
+        ".diff": "diff", ".patch": "diff",
+    }
+
+    @staticmethod
+    def _detect_file_language(path: str, content: str) -> Optional[str]:
+        """Return a pygments language name for `path`, or None if we
+        don't recognize it. Three signals, in order of reliability:
+
+          1. File extension (most reliable; ~30 supported below).
+          2. Bare-name special cases (Dockerfile, Makefile — these
+             conventionally have no extension).
+          3. Shebang on the first line — catches scripts saved
+             without extensions (`<home>/tools/recon/scan` with
+             `#!/bin/bash` first line).
+
+        Returning None drops the modal back to plain-text rendering.
+        """
+        from pathlib import Path as _Path
+        ext = _Path(path).suffix.lower()
+        if ext in CyberdeckApp._EXT_TO_LANG:
+            return CyberdeckApp._EXT_TO_LANG[ext]
+
+        name_lower = _Path(path).name.lower()
+        # Common no-extension special-case names.
+        if name_lower in ("dockerfile",):
+            return "dockerfile"
+        if name_lower in ("makefile", "gnumakefile"):
+            return "makefile"
+
+        # Shebang-driven detection for executables without extension.
+        first_line = content.split("\n", 1)[0] if content else ""
+        if first_line.startswith("#!"):
+            shebang = first_line.lower()
+            if "python" in shebang:
+                return "python"
+            if "node" in shebang:
+                return "javascript"
+            if "ruby" in shebang:
+                return "ruby"
+            # Order matters: 'bash' check before 'sh' since /bin/bash
+            # contains both, but bash is the more accurate label.
+            if "bash" in shebang:
+                return "bash"
+            if "sh" in shebang:
+                return "bash"  # sh-flavored close enough for highlighting
+            if "perl" in shebang:
+                return "perl"
+        return None
+
+    # ---- construct interaction -----------------------------------------
+
+    def _focused_pane(self) -> Optional[ConstructPane]:
+        f = self.focused
+        return f if isinstance(f, ConstructPane) else None
+
+    def action_kill_focused(self) -> None:
+        """Soft kill: terminate the focused construct. No-op if the
+        construct is already in a terminal state."""
+        pane = self._focused_pane()
+        if pane is None or self.fleet is None:
+            return
+        if pane.state in TERMINAL_PANE_STATES:
+            self._toast(f"{pane.construct_id} already {pane.state}; not killing")
+            return
+        cid = pane.construct_id
+        fleet_log = self.query_one("#fleet_log", RichLog)
+        fleet_log.write(f"[orange1]×[/orange1] {cid}")
+        self.run_worker(self.fleet.kill_construct(cid), name=f"kill-{cid}")
+
+    def action_hard_kill_focused(self) -> None:
+        """Hard kill + blacklist. Currently delegates to soft kill;
+        the blacklist propagation lands when Watchdog is implemented."""
+        pane = self._focused_pane()
+        if pane is None:
+            return
+        if pane.state in TERMINAL_PANE_STATES:
+            self._toast(f"{pane.construct_id} already {pane.state}; not killing")
+            return
+        # TODO(M5+): propagate to Watchdog blacklist when available.
+        # For now, hard-kill behaves as soft-kill so the binding works.
+        self._toast("hard-kill: blacklist not yet implemented; soft-killing")
+        self.action_kill_focused()
+
+    def action_queue_inject(self) -> None:
+        """Open inject modal pre-set to queue mode (deliver at next break)."""
+        self._open_inject_modal(mode="queue")
+
+    def action_interrupt_inject(self) -> None:
+        """Open inject modal pre-set to interrupt mode (kill + redirect)."""
+        self._open_inject_modal(mode="interrupt")
+
+    def _open_inject_modal(self, mode: str) -> None:
+        """Open the inject modal targeting the focused construct, or
+        toast if no construct is focused / focused construct is in a
+        terminal state."""
+        pane = self._focused_pane()
+        if pane is None:
+            self._toast("inject: no construct focused")
+            return
+        if pane.state in TERMINAL_PANE_STATES:
+            # Special-case REDIRECTED: the session continues in a
+            # follow-up construct, so the netrunner probably wanted
+            # that one. Point them at it rather than just refusing.
+            # Without this catch we'd happily spawn a *second* follow-up
+            # against the same session_id that the existing successor
+            # is already using — two parallel turns on one session,
+            # nothing good downstream.
+            if pane.state == "redirected" and pane.injected_to:
+                self._toast(
+                    f"inject: {pane.construct_id} was redirected to "
+                    f"{pane.injected_to} — focus that pane and inject there"
+                )
+            else:
+                self._toast(
+                    f"inject: {pane.construct_id} is {pane.state}; "
+                    f"can't inject into a terminal construct"
+                )
+            return
+        # Verify the construct has a session_id we can resume. Without
+        # one, --resume won't work. Should be present unless the
+        # construct died before its system_init landed.
+        construct = self._construct_by_id(pane.construct_id)
+        if construct is None or construct.session_id is None:
+            self._toast(
+                f"inject: {pane.construct_id} has no session_id yet; "
+                f"can't inject (try again in a moment)"
+            )
+            return
+        self.push_screen(
+            InjectScreen(
+                construct_id=pane.construct_id,
+                construct_task=construct.task,
+                mode=mode,
+            ),
+            self._handle_inject_submitted,
+        )
+
+    def _handle_inject_submitted(
+        self,
+        result: Optional[tuple[str, str, str]],
+    ) -> None:
+        """Callback from InjectScreen. result is (mode, message,
+        target_construct_id) or None.
+
+        target_construct_id comes from the modal, not from current
+        focus — focus may have moved while the modal was up (a
+        construct finalized and focus auto-shifted, the user Tabbed
+        while typing, etc.). We must inject into the construct the
+        netrunner *meant* to inject into, which is the one that was
+        focused at q/Q press time."""
+        if result is None:
+            return
+        mode, message, target_id = result
+        # Look up the original target by id. This is the fix for the
+        # focus-after-modal issue: the construct we want is the one
+        # baked into the modal, not whatever's focused now.
+        construct = self._construct_by_id(target_id)
+        if construct is None or construct.session_id is None:
+            self._toast(
+                f"inject: target {target_id} unavailable "
+                "(may have finalized before injection landed)"
+            )
+            return
+        # Confirm the target is still inject-able. If it terminated
+        # while the modal was up, queue-inject can still spawn a
+        # follow-up via --resume (the session lives on); interrupt
+        # just becomes a no-op kill on a dead process.
+        target_pane = self.panes.get(target_id)
+
+        if mode == "queue":
+            # Polite: wait for the construct to finalize, then spawn a
+            # follow-up with --resume + the new message. Stored on the
+            # app; consumed in _handle_meta when the finalize event fires.
+            # If the construct has ALREADY finalized, the pending entry
+            # would never be consumed via the meta event path — we'd
+            # need to spawn the follow-up directly. Detect that case.
+            already_terminal = (
+                target_pane is not None
+                and target_pane.state in TERMINAL_PANE_STATES
+            )
+            if already_terminal:
+                # Construct finalized while the modal was up. Spawn the
+                # follow-up immediately rather than waiting for a
+                # finalize event that already fired.
+                self.run_worker(
+                    self._spawn_injected_followup(
+                        target_id, "queue", message,
+                        construct.session_id, construct.task,
+                    ),
+                    name=f"inject-{target_id}",
+                )
+                try:
+                    self.query_one("#fleet_log", RichLog).write(
+                        f"[dim]inject (post-finalize) for {target_id}: "
+                        f"{message[:60]}{'...' if len(message) > 60 else ''}[/dim]"
+                    )
+                except Exception:
+                    pass
+                return
+            self._pending_injections[target_id] = (
+                "queue", message, construct.session_id, construct.task,
+            )
+            try:
+                self.query_one("#fleet_log", RichLog).write(
+                    f"[dim]inject queued for {target_id}: "
+                    f"{message[:60]}{'...' if len(message) > 60 else ''}[/dim]"
+                )
+            except Exception:
+                pass
+            return
+
+        # Interrupt: kill current work, then spawn the follow-up with
+        # an explicit redirect framing on the resumed session. The
+        # construct will see "Previous turn was interrupted by the
+        # netrunner. Their new direction supersedes prior intent: ..."
+        # as the next user message.
+        session_id = construct.session_id
+        prior_task = construct.task
+        try:
+            self.query_one("#fleet_log", RichLog).write(
+                f"[yellow]inject interrupting[/yellow] {target_id}"
+            )
+        except Exception:
+            pass
+        # Store as a pending injection so _handle_meta does the spawn
+        # AFTER the kill finalizes (avoids racing the slot semaphore).
+        self._pending_injections[target_id] = (
+            "interrupt", message, session_id, prior_task,
+        )
+        # Now actually kill — finalize event will fire, _handle_meta
+        # will see the pending injection and spawn the follow-up.
+        if self.fleet is not None:
+            self.run_worker(
+                self.fleet.kill_construct(target_id),
+                name=f"inject-kill-{target_id}",
+            )
+
+    def _construct_by_id(self, construct_id: str) -> Optional[Construct]:
+        """Look up a construct by ID via the Fleet's internal list.
+        Returns None if not found or fleet not yet up."""
+        if self.fleet is None:
+            return None
+        for c in self.fleet._constructs:
+            if c.id == construct_id:
+                return c
+        return None
+
+    async def _spawn_injected_followup(
+        self,
+        original_id: str,
+        mode: str,
+        message: str,
+        session_id: str,
+        prior_task: str,
+    ) -> None:
+        """Spawn a follow-up Construct that resumes the prior session
+        with the injected message as the next user turn.
+
+        The two modes carry different *intent* about how the model
+        should integrate the message:
+
+        - queue: "and also this" — the prior work was acceptable; the
+          new message extends or refines it. Additive.
+        - interrupt: "stop, do this instead" — the prior approach is
+          being corrected. The new message may replace or redirect
+          the prior intent rather than supplement it. The model
+          should treat the new message as authoritative course
+          correction, not a parallel addition.
+
+        The framings below are deliberately terse — the model already
+        has its own session history to reason about *what* it was
+        doing; framing only needs to convey the human's *attitude*
+        toward that history.
+
+        original_id is the construct we're following up on. It's threaded
+        into fleet.spawn so the new construct's 'spawned' event carries
+        the link back to its origin — that's how the parent pane learns
+        about its outgoing chevron, and the new pane learns about its
+        incoming chevron."""
+        if self.fleet is None:
+            return
+        if mode == "interrupt":
+            # Stop-and-redirect framing. The bracketed prefix tells
+            # the model the human halted them and is pivoting; the
+            # message body is the new direction. "Reconsider" rather
+            # than "continue" — the model should not assume the new
+            # message complements prior work.
+            framed_task = (
+                "[Netrunner halted you mid-work and is redirecting. "
+                "Reconsider your approach in light of this new "
+                "instruction; do not assume it supplements your "
+                "prior plan.]\n\n"
+                f"{message}"
+            )
+        else:
+            # Queue-inject: additive framing. The prior work finished
+            # naturally; the human waited and is adding to the load.
+            # "Also" signals supplement rather than replacement.
+            framed_task = (
+                "[Netrunner is adding to your work. Continue with your "
+                "prior plan and also address this:]\n\n"
+                f"{message}"
+            )
+        new_construct: Optional[Construct] = None
+        try:
+            new_construct = await self.fleet.spawn(
+                task=framed_task,
+                resume_session_id=session_id,
+                parent_id=original_id,
+                origin="inject",
+            )
+        except Exception as e:
+            try:
+                self.query_one("#fleet_log", RichLog).write(
+                    f"[red]inject spawn failed:[/red] {e!r}"
+                )
+            except Exception:
+                pass
+
+        # If the followup didn't actually spawn, the parent's
+        # REDIRECTED state is a lie (no destination exists). Roll back
+        # to KILLED so the visual matches reality. Queue-inject parents
+        # don't need rollback — their state was already the natural
+        # finalized one (DONE/FAILED/etc.), and a missing followup
+        # just means the chevron link never appears.
+        if new_construct is None and mode == "interrupt":
+            parent_pane = self.panes.get(original_id)
+            if parent_pane is not None:
+                parent_pane.state = "killed"
+
+    # ---- daemon / goal -------------------------------------------------
+
+    def action_talk_watchdog(self) -> None:
+        """t — open AskWatchdogScreen and on submit enqueue the
+        question. Async: this returns immediately, the answer arrives
+        later in the chatlog. The Watchdog has read-only access to
+        the recent event stream so it can answer "what's happening?"
+        questions without affecting any plans.
+
+        Distinct from action_talk_daemon (T) — that's plan-affecting
+        and synchronous. The visual differentiation (yellow border /
+        prefix vs daemon's green) reinforces the gravity difference.
+        """
+        depth = self.watchdog.queue_depth()
+        busy = self.watchdog.is_busy()
+        self.push_screen(
+            AskWatchdogScreen(queue_depth=depth, busy=busy),
+            self._on_watchdog_question_submitted,
+        )
+
+    def _on_watchdog_question_submitted(
+        self, question: Optional[str]
+    ) -> None:
+        """Modal callback. None = cancelled (no-op). Non-empty string
+        = enqueue. We snapshot the recent chatlog into a context blob
+        at submit time so the watchdog reasons about what was
+        happening when the question was asked, not when it eventually
+        gets processed (which could be seconds later if a queue is
+        ahead of it).
+        """
+        if not question:
+            return
+        # Show the question in chatlog immediately. The netrunner's
+        # focus may have moved on by the time the answer comes back;
+        # this anchors the eventual answer to a visible asked-line so
+        # the conversation reads chronologically.
+        self._chatlog_write(
+            rf"[yellow]\[watchdog][/yellow] [dim]asked:[/dim] {question}"
+        )
+        # Also write to the dedicated Watchdog tab — full-fidelity
+        # Q&A history with paragraph breaks preserved. Chatlog gets
+        # the breadcrumb (chronological context); the tab is where
+        # you go to read the actual conversation.
+        if self.watchdog_pane is not None:
+            self.watchdog_pane.write_question(question)
+        # Snapshot the chatlog. Not via _render_chatlog_buffer (which
+        # produces markup-decorated lines) — we want plain text for
+        # the model. Same buffer; same formatters; just no markup
+        # decoration on the result.
+        context_text = self._build_watchdog_context(max_events=30)
+        self.watchdog.ask(
+            question,
+            context_text,
+            self._on_watchdog_answer,
+        )
+        # Update the busy/queue indicator. queue_depth() reflects what's
+        # *waiting* (excludes the in-flight one), so after enqueueing
+        # we recompute. The submitted question may already have been
+        # picked up by the worker — in which case queue_depth=0 and
+        # busy=True. Or it may be queued behind another — busy=True,
+        # queue_depth>=1.
+        if self.watchdog_pane is not None:
+            self.watchdog_pane.set_status(
+                busy=True,
+                queue_depth=self.watchdog.queue_depth(),
+            )
+
+    def _build_watchdog_context(
+        self, *, max_events: int = 30
+    ) -> str:
+        """Snapshot the most recent N events from the chatlog buffer
+        as plain text for the watchdog to reason over.
+
+        We re-use the chatlog formatters with untruncated=True so the
+        watchdog sees full content (long thinking blocks, full
+        tool_results) — the netrunner asked because they want
+        understanding, and a chopped context blocks that. Markup
+        tags get stripped because the model doesn't need them and
+        they waste tokens.
+        """
+        # Tail of the buffer — most recent first in the deque, but we
+        # want chronological order in the prompt so the model reads
+        # left-to-right like a story.
+        tail = list(self._chatlog_event_buffer)[-max_events:]
+        lines: list[str] = []
+        for kind, event in tail:
+            try:
+                if kind == "fleet":
+                    line = chatlog_format_fleet(event, untruncated=True)
+                elif kind == "daemon":
+                    line = chatlog_format_daemon(event, untruncated=True)
+                else:
+                    line = None
+            except Exception:
+                continue
+            if line is None:
+                continue
+            # Strip Rich markup tags. The model doesn't need them and
+            # they're token waste. Broad regex to catch any
+            # `[anything]` or `[/anything]` shape — colors with
+            # # hex, bold/dim modifiers, complex compound styles.
+            import re
+            stripped = re.sub(r"\[/?[^\[\]]+\]", "", line)
+            # Newline collapse same as the chatlog write path so
+            # one event = one line in the context.
+            stripped = (
+                stripped.replace("\r\n", " ")
+                .replace("\n", " ")
+                .replace("\r", " ")
+            )
+            ts = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
+            lines.append(f"{ts}  {stripped}")
+        if not lines:
+            return "(no recent activity)"
+        return "\n".join(lines)
+
+    def _on_watchdog_answer(self, wq: WatchdogQuestion) -> None:
+        """Callback fired by the Watchdog worker when an answer is
+        ready (or failed). Writes to the chatlog. Multi-paragraph
+        answers get newlines collapsed to ` ¶ ` so they stay one
+        chatlog entry — long answers are still readable via the
+        ExpandModal (z on chatlog) which shows the full text.
+
+        IMPORTANT: this callback fires from the watchdog's worker
+        task, which is on the same event loop as the App but not
+        synchronously on the App's render path. Calls into the UI
+        widget tree are safe because Textual serializes them.
+        """
+        if wq.failed:
+            err = wq.error or "(unknown failure)"
+            self._chatlog_write(
+                rf"[yellow]\[watchdog][/yellow] [red]failed:[/red] "
+                f"{err[:200]}"
+            )
+            if self.watchdog_pane is not None:
+                self.watchdog_pane.write_failure(err)
+                # Recompute busy state: there may be more queued.
+                qd = self.watchdog.queue_depth()
+                self.watchdog_pane.set_status(busy=qd > 0, queue_depth=qd)
+            return
+        answer = wq.answer or "(empty)"
+        # Compact answer for the chatlog breadcrumb (paragraphs → ¶,
+        # whitespace collapsed). Full-fidelity answer with paragraph
+        # breaks preserved goes into the watchdog tab.
+        compact = answer.replace("\r\n", "\n")
+        # Normalize multiple newlines into the glyph.
+        import re
+        compact = re.sub(r"\n\s*\n+", " ¶ ", compact)
+        # Remaining single newlines (within a paragraph) become spaces.
+        compact = compact.replace("\n", " ")
+        # Collapse runs of whitespace.
+        compact = re.sub(r"\s+", " ", compact).strip()
+        self._chatlog_write(
+            rf"[yellow]\[watchdog][/yellow] [dim]→[/dim] {compact}"
+        )
+        # Full answer to the dedicated tab.
+        if self.watchdog_pane is not None:
+            self.watchdog_pane.write_answer(answer)
+            qd = self.watchdog.queue_depth()
+            self.watchdog_pane.set_status(busy=qd > 0, queue_depth=qd)
+
+    def action_talk_daemon(self) -> None:
+        """T — open the talk-to-daemon modal.
+
+        The loud counterpart to `t` (watchdog Q&A). What you type here
+        is plan-affecting input that the daemon weighs on its next
+        outcome turn. Goes through the same deferred-propagation
+        machinery as goal updates: stashed on DaemonSession, picked
+        up at next natural break, wake-event keeps idle delivery
+        prompt.
+
+        Without a running session, the modal still opens but warns
+        clearly that there's no daemon to talk to. Submit-with-no-
+        session drops the message and toasts a follow-up reminder.
+        We don't auto-start a session because the message-as-goal
+        semantics are murky — better to have the netrunner press
+        `e` deliberately.
+        """
+        # Compute pending message count so the modal can hint about
+        # queue depth. Defensive: if no session, count is zero.
+        if self.session is not None:
+            pending = len(self.session._pending_netrunner_messages)
+            session_running = self.daemon is not None
+        else:
+            pending = 0
+            session_running = False
+
+        self.push_screen(
+            TalkDaemonScreen(
+                pending_count=pending,
+                session_running=session_running,
+            ),
+            self._handle_daemon_message_submitted,
+        )
+
+    def _handle_daemon_message_submitted(
+        self, message: Optional[str]
+    ) -> None:
+        """Callback from TalkDaemonScreen on submit/cancel.
+
+        Two branches:
+          - None or empty → cancel, no-op (Esc-to-cancel path)
+          - Non-empty → if session running, stash + surface in chatlog
+                        + write to daemon pane; otherwise toast that
+                        the message was dropped (cooperate with the
+                        modal's no-session warning).
+        """
+        if not message:
+            return
+
+        if self.session is None or self.daemon is None:
+            self._toast(
+                "no daemon session — message dropped. "
+                "Press 'e' to set a goal and start one."
+            )
+            return
+
+        # Stash for next outcome turn delivery
+        self.session.set_pending_netrunner_message(message)
+
+        # Chatlog breadcrumb so the netrunner sees their message
+        # register and can scroll back to it later. Truncated for
+        # the inline summary; full text reaches the daemon intact.
+        preview = message if len(message) <= 80 else message[:77] + "..."
+        self._chatlog_write(
+            f"[primary]\\[netrunner → daemon][/primary] {preview}"
+        )
+
+        # Also surface in the daemon pane so the daemon-tab reader
+        # gets a clean record of the conversation flowing in. The
+        # daemon's response will appear here as normal daemon output
+        # on the next turn, pairing visually.
+        if self.daemon_pane is not None:
+            self.daemon_pane.write_line(
+                f"[primary]≫ netrunner:[/primary] {message}"
+            )
+
+    def action_edit_goal(self) -> None:
+        """e — open the goal-set/edit modal.
+
+        Three modes depending on session state:
+          - No goal set yet → set goal, start daemon
+          - Goal set but no session running → replace goal, start daemon
+          - Session running → edit goal mid-flight; classify the diff
+            (clarification / scope-change / pivot) and propagate to
+            the daemon at next outcome turn (per spec)
+
+        Force-push (apply-now, interrupt the in-flight turn) is M5+.
+        Today's deferred path is fine — the daemon picks up the
+        update at the next natural break, which the
+        set_pending_goal_update wake-event makes prompt even when no
+        constructs are running.
+        """
+        # All paths use the same modal, pre-filled with current goal.
+        # The submit handler decides whether this is "set", "replace",
+        # or "mid-flight edit" based on session state at submit time.
+        self.push_screen(
+            GoalSetScreen(current_goal=self.goal or ""),
+            self._handle_goal_submitted,
+        )
+
+    @staticmethod
+    def _classify_goal_diff(old: str, new: str) -> str:
+        """Classify a goal edit per spec — clarification / scope-change
+        / pivot. Cheap heuristic: tokenize, compute Jaccard, check
+        subset relation. Spec mentions a model-driven classifier as
+        the eventual approach; this lives here as the cheap
+        deferrable-to-later version.
+
+        Rules in priority order:
+          1. If old is a strict subset of new (every old token
+             appears in new), it's a clarification — netrunner
+             added detail without changing direction.
+          2. If Jaccard similarity ≥ 0.5, it's a scope-change —
+             same general territory but materially different
+             coverage.
+          3. Otherwise, it's a pivot — the new goal shares little
+             vocabulary with the old.
+
+        Stopwords stripped. Punctuation stripped. Case-folded. This
+        is "good enough to label" — a model would do better but at
+        the cost of latency and tokens, which we don't pay yet.
+        """
+        import re
+        STOPWORDS = {
+            "a", "an", "the", "is", "are", "was", "were", "be", "been",
+            "being", "to", "of", "in", "on", "at", "for", "with", "by",
+            "from", "as", "and", "or", "but", "if", "then", "i", "me",
+            "my", "we", "us", "our", "you", "your", "it", "its", "this",
+            "that", "these", "those", "do", "does", "did", "have", "has",
+            "had", "will", "would", "could", "should", "may", "might",
+            "can", "shall", "must", "not", "no",
+        }
+
+        def tokenize(s: str) -> set[str]:
+            # Crude singularize: trailing 's' on tokens of length 4+
+            # so "website" / "websites" match without a real stemmer.
+            # 4+ length guard avoids killing short tokens like "is",
+            # "as" (which are stopwords anyway) and "us" / "ms" /
+            # "os" that ARE legitimate as-is. Imperfect — "process"
+            # becomes "proces", "address" becomes "addres" — but
+            # symmetric, so both old AND new get the same butchering
+            # and Jaccard stays meaningful.
+            tokens = set()
+            for w in re.findall(r"[a-z0-9]+", s.lower()):
+                if not w or w in STOPWORDS:
+                    continue
+                if len(w) >= 4 and w.endswith("s"):
+                    w = w[:-1]
+                tokens.add(w)
+            return tokens
+
+        old_tokens = tokenize(old)
+        new_tokens = tokenize(new)
+
+        if not old_tokens and not new_tokens:
+            return "clarification"
+        if not old_tokens:
+            return "scope-change"  # going from empty to something
+        if old_tokens.issubset(new_tokens):
+            return "clarification"
+
+        intersection = old_tokens & new_tokens
+        union = old_tokens | new_tokens
+        jaccard = len(intersection) / len(union) if union else 0.0
+        # Threshold tuned against test cases — 0.25 catches the
+        # "same general territory, different coverage" cases (a goal
+        # diff with ~25-50% token overlap usually reads as
+        # scope-change to a human) while still routing real pivots
+        # (zero or near-zero overlap) to the pivot bucket. Real-
+        # world goals are short (5-10 content tokens) so each token
+        # shift swings the ratio more than in long-prose comparisons.
+        #
+        # Known limitation: crude singularize doesn't handle -es
+        # plurals (e.g. "process" vs "processes" stem differently),
+        # so some clarifications-with-plural-shift get mis-classed
+        # as pivots. Real Porter stemming would fix this. M5+ when
+        # we go model-driven, this becomes moot.
+        if jaccard >= 0.25:
+            return "scope-change"
+        return "pivot"
+
+    def _handle_goal_submitted(self, goal: Optional[str]) -> None:
+        """Callback from GoalSetScreen on submit/cancel.
+
+        Three branches:
+          - None or empty → cancel, no-op
+          - Same as current goal → no-op, brief toast
+          - Different → either set/replace (idle) or update (running)
+        """
+        if not goal:
+            return
+        old_goal = self.goal or ""
+        # Identical text — nothing to do. Surface as a toast so the
+        # netrunner sees their action register without any state
+        # change.
+        if goal == old_goal:
+            self._toast("goal unchanged")
+            return
+
+        # Mid-flight branch: session is running, daemon exists.
+        # Classify the diff and stash it for the session loop to
+        # propagate.
+        if (self.session is not None
+                and self.daemon is not None
+                and old_goal):
+            classification = self._classify_goal_diff(old_goal, goal)
+            self.goal = goal
+            if self.goal_pane is not None:
+                self.goal_pane.set_goal(goal)
+            self._refresh_subtitle()
+            self._refresh_sidebar_info()
+            # Surface in chatlog so the netrunner can trace what they
+            # changed. The daemon's response to this update will
+            # arrive on the next turn and will appear in the chatlog
+            # as a normal daemon line — they pair visually.
+            self._chatlog_write(
+                f"[yellow]\\[goal-update][/yellow] [dim]{classification}:[/dim] "
+                f"{goal[:100]}{'...' if len(goal) > 100 else ''}"
+            )
+            self.session.set_pending_goal_update(goal, classification, old_goal)
+            return
+
+        # Idle branch: set or replace goal, start daemon. Same as
+        # before — this is the original action_edit_goal behavior
+        # for first-time goal entry.
+        self.goal = goal
+        if self.goal_pane is not None:
+            self.goal_pane.set_goal(goal)
+        self._refresh_subtitle()
+        self._refresh_sidebar_info()
+        if self.daemon_pane is not None:
+            self.daemon_pane.set_status("starting")
+            self.daemon_pane.write_line(
+                f"[dim]— new goal: {goal[:60]}{'...' if len(goal) > 60 else ''} —[/dim]"
+            )
+        self._start_daemon_task()
+
+    def action_toggle_daemon_pause(self) -> None:
+        self._toast("daemon pause/unpause: not yet implemented")
+
+    # ---- spawn ---------------------------------------------------------
+
+    def action_new_construct(self) -> None:
+        self.push_screen(NewConstructScreen(), self._handle_new_task)
+
+    def action_new_construct_invisible(self) -> None:
+        # Same modal for now; visible/invisible distinction lands in M5+
+        self._toast("invisible spawn: same as visible until M5+")
+        self.action_new_construct()
+
+    # ---- routing / wiring ----------------------------------------------
+
+    def action_wire_route(self) -> None:
+        self._toast("wiring: not yet implemented")
+
+    # ---- plugins -------------------------------------------------------
+
+    def action_plugin_quickfire(self) -> None:
+        self._toast("plugin quickfire: no plugins registered")
+
+    def action_plugin_picker(self) -> None:
+        self._toast("plugin picker: no plugins registered")
+
+    def action_toggle_airgap(self) -> None:
+        self._toast("airgap toggle: no plugins to gate")
+
+    def action_open_limits(self) -> None:
+        """Open the Limits modal showing current caps + usage; apply
+        any submitted changes back to fleet/session state."""
+        # Cap-hit auto-open is deferred (M5.x). For now, l just opens
+        # the viewer/adjuster on demand.
+        live = 0
+        spawned = 0
+        cost = 0.0
+        if self.fleet is not None:
+            live = sum(
+                1 for c in self.fleet._constructs
+                if c.state.value not in ("done", "failed", "killed")
+            )
+            spawned = self.fleet.total_spawned
+            cost = getattr(self.fleet, "total_cost_usd", 0.0)
+        self.push_screen(
+            LimitsScreen(
+                max_concurrent=self.max_concurrent,
+                max_total_spawns=self.max_total_spawns,
+                current_live=live,
+                current_spawned=spawned,
+                cost_so_far=cost,
+            ),
+            self._handle_limits_submitted,
+        )
+
+    def _handle_limits_submitted(self, result: Optional[dict]) -> None:
+        """Callback from LimitsScreen. Applies new caps to live state.
+
+        Caveats:
+        - max_concurrent change applies to NEW spawns only. The fleet's
+          existing semaphore is set at construction; resizing it
+          mid-flight would race with in-flight acquires. Pragmatic v1:
+          new value takes effect on next fleet rebuild (i.e., next
+          session). Surfaced as a fleet-log note so the user knows.
+        - max_total_spawns applies live to the active daemon session
+          since daemon_session checks it on every spawn action.
+        - If raising max_total_spawns above the prior cap-hit value
+          and the daemon has already halted, this does NOT auto-resume
+          the session — that's deferred until the daemon grows a
+          paused state. User would need to set a new goal."""
+        if result is None:
+            return
+
+        new_mc = result.get("max_concurrent", self.max_concurrent)
+        new_mts = result.get("max_total_spawns", self.max_total_spawns)
+
+        changes: list[str] = []
+        if new_mc != self.max_concurrent:
+            changes.append(
+                f"max_concurrent: {self.max_concurrent} → {new_mc} "
+                f"(applies to next session)"
+            )
+            self.max_concurrent = new_mc
+        if new_mts != self.max_total_spawns:
+            changes.append(
+                f"max_total_spawns: {self.max_total_spawns} → {new_mts}"
+            )
+            self.max_total_spawns = new_mts
+            # Apply live to the current daemon session if one is
+            # running. daemon_session reads this on every spawn action.
+            if self.session is not None:
+                try:
+                    self.session.max_total_spawns = new_mts
+                    # Clear the cap_hit latch if we just raised the
+                    # cap above current spawn count — without this,
+                    # daemon_session stays in halted state even though
+                    # there's now headroom.
+                    if (
+                        getattr(self.session, "_cap_hit", False)
+                        and (new_mts == 0 or new_mts > self.session._total_spawns)
+                    ):
+                        self.session._cap_hit = False
+                        changes.append(
+                            "[yellow]cap_hit cleared; daemon may need "
+                            "a new goal to resume work[/yellow]"
+                        )
+                except Exception:
+                    pass
+
+        if not changes:
+            return
+
+        # Surface changes in the fleet log so the netrunner has a
+        # record of when caps moved and what they moved to.
+        try:
+            log = self.query_one("#fleet_log", RichLog)
+            for c in changes:
+                log.write(f"[dim]limits: {c}[/dim]")
+        except Exception:
+            pass
+
+        # Sidebar reflects max_concurrent + max_total_spawns; refresh.
+        self._refresh_sidebar_info()
+
+    # ---- help overlay --------------------------------------------------
+
+    def action_show_keybinds(self) -> None:
+        self.push_screen(KeybindsScreen())
+
+    # ---- toast helper --------------------------------------------------
+
+    def _toast(self, msg: str) -> None:
+        """Show a transient message in the fleet log so stub bindings
+        give feedback rather than failing silently."""
+        try:
+            self.query_one("#fleet_log", RichLog).write(f"[dim]{msg}[/dim]")
+        except Exception:
+            pass
+
+    def _handle_new_task(self, task: Optional[str]) -> None:
+        if not task or self.fleet is None:
+            return
+        fleet_log = self.query_one("#fleet_log", RichLog)
+        fleet_log.write(f"[bright_blue]⟳[/bright_blue] new: {task[:24]}{'...' if len(task) > 24 else ''}")
+        # Apply the active default profile to this manually-issued
+        # spawn. Until the daemon picks profiles per-spawn (C1e),
+        # all spawns share whichever profile the netrunner set on
+        # launch via --default-profile.
+        # origin="netrunner" so the chatlog spawn line gets a [you]
+        # badge — distinguishes human-initiated from daemon-initiated
+        # at a glance, both for the netrunner and for the watchdog.
+        self.run_worker(
+            self.fleet.spawn(
+                task,
+                profile=self.default_profile,
+                origin="netrunner",
+            ),
+            name="spawn",
+        )
+
+
+if __name__ == "__main__":
+    # Suppress the asyncio ProactorEventLoop noise on shutdown.
+    # On Windows, when subprocess transports get garbage-collected
+    # after the loop has closed, BaseSubprocessTransport.__del__
+    # tries to format `f'fd={self._sock.fileno()}'` for its repr —
+    # but the socket is already closed, raising ValueError. Python
+    # prints these as "Exception ignored while calling deallocator"
+    # tracebacks. Each leaked transport produces ~12 lines of noise
+    # that scrolls the terminal after the user presses Ctrl+C, hiding
+    # any real output above.
+    #
+    # Filter ONLY the specific known-harmless pattern: ValueError on
+    # closed pipe inside an asyncio __del__ deallocator. Anything
+    # else falls through to the default handler so real bugs still
+    # surface.
+    _orig_unraisable = sys.unraisablehook
+
+    def _filter_unraisable(unraisable):
+        exc = unraisable.exc_value
+        if isinstance(exc, ValueError):
+            msg = str(exc)
+            if "closed pipe" in msg or "closed file" in msg:
+                # Asyncio proactor cleanup on Windows. Drop silently.
+                return
+        _orig_unraisable(unraisable)
+
+    sys.unraisablehook = _filter_unraisable
+
+    parser = argparse.ArgumentParser(
+        description="Cyberdeck TUI — orchestrate Claude Code constructs",
+    )
+    parser.add_argument(
+        "tasks",
+        nargs="*",
+        help="Initial construct tasks (optional). Runs without a daemon unless --goal is given.",
+    )
+    parser.add_argument(
+        "--goal",
+        type=str,
+        default=None,
+        help="High-level goal for the daemon. When set, starts daemon-driven mode.",
+    )
+    parser.add_argument(
+        "--daemon-bin",
+        type=str,
+        default=None,
+        help="Binary to use for the daemon session. Defaults to --claude-bin.",
+    )
+    parser.add_argument(
+        "--claude-bin",
+        type=str,
+        default=os.environ.get("CLAUDE_BIN", "claude"),
+        help="Binary to use for constructs (default: $CLAUDE_BIN or 'claude').",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=os.environ.get("CLAUDE_MODE", "bypassPermissions"),
+        help="Permission mode passed to constructs (default: "
+             "bypassPermissions). Headless `-p` mode can't show "
+             "interactive permission prompts, so stricter modes like "
+             "'acceptEdits' or 'default' silently fail tool calls "
+             "that would normally prompt (WebFetch, certain Bash, etc). "
+             "Brake profiles (Phase C2) will eventually replace this "
+             "with deck-side consent UI.",
+    )
+    parser.add_argument(
+        "--log",
+        type=str,
+        default=os.environ.get("CYBERDECK_LOG"),
+        help="NDJSON log file path. Default: <home>/cyberdeck.log.",
+    )
+    parser.add_argument(
+        "--home",
+        type=str,
+        default=None,
+        help="Working directory for constructs, daemon, and the session "
+             "manifest. The deck soft-sandboxes its tool calls into this "
+             "dir so they don't operate on the deck's own source. "
+             "Default: $CYBERDECK_HOME or ./cyberdeck-home (created if "
+             "missing).",
+    )
+    parser.add_argument(
+        "--profiles-dir",
+        type=str,
+        default=None,
+        help="Directory of profile .toml files. Hot-reloaded — drop, "
+             "edit, or delete files at runtime and the deck picks it up. "
+             "Default: <home>/profiles (created if missing).",
+    )
+    parser.add_argument(
+        "--default-profile",
+        type=str,
+        default=None,
+        help="Name of the profile to apply to every spawned construct "
+             "this run. Stand-in for the daemon picking profiles per-"
+             "spawn (lands in C1e). Pool reuse only happens for the "
+             "'default' profile — other profiles spawn fresh subprocesses "
+             "so their system-prompt addendum lands cleanly. Unknown "
+             "names log a warning and fall back to no-profile behavior.",
+    )
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=5,
+        help="Maximum simultaneously-running constructs (default: 5). "
+             "Spawns beyond this wait in a queue until slots free up.",
+    )
+    parser.add_argument(
+        "--max-spawns",
+        type=int,
+        default=20,
+        help="Hard cap on total constructs per daemon session (default: 20). "
+             "Hitting this halts the session to prevent runaway token use. "
+             "Only meaningful with --goal.",
+    )
+    parser.add_argument(
+        "--streaming",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use streaming JSON input mode for the daemon (default: ON). "
+             "Keeps one claude subprocess alive across all turns instead of "
+             "spawning fresh per turn — nuclear-grade speedup observed in "
+             "real use. Pass --no-streaming for the legacy one-shot-per-turn "
+             "path if streaming misbehaves on a particular claude version.",
+    )
+    parser.add_argument(
+        "--no-pool",
+        action="store_true",
+        help="Disable the session pool. Without the pool, every construct "
+             "spawns fresh (no --resume warmth). Useful for token-cheap "
+             "mock testing and metered connections where pre-warming is "
+             "wasteful.",
+    )
+    parser.add_argument(
+        "--pool-size",
+        type=int,
+        default=3,
+        help="Target number of pre-warmed sessions in the pool (default: 3). "
+             "Higher = more snappy spawns, but more startup token use. "
+             "Ignored when --no-pool is set.",
+    )
+    args = parser.parse_args()
+
+    # M5.2: no startup requirement. App launches into idle if neither
+    # --goal nor positional tasks are provided; netrunner sets a goal
+    # via 'e' once running.
+
+    # Resolve the home dir first — log_path may default to live inside
+    # it. _resolve_home_dir creates the dir if missing so subsequent
+    # writes can assume it's there.
+    home_dir = _resolve_home_dir(args.home)
+    log_path = Path(args.log) if args.log else None
+
+    app = CyberdeckApp(
+        tasks=args.tasks,
+        claude_bin=args.claude_bin,
+        permission_mode=args.mode,
+        log_path=log_path,
+        goal=args.goal,
+        daemon_bin=args.daemon_bin,
+        max_concurrent=args.max_concurrent,
+        max_total_spawns=args.max_spawns,
+        streaming_mode=args.streaming,
+        use_pool=not args.no_pool,
+        pool_size=args.pool_size,
+        home_dir=home_dir,
+        profiles_dir=(
+            Path(args.profiles_dir).expanduser()
+            if args.profiles_dir is not None
+            else None
+        ),
+        default_profile_name=args.default_profile,
+    )
+    app.run()
