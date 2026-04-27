@@ -27,11 +27,13 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** plugin scaffolding (third leg of tool registry, design
-locked during the brake refactor — folders with manifest + README +
-entry, stateless v1), then connection consequences (spawn-blocking
-on Degraded), then daemon planning mode, then D1 (local model
-substrate) for the long-term Watchdog/synthesizer/arbiter story.
+**Up next:** daemon planning mode + daemon pause/unpause (paired
+state-machine work), then watchdog tripwires + blacklist (the harder
+half of watchdog), then log-readability overhaul, then D1 (local
+model substrate) for the long-term Watchdog/synthesizer/arbiter
+story. Plugin scaffolding, brake-as-deck-state, connection
+spawn-blocking, and the brake-denial visual all shipped in the
+first wave of post-migration work.
 
 ---
 
@@ -89,6 +91,31 @@ substrate) for the long-term Watchdog/synthesizer/arbiter story.
 - `recommended_tools` (renamed from `allowed_tools`) surfaced in the
   construct's system-prompt addendum as a soft suggestion. Construct
   still has full default tool set.
+
+### Plugin scaffolding — third leg of tool registry (shipped post-migration)
+- Plugin = capability bundle at `<home>/plugins/<name>/` with
+  `plugin.toml` (manifest), `README.md` (LLM-facing interface docs),
+  and an executable entry point (typically `run.py`).
+- Stateless v1: each invocation is a fresh subprocess that
+  constructs spawn via Bash. Persistent plugins, MCP-shaped plugins,
+  and the wiring keys (`p` airgap, `c` quickfire, `Shift+C` picker)
+  are deferred sub-shapes.
+- Manifest fields: `name` (slug), `category`, `description`, `entry`,
+  optional `[requires]` block (`platforms`, `python_imports`).
+  Failing requires checks downgrade the plugin to `available=False`
+  with a reason; it stays in the registry so the panel shows what's
+  installed.
+- `PluginRegistry` mirrors `ProfileRegistry`'s read API but is
+  one-shot (`scan()` at startup, no hot reload — plugins are code,
+  Python module reloading is fraught).
+- Tools panel grows a "PLUGINS" section between Profiles and Scripts.
+  Unavailable plugins render with a red ✗ marker and dimmed name.
+- Daemon system prompt grows a PLUGINS catalog (only available ones,
+  one line each); construct system prompt addendum gains plugin
+  awareness with explicit invocation patterns.
+- First plugin: `screenshot` — mss-based cross-platform screen
+  capture, ~140 LOC. Real-deck verified end-to-end: construct
+  invokes via Bash, captures PNG, reports path back.
 
 ### Brake state — deck-global (replaces per-profile brake)
 - Three levels: paranoid / default / yolo. Set via `b` modal

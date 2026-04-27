@@ -92,11 +92,13 @@ removed; dir-reference labels removed; PERMISSIONS placeholder removed.
   in Shipped section; profiles are prescriptive templates now)
 - **C2 Brake profiles**: ✓ shipped, then superseded by deck-global
   brake refactor. Brake is no longer profile-attached.
-- **C3 Tool registry tree**: 🟡 partial
+- **C3 Tool registry tree**: 🟢 mostly shipped
   - ✓ Profiles registry
   - ✓ Scripts registry
-  - ✗ Plugins (third leg) — design locked, sketched as folders
-    with manifest + README + entry; deferred behind brake refactor
+  - ✓ Plugins (third leg) — folders with manifest + README + entry;
+    stateless v1 with screenshot as the first plugin. Wiring keys
+    (`p` airgap, `c` quickfire, `Shift+C` picker), persistent mode,
+    and MCP-as-metadata sub-shape are deferred sub-features.
   - ✗ Hierarchical Esc-up navigation
   - ✗ Script manifests
 
@@ -125,23 +127,15 @@ watchdog blindfold. Personal use doesn't need it.
 
 Roughly ordered by likely appeal:
 
-1. **Plugin scaffolding (C3 third leg)** — the largest unscratched
-   item. Hardware (camera, IR, NFC) and external (MCP servers).
-   Design locked during the brake-refactor session: each plugin is
-   a folder under `plugins/<name>/` containing `plugin.toml`
-   (manifest with name/category/description/entry/quickfire/
-   `requires` block / awareness=always_on|by_request /
-   mode=stateless|persistent), a `README.md` (LLM-facing interface
-   docs, lazy-loaded for by_request plugins), and an executable
-   entry point invoked via Bash for stateless plugins. v1 ships
-   stateless-only with screenshot as the first plugin; persistent
-   plugins (camera with live preview, SSH session) deferred until
-   a real use case forces the design. MCP-server-as-metadata-only
-   plugin is a v2 sub-shape.
-   The brake hook layer already in place will gate plugin
-   invocations under default/paranoid via the same regex/path
-   patterns; the airgap (`p`) becomes "deck refuses to spawn the
-   plugin subprocess" once plugins land.
+1. **Plugin scaffolding** — ✓ shipped (v1: stateless, screenshot
+   plugin as first example, brake hook gates invocations naturally
+   via existing bash/path patterns). Sub-features still deferred:
+   plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`),
+   persistent (stateful) mode for plugins that need a long-lived
+   service process (camera with live preview, SSH session), and
+   MCP-as-metadata as a v2 sub-shape for plugins that route
+   through Claude Code's `--mcp-config` rather than spawning a
+   deck-side subprocess.
 2. **Real-deck shakedown on Windows.** Several of the latest features
    are mock-tested AND user-confirmed on real deck — no further
    shakedown urgent. But ongoing real-deck use will continue to
@@ -207,16 +201,26 @@ natively, doesn't suffer chat context truncation.
 - `cyberdeck-spec.md` (architectural canon)
 - `cyberdeck-philosophy.md` (the why)
 
-**First Claude Code session priorities (open questions):**
-1. ~~Plugin scaffolding~~ — design locked, scaffolding deferred to
-   a follow-up session. Brake refactor took priority instead.
-2. Profile/brake refactor — ✓ shipped.
-3. Connection consequences (smallest M5+ bite)
-4. Daemon planning mode — chat with the daemon before it spawns
-   anything; transitions to active when netrunner says go.
-5. Tools-research chat (from `cyberdeck-tools-research-seed.md`)
-6. Watchdog tripwires + blacklist — eventually authors goal-scoped
-   deny rules on top of the static brake patterns.
+**Post-migration shipped:**
+- ✓ Profile/brake refactor (deck-global brake, hook-based enforcement)
+- ✓ Brake-denial visual indicator on construct panes
+- ✓ Connection consequences — spawn-blocking on Degraded/Offline
+- ✓ Plugin scaffolding v1 — stateless plugins, screenshot as first
+
+**Next priorities:**
+1. Daemon planning mode + daemon pause/unpause — paired state-machine
+   work; chat with the daemon before it spawns anything, transitions
+   to active when netrunner says go.
+2. Watchdog tripwires + blacklist — eventually authors goal-scoped
+   deny rules on top of the static brake patterns. Largest remaining
+   chunk.
+3. Log-readability overhaul — fleet/chatlog/watchdog/daemon scattered
+   across windows is hard to follow at a glance; needs structural
+   thinking, not just CSS.
+4. Connection consequences round 2: daemon parking on connection-
+   blocked spawns + recovery flow.
+5. Tools-research chat (from `cyberdeck-tools-research-seed.md`).
+6. Plugin sub-features: airgap `p`, quickfire `c`, picker `Shift+C`.
 
 ---
 

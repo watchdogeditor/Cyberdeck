@@ -254,8 +254,25 @@ grep for existing similar work — the pattern is almost always there.
 - ~150 LOC; depends only on stdlib (json, re, os, sys, pathlib)
 - Patterns are hand-curated and short — destructive bash regex,
   OS-root path prefixes, deck source dir self-protection
+- Path-aware bash check: any Bash command mentioning a protected
+  path or the three sentinel deck filenames (brake_hook.py,
+  brake_state.py, brake_patterns.py) is denied — closes the bash-
+  redirect bypass route
 - Future: watchdog will eventually author additional goal-scoped
   patterns; this script's pattern lists are the always-on baseline
+
+### `plugins.py` + `plugin_registry.py`
+- Plugin dataclass + manifest loader; one-shot registry that scans
+  `<home>/plugins/` at deck startup
+- Plugin folders contain `plugin.toml` (name, category, description,
+  entry, optional requires block), `README.md` (LLM-facing interface
+  docs), and an executable entry point
+- `requires` checks (platforms + python_imports) gate availability;
+  unavailable plugins still appear in the registry but the daemon
+  prompt doesn't suggest them
+- No hot reload: plugins are code, not data. Add or edit a plugin →
+  restart the deck. Profiles got hot reload because TOMLs are pure
+  data; plugins have arbitrary native dependency state
 
 ### `connection_monitor.py` (311 LOC)
 - ConnectionMonitor with heartbeat loop
@@ -397,6 +414,9 @@ substantive change is still useful. Keep it.
 | Brake hook (runtime enforcement) | `brake_hook.py` |
 | Brake-hook spawn settings | `brake_state.make_spawn_settings` + `fleet.spawn` |
 | permission_denials feed | `fleet.py` `_consume` (scrape) + `display.py` `chatlog_format_fleet` (render) + `watchdog.py` (system prompt) |
+| Plugin registry / loader | `plugin_registry.py` + `plugins.py` |
+| Plugin shape (manifest, README, entry) | `<home>/plugins/<name>/` |
+| Plugin awareness in prompts | `tui.py` `_build_daemon_system_prompt` + `_build_deck_addendum` |
 
 ---
 
