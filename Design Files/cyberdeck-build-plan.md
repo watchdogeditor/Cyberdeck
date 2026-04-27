@@ -152,6 +152,22 @@ Roughly ordered by likely appeal:
 7. **Goal-edit force-push** — apply-now interrupt of in-flight turn.
 8. **Daemon pause/unpause (`E`).**
 9. **Plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`).**
+10. **Quota-aware throttling.** Daemon gates spawns on remaining Max
+    quota — warn or hold when the 5h or weekly window is near full.
+    Mechanism: Claude Code's status-line script receives
+    `rate_limits.five_hour.used_percentage` and `seven_day.used_percentage`
+    on stdin; script writes them to a small JSON file; daemon reads it.
+    This is the only sanctioned surface — Anthropic exposes no public
+    API for Max-plan quota, and reverse-engineering the endpoint
+    `/usage` calls is ToS-dicey (and yields the same numbers anyway).
+    API-billing org has a clean Usage and Cost API but per-token cost
+    is prohibitive vs. Max for this workload — ruled out. Cold-start
+    caveat: the rate-limit fields populate only after the session's
+    first model call, so quota is unknown for the first few seconds of
+    a fresh session. **Pi gotcha:** on the eventual OrangePi port,
+    point the quota file at tmpfs (`/dev/shm/cyberdeck-quota.json`)
+    and/or write-on-change only, so high-frequency status-line ticks
+    don't chew the SD card. Non-issue on Windows/SSD.
 
 ---
 
