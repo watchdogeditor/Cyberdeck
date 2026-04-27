@@ -97,6 +97,19 @@ PARANOID_DENY_TOOLS = frozenset({
     "Write", "Edit", "Bash", "WebFetch", "NotebookEdit",
 })
 
+# Filenames the deck owns that bash should never modify, even when
+# the construct uses a relative path or a clever indirection. These
+# are sentinel filenames — they don't appear in legitimate workflows
+# the construct is asked to do, so a bash command that mentions them
+# is almost certainly an attempt to circumvent the brake. Substring
+# match (case-insensitive on Windows) catches them even when the
+# construct cd's into the deck source dir to drop the absolute path.
+PROTECTED_DECK_FILENAMES = (
+    "brake_hook.py",
+    "brake_state.py",
+    "brake_patterns.py",
+)
+
 
 # -- decision logic -----------------------------------------------------------
 
@@ -107,6 +120,70 @@ def deck_source_dir() -> Path:
     from this file's location: brake_hook.py sits next to tui.py,
     daemon.py, etc., so its parent IS the deck source dir."""
     return Path(__file__).resolve().parent
+
+
+def bash_touches_protected_path(cmd: str) -> tuple[bool, str]:
+    """Detect bash commands that mention a protected path or deck-
+    owned filename. Catches the redirect/copy/move/tee class of
+    bypass — `echo > brake_hook.py`, `cp foo /usr/bin/`, `tee
+    C:\\Windows\\thing.dll`, etc. — without trying to fully parse
+    bash. Substring match is over-broad on purpose: a construct
+    that needs to mention a protected path in a command can do
+    legitimately read-only work via Read/Glob/Grep instead.
+
+    Returns (deny, reason). Deny=False if the command doesn't touch
+    a protected target.
+
+    Threat model is "construct goes off-rails," not "construct is
+    adversarial" — a determined adversary can hide intent (variable
+    substitution, base64'd commands, scripts that compose paths
+    dynamically). The defense here is structural enough to catch
+    the casual-drift failure mode while staying simple. Tighter
+    sandboxing belongs at the OS layer (AppContainer / namespaces /
+    different uid), out of scope for this hook.
+    """
+    if not cmd:
+        return False, ""
+
+    on_windows = sys.platform.startswith("win")
+    haystack = cmd.lower() if on_windows else cmd
+    # Normalize backslashes to forward slashes on Windows so we
+    # match regardless of which separator the construct used.
+    if on_windows:
+        haystack_alt = haystack.replace("\\", "/")
+    else:
+        haystack_alt = haystack
+
+    # OS-root prefixes (case-insensitive on Windows).
+    if on_windows:
+        for prefix in PROTECTED_WINDOWS_PREFIXES:
+            p_norm = prefix.lower().replace("\\", "/")
+            if p_norm in haystack_alt:
+                return True, f"bash references protected OS path '{prefix}'"
+    else:
+        for prefix in PROTECTED_UNIX_PREFIXES:
+            if prefix in haystack:
+                return True, f"bash references protected OS path '{prefix}'"
+
+    # Deck source dir — the parent of brake_hook.py itself.
+    deck = str(deck_source_dir())
+    deck_norm = deck.lower().replace("\\", "/") if on_windows else deck
+    if deck_norm in haystack_alt:
+        return True, f"bash references deck source dir"
+
+    # Deck-owned filenames (sentinel substring match). Catches the
+    # "construct cd's into the deck source then runs `> brake_hook.py`"
+    # path even when the deck source dir prefix isn't in the same
+    # command string.
+    for fname in PROTECTED_DECK_FILENAMES:
+        needle = fname.lower() if on_windows else fname
+        if needle in haystack:
+            return True, (
+                f"bash references protected deck file '{fname}' "
+                f"(brake-config tampering attempt)"
+            )
+
+    return False, ""
 
 
 def path_is_protected(path: str) -> bool:
@@ -174,6 +251,16 @@ def check_default(tool: str, inp: dict) -> tuple[bool, str]:
                     f"DEFAULT brake: bash command denied "
                     f"({label}): {preview}"
                 )
+        # Path-aware second pass: catches bash commands that bypass
+        # the Write/Edit path check via redirect / cp / mv / tee /
+        # python inline / etc. Substring match for protected paths
+        # and deck-owned filenames.
+        touches, label = bash_touches_protected_path(cmd)
+        if touches:
+            preview = cmd[:120] + ("..." if len(cmd) > 120 else "")
+            return True, (
+                f"DEFAULT brake: bash command denied ({label}): {preview}"
+            )
     return False, ""
 
 

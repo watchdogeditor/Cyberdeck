@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import signal
 import sys
 import time
@@ -391,6 +392,46 @@ class Fleet:
                 final = c.final_output or ""
                 if len(final) > 2048:
                     final = final[:2045] + "..."
+                # files_written sanity pass: Construct populates this
+                # from the model's `tool_use` events for the Write
+                # tool — i.e. it tracks ATTEMPTED writes, not
+                # confirmed ones. When the brake hook denies the
+                # call, the file isn't actually created, but the
+                # path stayed in the list. Subtract anything in
+                # permission_denials (Write/Edit) here so listeners
+                # see real artifacts, not hopeful ones.
+                #
+                # Path comparison is normalized (normcase + normpath)
+                # so backslash-vs-forward-slash and case differences
+                # between the model's spelling and our captured form
+                # don't cause us to miss the match.
+                _denied_write_paths: set[str] = set()
+                for d in permission_denials:
+                    if not isinstance(d, dict):
+                        continue
+                    if d.get("tool_name") not in ("Write", "Edit"):
+                        continue
+                    p = (d.get("tool_input") or {}).get("file_path", "")
+                    if not p:
+                        continue
+                    try:
+                        _denied_write_paths.add(
+                            os.path.normcase(os.path.normpath(p))
+                        )
+                    except Exception:
+                        _denied_write_paths.add(p)
+
+                def _kept(path: str) -> bool:
+                    try:
+                        norm = os.path.normcase(os.path.normpath(path))
+                    except Exception:
+                        norm = path
+                    return norm not in _denied_write_paths
+
+                actual_files_written = [
+                    f for f in c.files_written if _kept(f)
+                ]
+
                 await self._queue.put(FleetEvent(
                     timestamp=time.time(),
                     kind="meta",
@@ -401,7 +442,13 @@ class Fleet:
                         "exit_code": c.exit_code,
                         "runtime": c.runtime,
                         "final_output": final,
-                        "files_written": c.files_written,
+                        # Filtered list — only files the brake hook
+                        # didn't deny. False positives (file actually
+                        # was written but somehow appears in denials)
+                        # are vanishingly unlikely; false negatives
+                        # (denied file appears in files_written) were
+                        # the bug we just fixed.
+                        "files_written": actual_files_written,
                         # Brake-hook denials. Empty list when nothing
                         # was blocked. Each entry is a dict with
                         # tool_name, tool_use_id, tool_input — the
