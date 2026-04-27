@@ -54,6 +54,7 @@ from watchdog import Watchdog, WatchdogQuestion
 from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
+from brake_state import BrakeState, BrakeStateStore, BrakeChangeEvent
 
 
 STATE_STYLES = {
@@ -1554,6 +1555,206 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         self.dismiss(None)
 
 
+class YoloConfirmScreen(ModalScreen[bool]):
+    """Deliberate-consent confirmation for moving brake to YOLO.
+
+    Mirrors EjectScreen exactly in shape — countdown bar drains over
+    CONFIRM_WINDOW_SECS, Space within the window confirms, Esc or
+    timeout cancels. Same 3-second window as EJECT for muscle memory;
+    the gravity is different (YOLO doesn't kill anything immediately,
+    it grants every future spawn full latitude) but the gesture should
+    feel identical so the netrunner doesn't have to relearn the
+    timing.
+
+    Returns True if confirmed, False otherwise."""
+
+    CSS = """
+    YoloConfirmScreen {
+        align: center middle;
+    }
+    #yolo_dialog {
+        width: 60;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: heavy $error;
+    }
+    #yolo_dialog > Label {
+        margin-bottom: 1;
+        width: 100%;
+        height: auto;
+    }
+    #yolo_title {
+        color: $error;
+        text-style: bold;
+    }
+    #yolo_countdown {
+        color: $warning;
+    }
+    """
+
+    BINDINGS = [
+        Binding("space", "confirm", "Confirm YOLO", show=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    CONFIRM_WINDOW_SECS = 3.0
+    TICK_INTERVAL_SECS = 0.05
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="yolo_dialog"):
+            yield Label("⚠  YOLO CONFIRMATION  ⚠", id="yolo_title")
+            yield Label(
+                "All future construct spawns will run with no brake. "
+                "No path filtering, no destructive-command pattern "
+                "matching, no plugin gating.\nEject is your only stop.",
+            )
+            yield Label("", id="yolo_countdown")
+            yield Label(
+                "[b]SPACE[/b] to confirm  ·  [b]ESC[/b] to cancel",
+            )
+
+    def on_mount(self) -> None:
+        self._elapsed = 0.0
+        self._tick_timer = self.set_interval(
+            self.TICK_INTERVAL_SECS, self._tick
+        )
+        self._refresh_countdown()
+
+    def _tick(self) -> None:
+        self._elapsed += self.TICK_INTERVAL_SECS
+        if self._elapsed >= self.CONFIRM_WINDOW_SECS:
+            self._tick_timer.stop()
+            self.dismiss(False)
+            return
+        self._refresh_countdown()
+
+    def _refresh_countdown(self) -> None:
+        remaining = max(0.0, self.CONFIRM_WINDOW_SECS - self._elapsed)
+        cell_count = 20
+        filled = int(round(cell_count * remaining / self.CONFIRM_WINDOW_SECS))
+        bar = "█" * filled + "░" * (cell_count - filled)
+        try:
+            self.query_one("#yolo_countdown", Label).update(
+                f"[red]{bar}[/red]  [dim]{remaining:.1f}s remaining[/dim]"
+            )
+        except Exception:
+            pass
+
+    def action_confirm(self) -> None:
+        if hasattr(self, "_tick_timer"):
+            self._tick_timer.stop()
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        if hasattr(self, "_tick_timer"):
+            self._tick_timer.stop()
+        self.dismiss(False)
+
+
+class BrakeScreen(ModalScreen[Optional["BrakeState"]]):
+    """Modal for changing the deck-global brake state.
+
+    Three options; each bound to its first letter (P/D/Y) for fast
+    selection. Selecting Paranoid or Default commits immediately.
+    Selecting YOLO opens YoloConfirmScreen as a sub-modal — required
+    deliberate-consent gesture, since YOLO removes all runtime gating.
+
+    Returns the new BrakeState on confirmed change, or None on
+    cancel. The caller (CyberdeckApp._handle_brake_submitted) is
+    responsible for actually mutating the BrakeStateStore — this
+    modal is purely UI."""
+
+    CSS = """
+    BrakeScreen {
+        align: center middle;
+    }
+    #brake_dialog {
+        width: 70;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: round $primary;
+    }
+    #brake_dialog > Label {
+        margin-bottom: 1;
+        width: 100%;
+        height: auto;
+    }
+    #brake_title {
+        text-style: bold;
+    }
+    #brake_current {
+        color: $text-muted;
+    }
+    .brake_option {
+        height: auto;
+        margin-bottom: 0;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+        # First-letter selectors for fast keyboard nav. Lowercase only —
+        # this modal is one-handed-friendly like the rest of the deck.
+        Binding("p", "select_paranoid", "Paranoid", show=True),
+        Binding("d", "select_default", "Default", show=True),
+        Binding("y", "select_yolo", "YOLO", show=True),
+    ]
+
+    def __init__(self, current: "BrakeState", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        cur = self.current.value.upper()
+        with Vertical(id="brake_dialog"):
+            yield Label("[b]BRAKE STATE[/b]", id="brake_title")
+            yield Label(f"Current: [b]{cur}[/b]", id="brake_current")
+            yield Label("")
+            # Three options, color-coded by gravity.
+            yield Label(
+                "[b][yellow]P[/yellow][/b]aranoid  ·  "
+                "[yellow]investigate-only; deny Write/Edit/Bash/WebFetch[/yellow]",
+                classes="brake_option",
+            )
+            yield Label(
+                "[b][white]D[/white][/b]efault   ·  "
+                "[white]most things allowed; deny destructive ops + OS path writes[/white]",
+                classes="brake_option",
+            )
+            yield Label(
+                "[b][red]Y[/red][/b]OLO      ·  "
+                "[red]no brakes; eject is your only stop[/red]  "
+                "[dim](requires confirm)[/dim]",
+                classes="brake_option",
+            )
+            yield Label("")
+            yield Label("[dim]Esc to cancel.[/dim]")
+
+    def action_select_paranoid(self) -> None:
+        self.dismiss(BrakeState.PARANOID)
+
+    def action_select_default(self) -> None:
+        self.dismiss(BrakeState.DEFAULT)
+
+    def action_select_yolo(self) -> None:
+        # YOLO requires deliberate consent. Push the confirmation
+        # screen on top of this one; if confirmed, dismiss with YOLO,
+        # if cancelled, stay open so the netrunner can pick something
+        # else or hit Esc.
+        def _on_confirm(confirmed: bool) -> None:
+            if confirmed:
+                self.dismiss(BrakeState.YOLO)
+            # else: leave BrakeScreen up. The netrunner backed out of
+            # YOLO; they may still want paranoid or default.
+
+        self.app.push_screen(YoloConfirmScreen(), _on_confirm)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class KeybindsScreen(ModalScreen[None]):
     """Modal overlay displaying the full keybinds map. Triggered by `?`.
     Lives in the netrunner's pocket: any time you forget a key, ? brings
@@ -2253,6 +2454,7 @@ class CyberdeckApp(App):
         Binding("C", "plugin_picker", "", show=False),
         Binding("p", "toggle_airgap", "Airgap", show=False),
         Binding("l", "open_limits", "Limits", show=False),
+        Binding("b", "open_brake", "Brake", show=False),
 
         # Help / keybinds overlay
         Binding("question_mark", "show_keybinds", "Help"),
@@ -2381,6 +2583,22 @@ class CyberdeckApp(App):
         self.connection_monitor = ConnectionMonitor(
             on_state_change=self._handle_connection_change,
         )
+        # Brake state — deck-global enum (paranoid/default/yolo) that
+        # gates what constructs are permitted to do at runtime. The
+        # store loads on app start, persists changes to disk, and
+        # broadcasts transitions to listeners (sidebar indicator,
+        # chatlog announcer, eventual hook-config refresh hook for
+        # subsequent spawns). Mirrors ConnectionMonitor in shape.
+        # See brake_state.py for the data model and brake_hook.py
+        # (vendored at startup) for the actual enforcement layer.
+        self.brake_state_store = BrakeStateStore(
+            state_path=self.home_dir / ".cyberdeck" / "state.json",
+            on_change=self._handle_brake_change,
+        )
+        # Loaded synchronously in __init__ rather than on_mount so
+        # any spawn (including the initial pool warm-up) sees the
+        # netrunner's last-set brake from disk, not the cold default.
+        self.brake_state_store.load()
         self.panes: dict[str, ConstructPane] = {}
         self.goal_pane: Optional[GoalPane] = None
         self.daemon_pane: Optional[DaemonPane] = None
@@ -2424,6 +2642,15 @@ class CyberdeckApp(App):
                 yield Label(
                     "[green]●[/green] online",
                     id="connection_status",
+                )
+                # Brake state indicator. Sits next to connection because
+                # the two together answer "is the deck running normally
+                # right now?" at a glance. Initial render uses the
+                # store's already-loaded state so the indicator never
+                # shows a stale default after a restart.
+                yield Label(
+                    self._brake_indicator_text(self.brake_state_store.state),
+                    id="brake_status",
                 )
                 yield Label("", id="sidebar_info")
                 # Pool meter sits between sidebar info and the goal pane
@@ -2808,6 +3035,13 @@ class CyberdeckApp(App):
             session_pool=self.session_pool,
             cwd=str(self.home_dir),
             deck_addendum=self._build_deck_addendum(),
+            # Brake-hook plumbing: fleet reads current brake at each
+            # spawn (lambda closes over the store, not its value, so
+            # changes to the store between spawns are reflected).
+            # home_dir tells fleet where to drop the per-spawn
+            # settings JSON (.cyberdeck/spawns/).
+            brake_state_provider=lambda: self.brake_state_store.state,
+            home_dir=self.home_dir,
         )
         self.fleet.add_listener(self._handle_event)
         fleet_log = self.query_one("#fleet_log", RichLog)
@@ -2993,6 +3227,63 @@ class CyberdeckApp(App):
                 f"[dim]{event.old_state.value} →[/dim] "
                 f"[b {color}]{event.new_state.value}[/b {color}]  "
                 f"[dim]{event.reason}[/dim]"
+            )
+        except Exception:
+            pass
+
+    # ---- brake state ----------------------------------------------------
+
+    def _brake_indicator_text(self, state: "BrakeState") -> str:
+        """Render the brake state for the sidebar indicator.
+
+        Glyphs deliberately echo the gravity:
+          ▲ paranoid — restrictive, "ratchet up" arrow
+          = default  — neutral, no-tilt
+          ▼ yolo     — permissive, "open the floodgates" arrow
+        Color-coded the same way: yellow / dim white / red.
+
+        Same shape as _handle_connection_change's renderer — single
+        Label, single line, color + glyph + label."""
+        glyph_color = {
+            BrakeState.PARANOID: ("▲", "yellow"),
+            BrakeState.DEFAULT:  ("=", "white"),
+            BrakeState.YOLO:     ("▼", "red"),
+        }.get(state, ("?", "dim"))
+        glyph, color = glyph_color
+        return f"[{color}]{glyph}[/{color}] {state.value}"
+
+    def _handle_brake_change(self, event: BrakeChangeEvent) -> None:
+        """BrakeStateStore callback: state transitioned.
+
+        Updates the sidebar indicator and announces in the chatlog so
+        the netrunner has a timeline anchor. New spawns will pick up
+        the new state at spawn time; in-flight constructs continue
+        under the brake they spawned with — that's by design (Claude
+        Code can't have its --permission-mode or --settings mutated
+        post-spawn).
+
+        Mirrors _handle_connection_change in shape — it's the same
+        pattern."""
+        try:
+            indicator = self.query_one("#brake_status", Label)
+            indicator.update(self._brake_indicator_text(event.new_state))
+        except Exception:
+            # Pre-mount or test harness — ignore.
+            pass
+        try:
+            # Pull a color hint for the chatlog line — yellow for
+            # tightening, red for loosening, dim for default. Same
+            # color choice as the indicator itself.
+            color = {
+                BrakeState.PARANOID: "yellow",
+                BrakeState.DEFAULT:  "white",
+                BrakeState.YOLO:     "red",
+            }.get(event.new_state, "dim")
+            self._chatlog_write(
+                f"[{color}]\\[brake][/{color}] "
+                f"[dim]{event.old_state.value} →[/dim] "
+                f"[b {color}]{event.new_state.value}[/b {color}]  "
+                f"[dim]({event.reason}; applies to new spawns)[/dim]"
             )
         except Exception:
             pass
@@ -5887,6 +6178,35 @@ class CyberdeckApp(App):
 
         # Sidebar reflects max_concurrent + max_total_spawns; refresh.
         self._refresh_sidebar_info()
+
+    # ---- brake ---------------------------------------------------------
+
+    def action_open_brake(self) -> None:
+        """Open the brake-state modal. Submitted state (if non-None
+        and different from current) triggers _handle_brake_submitted
+        which mutates the store + broadcasts to listeners.
+
+        Modal short-circuits the YOLO selection through a
+        deliberate-consent confirmation (YoloConfirmScreen) — caller
+        only sees BrakeState.YOLO if the netrunner held through that
+        gesture."""
+        self.push_screen(
+            BrakeScreen(current=self.brake_state_store.state),
+            self._handle_brake_submitted,
+        )
+
+    def _handle_brake_submitted(self, result: Optional[BrakeState]) -> None:
+        """Callback from BrakeScreen.
+
+        result is None when the netrunner cancelled (Esc, or backed out
+        of the YOLO confirmation). Anything else is a confirmed state
+        choice — pass it through to the store, which fires the change
+        event and runs the listeners (sidebar update, chatlog line)."""
+        if result is None:
+            return
+        # Store handles the no-op-same-state case internally — calling
+        # set() with the current value just returns without firing.
+        self.brake_state_store.set(result, reason="netrunner")
 
     # ---- help overlay --------------------------------------------------
 

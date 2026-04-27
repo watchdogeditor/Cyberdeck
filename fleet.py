@@ -45,6 +45,11 @@ if TYPE_CHECKING:
 from construct import Construct
 from display import summarize
 from session_manager import SessionManager, SessionPool
+from brake_state import (
+    BrakeState,
+    make_spawn_settings,
+    cleanup_spawn_settings,
+)
 
 
 @dataclass
@@ -87,6 +92,8 @@ class Fleet:
         session_pool: Optional["SessionPool"] = None,
         cwd: Optional[str] = None,
         deck_addendum: Optional[str] = None,
+        brake_state_provider: Optional[Callable[[], "BrakeState"]] = None,
+        home_dir: Optional[Path] = None,
     ):
         self.run_id = f"run-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -115,6 +122,23 @@ class Fleet:
         # session from the pool and uses --resume. When unavailable
         # or empty, falls back to a fresh spawn (current behavior).
         self.session_pool = session_pool
+
+        # Brake-state callable + home dir for per-spawn hook settings.
+        # When `brake_state_provider` is wired, every spawn calls it
+        # to read the current deck-global brake at spawn time, then
+        # generates a transient claude --settings file in
+        # <home>/.cyberdeck/spawns/. The construct's lifecycle owns
+        # that file: written on spawn, deleted on finalize.
+        # When the provider is None (e.g., headless console runs of
+        # fleet.py without a TUI), no hook is installed — equivalent
+        # to YOLO. home_dir defaults to cwd because pre-brake-refactor
+        # callers passed cwd as their soft-sandbox dir; that's the
+        # natural place for the .cyberdeck/spawns/ directory too.
+        self.brake_state_provider = brake_state_provider
+        self.home_dir = (
+            Path(home_dir) if home_dir is not None
+            else (Path(cwd) if cwd is not None else None)
+        )
 
         # Listener list. The legacy `on_event` kwarg becomes the first
         # listener for backward compat; new code should use add_listener().
@@ -356,6 +380,16 @@ class Fleet:
                 # Always release the slot, even on crash. If we didn't,
                 # one buggy construct could starve the fleet permanently.
                 self._slot_sema.release()
+                # Clean up the per-spawn brake-settings file. Best-
+                # effort; cleanup_spawn_settings is None-safe and
+                # idempotent. Done here rather than in spawn's
+                # finally because we want it to run on the *consumer*
+                # side, after the subprocess actually exits — keeping
+                # the settings file alive for the construct's full
+                # lifetime is the simple semantic.
+                cleanup_spawn_settings(
+                    Path(c.settings_path) if c.settings_path else None,
+                )
 
     # ---- construct management ------------------------------------------
 
@@ -439,6 +473,10 @@ class Fleet:
             if warm_entry is not None:
                 resume_id = warm_entry.session_id
 
+        # Build the construct first (we need its id for the settings
+        # filename), then generate the per-spawn brake settings file
+        # and attach. Doing it in this order keeps the construct id
+        # canonical (Construct mints one in __init__ if not given).
         c = Construct(
             task=task,
             claude_bin=self.claude_bin,
@@ -448,6 +486,34 @@ class Fleet:
             profile=profile,
             deck_addendum=self.deck_addendum,
         )
+
+        # Generate the brake-hook --settings file for this spawn, if
+        # the deck has wired up a brake-state provider and a home dir
+        # to write into. YOLO brake (and missing config) yields None,
+        # which means no --settings on the claude command line and
+        # therefore no hook installed for this construct.
+        if (self.brake_state_provider is not None
+                and self.home_dir is not None):
+            try:
+                settings_path = make_spawn_settings(
+                    brake=self.brake_state_provider(),
+                    home_dir=self.home_dir,
+                    construct_id=c.id,
+                )
+                if settings_path is not None:
+                    c.settings_path = str(settings_path)
+            except Exception as exc:
+                # Spawn-settings generation must never break a spawn.
+                # Surface the issue and run the construct without a
+                # hook (effectively YOLO for this one). Caller will
+                # see the warning in stderr; the deck stays usable.
+                if not self.quiet:
+                    print(
+                        f"[fleet] brake settings generation failed: "
+                        f"{exc!r}",
+                        file=sys.stderr,
+                    )
+
         self._constructs.append(c)
         self._pending_count += 1
         self.total_spawned += 1
@@ -458,6 +524,11 @@ class Fleet:
             self.total_spawned -= 1
             self._constructs.remove(c)
             self._slot_sema.release()  # never got to _consume, release here
+            # Settings file will go un-cleaned-up by _consume since
+            # we never reached it. Best-effort cleanup here.
+            cleanup_spawn_settings(
+                Path(c.settings_path) if c.settings_path else None,
+            )
             # Surface the error via the event stream so TUIs and logs
             # see it; don't silently drop.
             await self._queue.put(FleetEvent(

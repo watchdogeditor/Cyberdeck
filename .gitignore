@@ -15,8 +15,9 @@ venv/
 Thumbs.db
 Desktop.ini
 
-# Claude Code machine-local settings
+# Claude Code machine-local settings + harness worktrees
 .claude/settings.local.json
+.claude/worktrees/
 
 # Cyberdeck runtime working dir — keep only the profile templates,
 # ignore everything else (logs, ejection snapshots, bootstrapped
