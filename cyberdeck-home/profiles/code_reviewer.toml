@@ -22,15 +22,13 @@ paths for every finding so the netrunner can navigate to them quickly.
 End with a one-paragraph summary of the overall code health you observed.
 """
 
-# Read-only tool set — no Write, no Edit, no Bash. Glob and Grep are
-# the bread and butter of code review.
-allowed_tools = ["Read", "Glob", "Grep"]
+# Recommended tools — the read-only investigation kit. Surfaces in
+# the construct's system-prompt addendum so the model knows what's
+# idiomatic for code review. Not enforced — runtime gating lives in
+# the deck-global brake (paranoid is the right deck-wide brake for
+# code-review work). The model will gravitate toward these tools
+# because they're called out; the brake stops it from misbehaving
+# regardless.
+recommended_tools = ["Read", "Glob", "Grep"]
 
-# Paranoid brake — read-only review work is a natural fit for the
-# strictest tier. Even though the tool set is already read-only, the
-# tier matters for the security model: a code_reviewer profile cannot
-# be picked from underneath a 'default' or 'yolo' run as a privesc
-# stepping stone, AND if/when the daemon tries to spawn under a
-# looser tier it will be rejected.
-brake_profile = "paranoid"
 default_scripts = []

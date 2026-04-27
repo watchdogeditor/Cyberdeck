@@ -40,21 +40,22 @@ from profiles import (
 
 
 # Canonical "default" profile content, seeded to disk if missing.
-# Empty addendums + empty allowed_tools mean "use deck baseline as-is";
-# no behavioral change vs running with no profile at all. The file
-# exists so the netrunner can EDIT it — tweak the addendum, narrow
-# the tool set, add a brake profile reference (C2) — and have those
-# changes apply to every spawn that doesn't request something else.
+# Empty addendums + empty recommended_tools mean "use deck baseline
+# as-is"; no behavioral change vs running with no profile at all.
+# The file exists so the netrunner can EDIT it — tweak the addendum,
+# add tool recommendations — and have those changes apply to every
+# spawn that doesn't request something else.
 #
 # This constant is the HARD default. If the netrunner deletes
 # default.toml entirely, the next scan re-seeds from this — so
 # deletion resets to baseline rather than permanently disabling the
 # default-profile mechanism.
 #
-# Keep examples/profiles/default.toml in sync with this content (it's
-# the same text). They serve different purposes (this seeds the live
-# home dir; the example is reference material), but drift between
-# them is just confusing.
+# Note: profiles do NOT carry brake state. The deck-global brake
+# (paranoid/default/yolo, see brake_state.py) is the single source
+# of runtime constraint, controlled exclusively by the netrunner via
+# the brake modal (`b`). Profiles are prescriptive templates; the
+# brake is the enforcement layer.
 DEFAULT_PROFILE_TOML: str = '''\
 name = "default"
 category = "General"
@@ -68,10 +69,10 @@ or when the netrunner explicitly wants the unsteered behavior.
 default_daemon_addendum = ""
 default_construct_addendum = ""
 
-# Empty allowed_tools = use deck-level default tool set. Not "no tools".
-allowed_tools = []
+# Empty recommended_tools = no specific suggestion; construct picks
+# from the full default tool set freely.
+recommended_tools = []
 
-brake_profile = "default"
 default_scripts = []
 '''
 

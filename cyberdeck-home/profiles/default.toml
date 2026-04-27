@@ -10,8 +10,8 @@ or when the netrunner explicitly wants the unsteered behavior.
 default_daemon_addendum = ""
 default_construct_addendum = ""
 
-# Empty allowed_tools = use deck-level default tool set. Not "no tools".
-allowed_tools = []
+# Empty recommended_tools = no specific suggestion; construct picks
+# from the full default tool set freely.
+recommended_tools = []
 
-brake_profile = "default"
 default_scripts = []

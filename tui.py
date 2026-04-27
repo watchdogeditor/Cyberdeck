@@ -2838,27 +2838,26 @@ class CyberdeckApp(App):
             empty_item.disabled = True
             profile_list.append(empty_item)
         else:
-            tier_sigil = {
-                "paranoid": "[green]P[/green]",
-                "default":  "[dim]D[/dim]",
-                "yolo":     "[red]Y[/red]",
-            }
             for cat, profiles_in_cat in profiles_by_cat.items():
                 for p in profiles_in_cat:
-                    sigil = tier_sigil.get(
-                        p.brake_profile, "[dim]?[/dim]"
-                    )
+                    # Recommended-tool count badge. Profiles no longer
+                    # carry brake state (that's deck-global now), so
+                    # the old P/D/Y sigil is gone — only the
+                    # recommended-tools count survives as a glance
+                    # signal. A profile with N recommended tools shows
+                    # "Nt"; a profile with no opinion shows a single
+                    # dot to keep the column aligned.
                     count = (
-                        f"[dim]{len(p.allowed_tools)}t[/dim]"
-                        if p.allowed_tools
+                        f"[dim]{len(p.recommended_tools)}t[/dim]"
+                        if p.recommended_tools
                         else "[dim]·[/dim]"
                     )
-                    # Format: "P Engineering/code_reviewer  3t"
+                    # Format: "Engineering/code_reviewer  3t"
                     # Category prefix replaces the standalone header
                     # line we used to render — works in a flat list
                     # without needing non-focusable header rows.
                     label_markup = (
-                        f"{sigil} [dim]{cat}/[/dim]"
+                        f"[dim]{cat}/[/dim]"
                         f"[cyan]{p.name}[/cyan]  {count}"
                     )
                     profile_list.append(
@@ -3298,12 +3297,14 @@ class CyberdeckApp(App):
         self._daemon_task = asyncio.create_task(self._drive_daemon())
 
     def _build_daemon_system_prompt(self) -> str:
-        """Compose the daemon's system prompt with profile awareness.
+        """Compose the daemon's system prompt with profile + brake awareness.
 
         Returns the baseline DAEMON_SYSTEM_PROMPT extended with:
+          - The current deck-global brake state and what it implies.
           - A PROFILES catalog listing every loaded profile (name,
-            category, description, allowed_tools).
-          - Profile-switching rules including the privesc guardrail.
+            category, description, recommended_tools).
+          - Profile-selection rules (any profile is selectable; the
+            brake handles runtime constraint, not the profile).
           - The active profile's default_daemon_addendum, if non-empty.
 
         Called once per session start. If the registry hasn't loaded
@@ -3313,69 +3314,93 @@ class CyberdeckApp(App):
         """
         sections: list[str] = [DAEMON_SYSTEM_PROMPT]
 
+        # Brake state awareness. The daemon needs to know what's
+        # currently allowed so it doesn't plan actions that'll get
+        # denied at the hook layer (which costs construct startup
+        # tokens for nothing). One-line summary per brake — terse
+        # because the hook is the ground truth; this is just enough
+        # for the daemon to plan compatibly.
+        brake = self.brake_state_store.state
+        brake_blurb = {
+            BrakeState.PARANOID: (
+                "PARANOID — investigate-only mode. Constructs CANNOT "
+                "Write, Edit, run Bash, or use WebFetch. Read, Glob, "
+                "Grep, WebSearch, and TodoWrite are still available. "
+                "Plan tasks that produce findings rather than artifacts."
+            ),
+            BrakeState.DEFAULT: (
+                "DEFAULT — most tools allowed. Constructs CANNOT write "
+                "or edit files in OS roots (Windows/Program Files, /usr, "
+                "/etc, /bin, /sbin, /var, /lib, /opt) or in the deck's "
+                "own source directory; CANNOT run destructive bash "
+                "patterns (rm -rf on system roots, format, dd of=/dev/, "
+                "mkfs, fork bombs, shutdown). Everything else is fair."
+            ),
+            BrakeState.YOLO: (
+                "YOLO — no brakes. Constructs run unrestricted. The "
+                "netrunner has explicitly accepted this; plan freely."
+            ),
+        }.get(brake, "(unknown brake state)")
+        sections.append(
+            "\nDECK BRAKE STATE:\n"
+            f"Current brake: {brake.value}\n"
+            f"{brake_blurb}\n"
+            "The brake is deck-global, set by the netrunner via the "
+            "brake modal (`b` key). It applies to every spawn until "
+            "the netrunner changes it. Constructs spawned under this "
+            "brake will see denials surface as tool_result errors if "
+            "they attempt forbidden actions."
+        )
+
         # Profile catalog
         profiles_loaded = self.profile_registry.all()
         if profiles_loaded:
             catalog: list[str] = [
                 "",
-                "PROFILES — available steering configurations for spawns:",
+                "PROFILES — available steering templates for spawns:",
                 "",
             ]
             for p in profiles_loaded:
                 tool_str = (
-                    ", ".join(p.allowed_tools)
-                    if p.allowed_tools
-                    else "all baseline tools"
+                    ", ".join(p.recommended_tools)
+                    if p.recommended_tools
+                    else "(no specific recommendation)"
                 )
                 desc_short = " ".join(p.description.split())  # collapse newlines
                 if len(desc_short) > 200:
                     desc_short = desc_short[:197] + "..."
                 catalog.append(
-                    f"- {p.name} ({p.category}, brake={p.brake_profile}): "
-                    f"tools={tool_str}\n"
+                    f"- {p.name} ({p.category}): "
+                    f"recommended tools={tool_str}\n"
                     f"  {desc_short}"
                 )
             sections.append("\n".join(catalog))
 
-        # Profile-switching rules — the daemon needs to know it CAN
-        # vary profile per spawn, and it needs to know the rules.
+        # Profile-selection rules. With brake state moved out of
+        # profiles, profiles are purely prescriptive — selection has
+        # no privesc dimension. The daemon picks the right template
+        # for the work; the deck-global brake handles enforcement
+        # regardless of which profile gets used.
         active_name = (
             self.default_profile.name if self.default_profile else "default"
         )
-        active_tier = (
-            self.default_profile.brake_profile
-            if self.default_profile else "default"
-        )
         sections.append(
             "\nPROFILE SELECTION:\n"
-            f"The active profile for this run is: {active_name} "
-            f"(brake tier: {active_tier})\n"
+            f"The active profile for this run is: {active_name}\n"
             "\n"
             "By default, every spawn action runs under the active profile.\n"
             "You MAY override per-spawn by adding a `profile` field to the\n"
             "spawn action, e.g.:\n"
             '  {"type": "spawn", "task": "...", "profile": "code_reviewer"}\n'
             "\n"
-            "RULES (enforced; violations are rejected and logged):\n"
-            "Two security axes apply, and BOTH must clear:\n"
+            "Profiles are prescriptive templates — they steer the construct\n"
+            "with a system-prompt addendum and recommended tools. They do\n"
+            "NOT enforce constraints; the deck-global brake (above) is the\n"
+            "single source of runtime gating. Pick the profile that best\n"
+            "matches the work shape, regardless of brake level.\n"
             "\n"
-            "  1. BRAKE TIER: paranoid < default < yolo (stricter to looser)\n"
-            "     You may pick a profile at the SAME tier or STRICTER.\n"
-            "     You may NEVER pick a profile at a LOOSER tier — that\n"
-            "     would lower the permission-prompt frequency the\n"
-            "     netrunner set for this run.\n"
-            "\n"
-            "  2. ALLOWED TOOLS: picked profile's tool set must be a\n"
-            "     subset of active's. Empty allowed_tools means 'all\n"
-            "     baseline tools' on either side.\n"
-            "\n"
-            "If a pick violates EITHER axis, the spawn falls back to the\n"
-            "active profile and a security event is logged. The netrunner\n"
-            "is the only party who can elevate; you cannot hand yourself\n"
-            "capabilities the netrunner did not grant.\n"
-            "\n"
-            "If unsure whether a profile would escalate, omit the\n"
-            "field — the active profile applies."
+            "If unsure which profile fits, omit the field — the active\n"
+            "profile applies."
         )
 
         # Active profile's daemon-side addendum
@@ -4918,22 +4943,19 @@ class CyberdeckApp(App):
                 # composes the spawn with profile= set; user input
                 # becomes the task verbatim.
                 p = highlighted.profile
-                tier_sigil = {
-                    "paranoid": "[green]P[/green]",
-                    "default":  "[dim]D[/dim]",
-                    "yolo":     "[red]Y[/red]",
-                }.get(p.brake_profile, "[dim]?[/dim]")
-                tool_count = (
-                    f"{len(p.allowed_tools)} tools"
-                    if p.allowed_tools else "all tools"
+                # Show the recommended-tools count if any, else a dot.
+                # Profiles no longer carry brake state (the deck-global
+                # brake replaces it), so the old P/D/Y sigil is gone.
+                rec_count = (
+                    f"{len(p.recommended_tools)} recommended"
+                    if p.recommended_tools else "no specific recs"
                 )
                 self.push_screen(
                     LaunchScreen(
                         header_markup="Launch with profile",
                         context_markup=(
-                            f"{tier_sigil} [cyan]{p.name}[/cyan]  "
-                            f"[dim]({p.category} · {tool_count} · "
-                            f"{p.brake_profile})[/dim]"
+                            f"[cyan]{p.name}[/cyan]  "
+                            f"[dim]({p.category} · {rec_count})[/dim]"
                         ),
                     ),
                     self._make_launch_handler(profile=p),

@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     # Profile is referenced by type annotation only. Importing eagerly
     # would create a cycle (profiles.py is intentionally upstream of
     # most of the deck) and isn't needed for runtime — Construct just
-    # reads .name and .allowed_tools and .default_construct_addendum
+    # reads .name, .recommended_tools, and .default_construct_addendum
     # off whatever Profile-shaped object it's handed.
     from profiles import Profile
 
@@ -149,8 +149,13 @@ class Construct:
         self.task = task
         # Profile metadata. Stored so listeners (TUI panes, logs,
         # finalize meta events) can show which profile was in effect.
-        # Application is mostly inline below: addendum becomes a CLI
-        # arg, allowed_tools narrows the tool set.
+        # The profile's effect on this construct is purely soft: its
+        # system-prompt addendum is appended at command-build time,
+        # and recommended_tools (if any) get surfaced in the addendum
+        # as a "for this kind of work, prefer X / Y / Z" hint. The
+        # profile does NOT narrow the tool set — runtime tool gating
+        # lives entirely in the deck-global brake (see brake_state.py
+        # and brake_hook.py).
         self.profile = profile
         self.profile_name: Optional[str] = profile.name if profile else None
         # Deck-wide system-prompt addendum. Independent of profile;
@@ -160,15 +165,14 @@ class Construct:
         # the profile addendum (if any) at command-build time.
         self.deck_addendum = deck_addendum
         # Tool resolution priority:
-        #   explicit `tools` kwarg          (caller knows best)
-        #   > profile.allowed_tools         (when non-empty)
-        #   > DEFAULT_TOOLS                 (deck baseline)
-        # An empty allowed_tools on a profile is the "use baseline"
-        # signal per spec — NOT "no tools."
+        #   explicit `tools` kwarg     (caller knows best)
+        #   > DEFAULT_TOOLS            (deck baseline)
+        # Profiles do NOT narrow tools — they recommend, the brake
+        # enforces. This used to be a three-tier resolution; the
+        # middle tier (profile.allowed_tools) was dropped when brake
+        # state moved out of profiles into the deck-global layer.
         if tools is not None:
             self.tools = list(tools)
-        elif profile is not None and profile.allowed_tools:
-            self.tools = list(profile.allowed_tools)
         else:
             self.tools = list(DEFAULT_TOOLS)
         self.permission_mode = permission_mode
@@ -271,9 +275,23 @@ class Construct:
         # the meaning survives, the formatting doesn't.
         addenda: list[str] = []
         if self.profile is not None:
+            # Profile's free-text steering. Empty string means "no
+            # additional steering for this profile" — skip cleanly.
             profile_addendum = self.profile.default_construct_addendum.strip()
             if profile_addendum:
                 addenda.append(profile_addendum)
+            # Recommended tools — surface as a soft signal. The model
+            # gets told "for this kind of work, prefer X / Y / Z";
+            # the construct still has access to all default tools, so
+            # this is a steering nudge, not a cap. Skipped when the
+            # profile didn't declare any (empty tuple = no opinion).
+            if self.profile.recommended_tools:
+                rec = ", ".join(self.profile.recommended_tools)
+                addenda.append(
+                    f"Recommended tools for this profile: {rec}. "
+                    f"Prefer these unless the task clearly needs "
+                    f"something else."
+                )
         if self.deck_addendum:
             deck_addendum = self.deck_addendum.strip()
             if deck_addendum:

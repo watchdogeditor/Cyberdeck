@@ -340,20 +340,16 @@ class DaemonSession:
         self, requested_name: str, task: str,
     ) -> Optional["Profile"]:
         """Validate and return the profile a daemon spawn should run
-        under. Falls back to active default with a logged reason on any
-        failure (unknown name, privesc attempt). Never raises.
+        under. Falls back to the active default with a logged reason
+        when the requested name doesn't resolve. Never raises.
 
-        Surfaces meaningful events through on_daemon_event so the
-        netrunner can see when the daemon tried to switch profiles —
-        especially when the switch was rejected.
+        With brake state moved out of profiles into the deck-global
+        layer, profiles no longer have a privesc dimension — they're
+        purely prescriptive templates (instructions + recommended
+        tool lists). Any registered profile is fair game for daemon
+        selection; the brake hook handles runtime constraint
+        independently of which profile the construct spawned with.
         """
-        # Late-bound imports to avoid module-load cycles. profiles is
-        # the data layer; daemon_session sits above fleet which sits
-        # above construct, and construct already references profiles
-        # via TYPE_CHECKING. Function-local import keeps the runtime
-        # graph clean.
-        from profiles import is_privesc
-
         if self.profile_lookup is None:
             return self.default_profile
 
@@ -363,34 +359,6 @@ class DaemonSession:
                 "error",
                 f"daemon requested unknown profile {requested_name!r} "
                 f"for task \"{task[:60]}...\" — using active default",
-            )
-            return self.default_profile
-
-        # No active profile means we never narrowed; daemon can pick
-        # anything because there's no ceiling.
-        if self.default_profile is None:
-            return candidate
-
-        if is_privesc(self.default_profile, candidate):
-            # Security event. Log it loud — this is the daemon trying
-            # to give itself capabilities the netrunner didn't grant.
-            # Could be a model glitch, could be prompt injection, could
-            # be a profile addendum that the daemon misread. Either
-            # way, the netrunner needs to see it.
-            #
-            # Show both axes (tier + tools) in the message so the netrunner
-            # can tell at a glance which axis tripped, even though the
-            # rejection itself is unconditional regardless of which.
-            active_tools = list(self.default_profile.allowed_tools) or "[all]"
-            picked_tools = list(candidate.allowed_tools) or "[all]"
-            self._emit_daemon_event(
-                "error",
-                f"⚠ daemon attempted privesc: requested "
-                f"{candidate.name!r} "
-                f"(brake={candidate.brake_profile}, tools={picked_tools}) "
-                f"while active is {self.default_profile.name!r} "
-                f"(brake={self.default_profile.brake_profile}, "
-                f"tools={active_tools}) — REJECTED, falling back to active",
             )
             return self.default_profile
 
