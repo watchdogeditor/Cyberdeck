@@ -5110,8 +5110,13 @@ class CyberdeckApp(App):
             if active_tab == "files_tab":
                 return [self.query_one("#files_list", ListView)]
             if active_tab == "tools_tab":
+                # Order matters: list as they appear top-to-bottom in
+                # the tab so W/S walks visually rather than out-of-
+                # order. Profiles first, Plugins second, Scripts last
+                # — same as the compose() order.
                 return [
                     self.query_one("#tools_profile_list", ListView),
+                    self.query_one("#tools_plugin_list", ListView),
                     self.query_one("#tools_scripts_list", ListView),
                 ]
         except Exception:
