@@ -5758,6 +5758,11 @@ class CyberdeckApp(App):
         understanding, and a chopped context blocks that. Markup
         tags get stripped because the model doesn't need them and
         they waste tokens.
+
+        Prepends a single `DECK BRAKE: <state>` line so the watchdog
+        knows the current brake level when interpreting denials it
+        sees in the chatlog. Cheap (~10 tokens) and bounded (one
+        line per question, not per event).
         """
         # Tail of the buffer — most recent first in the deque, but we
         # want chronological order in the prompt so the model reads
@@ -5791,9 +5796,13 @@ class CyberdeckApp(App):
             )
             ts = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
             lines.append(f"{ts}  {stripped}")
+        # Prepend the brake-state header. Single line, bounded cost.
+        # Watchdog uses this to interpret `brake blocked: ...` markers
+        # the chatlog renders on finalized events.
+        brake_header = f"DECK BRAKE: {self.brake_state_store.state.value}"
         if not lines:
-            return "(no recent activity)"
-        return "\n".join(lines)
+            return brake_header + "\n\n(no recent activity)"
+        return brake_header + "\n\n" + "\n".join(lines)
 
     def _on_watchdog_answer(self, wq: WatchdogQuestion) -> None:
         """Callback fired by the Watchdog worker when an answer is

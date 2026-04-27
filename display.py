@@ -334,24 +334,47 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
             runtime = payload.get("runtime", 0.0)
             files = payload.get("files_written") or []
             file_suffix = f", {len(files)} file(s)" if files else ""
+            # Brake-hook denials suffix. When non-empty, append a
+            # bracket showing how many tool calls got blocked and
+            # which tools — gives the netrunner a glance signal that
+            # this construct hit the brake. Watchdog reads the same
+            # info from the chatlog snippet.
+            denials = payload.get("permission_denials") or []
+            if denials:
+                # Summarize: "Write×2, Bash×1" — counts per tool name.
+                from collections import Counter
+                tool_counts = Counter(
+                    str(d.get("tool_name", "?"))
+                    for d in denials if isinstance(d, dict)
+                )
+                summary = ", ".join(
+                    f"{name}×{n}" if n > 1 else name
+                    for name, n in sorted(tool_counts.items())
+                )
+                denial_suffix = f" [yellow]· brake blocked: {summary}[/yellow]"
+            else:
+                denial_suffix = ""
             if state == "done":
                 return (
                     f"[cyan]✓[/cyan] [b]{cid}[/b] done "
                     f"[dim]({runtime:.1f}s{file_suffix})[/dim]"
+                    f"{denial_suffix}"
                 )
             if state == "failed":
                 return (
                     f"[red]✗[/red] [b]{cid}[/b] failed "
                     f"[dim]({runtime:.1f}s)[/dim]"
+                    f"{denial_suffix}"
                 )
             if state == "killed":
                 return (
                     f"[orange1]×[/orange1] [b]{cid}[/b] killed "
                     f"[dim]({runtime:.1f}s)[/dim]"
+                    f"{denial_suffix}"
                 )
             # Unknown terminal state — render the literal so we
             # notice if Construct grows a new state.
-            return f"[dim]{cid} finalized: {state}[/dim]"
+            return f"[dim]{cid} finalized: {state}[/dim]{denial_suffix}"
 
         if ptype == "spawn_failed":
             err = payload.get("error", "?")

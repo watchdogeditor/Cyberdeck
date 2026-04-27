@@ -282,6 +282,12 @@ class Fleet:
         # which can land at any time during the stream; we want to
         # record exactly once.
         recorded_session = False
+        # Per-construct accumulator for brake-hook denials. Populated
+        # from the `permission_denials` field on result events; rolled
+        # into the finalize meta event payload so listeners (chatlog,
+        # watchdog) can see what got blocked. Empty list means "no
+        # denials this run" (which is the common case).
+        permission_denials: list[dict] = []
         try:
             async for event in c.events():
                 # If we've now seen the session_id and haven't recorded
@@ -298,14 +304,23 @@ class Fleet:
                     )
                     recorded_session = True
 
-                # Opportunistically scrape cost and tokens from result
-                # events. Both tokens and cost live on the top-level
-                # result event in Claude Code's stream-json.
+                # Opportunistically scrape cost, tokens, and brake-hook
+                # permission_denials from result events. All three live
+                # on the top-level result event in Claude Code's
+                # stream-json. permission_denials is the catalog of
+                # what the brake hook blocked this turn — surfaced in
+                # the finalize meta event so the chatlog and watchdog
+                # see what got caught.
                 if (event.kind == "result"
                         or event.raw.get("type") == "result"):
                     cost = event.raw.get("total_cost_usd")
                     if isinstance(cost, (int, float)):
                         self.total_cost_usd += float(cost)
+                    pd = event.raw.get("permission_denials")
+                    if isinstance(pd, list):
+                        permission_denials.extend(
+                            d for d in pd if isinstance(d, dict)
+                        )
                     usage = event.raw.get("usage") or {}
                     # Sum all input flavors: fresh input + cache reads
                     # + cache creation. For a user watching the sidebar,
@@ -374,6 +389,14 @@ class Fleet:
                         "runtime": c.runtime,
                         "final_output": final,
                         "files_written": c.files_written,
+                        # Brake-hook denials. Empty list when nothing
+                        # was blocked. Each entry is a dict with
+                        # tool_name, tool_use_id, tool_input — the
+                        # shape Claude Code's result event provides.
+                        # Listeners use this to render chatlog notes
+                        # ("blocked: Write -> C:/Windows/...") and to
+                        # feed the watchdog's brake-awareness layer.
+                        "permission_denials": list(permission_denials),
                     },
                 ))
             finally:
