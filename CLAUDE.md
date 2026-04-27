@@ -55,7 +55,8 @@ vars with `$env:NAME = "..."`, not bash syntax.
   logs, ejection snapshots. Constructs are soft-sandboxed here.
   Override with `--home <dir>` or `$CYBERDECK_HOME`.
 - `Previous Versions/` — milestone snapshots (zips). Read-only history.
-- `README.md` — **stale (M3-era).** Trust the design docs over the README.
+- `README.md` — current; pitch + status + run commands + design-doc
+  index. Lighter than the canon; trust the design docs for depth.
 
 ## Hard rules
 
@@ -77,6 +78,26 @@ The orientation doc explains the reasoning behind each. Condensed:
 
 ## Repo state
 
-This is **not yet a git repo**; first commit is pending. When git
-lands, `cyberdeck-home/` runtime artifacts (logs, `ejected-*.json`,
-`__pycache__/`) and `Previous Versions/` should be `.gitignore`d.
+Live at **github.com/watchdogeditor/Cyberdeck** (private). Default
+branch `main`. `.gitignore` already excludes `Previous Versions/`,
+`cyberdeck-home/*` (except `profiles/` and `plugins/`),
+`__pycache__/`, image files, and `.claude/` machine-local files.
+
+## Git conventions
+
+- **Do NOT add `Co-Authored-By:` trailers to commits.** GitHub
+  parses that syntax and shows a second contributor on the commit
+  page (e.g. "watchdogeditor and claude"), which makes Claude look
+  like a separate user account. The netrunner runs this repo solo;
+  one contributor on the GitHub UI matches reality. The default
+  Claude Code instructions say to add the trailer; override that
+  here.
+- **Credit Claude in the commit body** (not as a trailer) when the
+  AI did substantive work. A line like `Built with Claude Code
+  (claude-opus-4.7, 1M context)` at the bottom of the body is just
+  text — GitHub doesn't parse it, doesn't add a contributor, and
+  the credit lives in the log for anyone who looks. Skip the credit
+  on small fixes / cosmetic edits where it'd be noise.
+- Commit messages otherwise follow the existing style: subject
+  line under ~72 chars, body explains the *why* with paragraph
+  breaks, multi-line. Look at `git log` for tone.
