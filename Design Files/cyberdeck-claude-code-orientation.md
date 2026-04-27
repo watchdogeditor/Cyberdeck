@@ -87,13 +87,54 @@ codebase harder to reason about and the comments thinner.
    that answers human questions about fleet activity. Independent
    of the daemon; runs its own claude subprocess. Streaming default.
 
-### Profiles, brake tiers, allowed_tools
+### Profiles (prescriptive templates)
 A profile is a TOML file in `<home>/profiles/` defining `name`,
-`category`, `description`, `system_prompt_addendum`, `allowed_tools`,
-and `brake_profile` (paranoid / default / yolo). Profiles narrow what
-a construct can do. The daemon picks profiles per-spawn from a JSON
-field. Profile registry hot-reloads from disk. The default profile
+`category`, `description`, `default_daemon_addendum`,
+`default_construct_addendum`, and `recommended_tools`. Profiles do
+NOT narrow what a construct can do — they're prescriptive
+templates that steer behavior (addendums) and suggest tools
+(`recommended_tools` surfaces in the system-prompt addendum as a
+soft hint). The daemon picks profiles per-spawn from a JSON field.
+Profile registry hot-reloads from disk. The default profile
 auto-seeds on first run; netrunner edits to it are sacred.
+
+Historical note: profiles used to carry a `brake_profile` field and
+an `allowed_tools` field that hard-narrowed `--allowedTools` at
+spawn. Both were dropped during the brake refactor. Brake is now
+deck-global (see below); tool narrowing is delegated to the brake
+hook layer (also below).
+
+### Brake state (deck-global, runtime enforcement via hook)
+Three levels: paranoid / default / yolo. Set by the netrunner via
+the `b` modal (paranoid is single-press; yolo requires a 3-second
+held-key confirmation, mirroring the EJECT deliberate-consent
+gesture). Persists at `<home>/.cyberdeck/state.json`. Sidebar
+indicator next to connection state.
+
+Enforcement is via Claude Code's `PreToolUse` hooks. Each new spawn
+gets a per-construct `--settings` JSON pointing at `brake_hook.py`
+(in the deck source dir) with the current brake passed via argv.
+The hook is a self-contained ~150-LOC Python script that reads the
+proposed tool call from stdin, applies hand-curated patterns, exits
+0 (allow) or 2 (deny). Stderr text becomes the model-visible denial
+reason; the construct sees it as a `tool_result.is_error=True` with
+content like `"PreToolUse:Write hook error: [...]: <stderr>"`.
+
+Per-brake behavior:
+- **paranoid:** denies Write, Edit, Bash, WebFetch, NotebookEdit
+  wholesale. Read-only investigation mode. The construct can still
+  use Read/Glob/Grep/WebSearch/TodoWrite freely.
+- **default:** allows broadly; denies destructive bash regex
+  matches (rm -rf on system roots, format, dd of=/dev/, mkfs, fork
+  bombs, shutdown) and Write/Edit to OS-root paths or the deck
+  source directory.
+- **yolo:** no hook installed at all. Constructs run unrestricted.
+
+Mid-flight propagation is deferred — brake is captured at spawn
+and baked into that construct's lifetime. New spawns see new
+values. Watchdog observes denials via the `permission_denials`
+field on result events; chatlog renders a yellow `· brake blocked:
+Write×2, Bash×1` suffix on finalized lines.
 
 ### The dispatcher protocol
 Constructs talk back to the deck via a one-way stdout marker protocol:
@@ -192,10 +233,29 @@ grep for existing similar work — the pattern is almost always there.
 - `chatlog_format_fleet` — chatlog spawn line renderer with origin
   badge logic
 
-### `profile_registry.py` (450 LOC) + `profiles.py` (399 LOC)
+### `profile_registry.py` + `profiles.py`
 - TOML loader, frozen Profile dataclass with `source_path`
 - File-watch + hot reload, default seeded
-- Brake tier privesc gate
+- Profiles are pure prescription post-refactor: `recommended_tools`
+  surfaces as a soft suggestion in the system-prompt addendum;
+  brake_profile field and is_privesc check are gone.
+
+### `brake_state.py`
+- BrakeState enum (paranoid/default/yolo) + persistent store +
+  listener pattern (mirrors ConnectionMonitor)
+- Per-spawn settings file generation at
+  `<home>/.cyberdeck/spawns/<construct_id>.json`
+- `cleanup_spawn_settings` runs on construct finalization
+
+### `brake_hook.py`
+- Self-contained PreToolUse hook script invoked by claude per tool
+  call. Reads JSON from stdin, brake state from argv, exits 0/2
+  with stderr denial reason
+- ~150 LOC; depends only on stdlib (json, re, os, sys, pathlib)
+- Patterns are hand-curated and short — destructive bash regex,
+  OS-root path prefixes, deck source dir self-protection
+- Future: watchdog will eventually author additional goal-scoped
+  patterns; this script's pattern lists are the always-on baseline
 
 ### `connection_monitor.py` (311 LOC)
 - ConnectionMonitor with heartbeat loop
@@ -279,8 +339,22 @@ substantive change is still useful. Keep it.
 - Don't write extensive tests for things real-claude testing covers
   better. A 200-line mock test that misses the subprocess-streaming
   edge case isn't worth the maintenance burden.
-- Don't over-engineer the watchdog. It's a Q&A oracle. Adding
-  multi-step reasoning, tool access, etc. defeats its purpose.
+- Don't over-engineer the watchdog. The watchdog is the deck's
+  security analyst — it authors policy (tripwires, when they ship)
+  and observes the deterministic enforcement layer (hook denials,
+  fleet events). Q&A is what it does with leftover bandwidth.
+  Adding multi-step reasoning, planning authority, or putting it in
+  the hot path of any tool call defeats the spec's separation of
+  concerns.
+- Don't put an LLM in the brake-enforcement hot path. The hook is
+  deterministic by design; the watchdog observes denials and
+  authors patterns over time, but it does NOT gate per-call
+  decisions. Spec language: "LLM authors, deterministic enforces."
+- Don't reintroduce per-profile brake state or `--allowedTools`-
+  based tool narrowing. Those got refactored out for good reasons:
+  brake is deck-global and netrunner-controlled, profiles are
+  prescriptive templates, and runtime gating happens via the brake
+  hook regardless of which profile a construct spawned with.
 - Don't try to make the daemon "smarter." It already is — it's
   Claude Code with a system prompt. The daemon doesn't need
   scaffolding; it needs clear inputs and clean propagation paths.
@@ -319,6 +393,10 @@ substantive change is still useful. Keep it.
 | Modal navigation | `tui.py` `_focus_section`, `_list_walk`, `_cycle_*_panel_tabs` |
 | Origin badges | `display.py` `chatlog_format_fleet` |
 | Connection state | `connection_monitor.py` |
+| Brake state (deck-global) | `brake_state.py` + `tui.py` `BrakeScreen`/`_handle_brake_change` |
+| Brake hook (runtime enforcement) | `brake_hook.py` |
+| Brake-hook spawn settings | `brake_state.make_spawn_settings` + `fleet.spawn` |
+| permission_denials feed | `fleet.py` `_consume` (scrape) + `display.py` `chatlog_format_fleet` (render) + `watchdog.py` (system prompt) |
 
 ---
 

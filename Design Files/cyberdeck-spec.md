@@ -43,7 +43,9 @@ Autonomy is **not** a function of model confidence alone (models are often most 
 | Network egress, credential use, remote state changes | Always confirm |
 | Plugin / hardware actuator calls | Subject to brake profile *and* hardware airgap (see below) |
 
-Risk classes are per-action-type, not per-command. Configurable via **brake profiles**: `Paranoid / Default / YOLO`. Paranoid asks before *every* action regardless of class — assumes adversarial environment.
+Risk classes are per-action-type, not per-command. The deck-global **brake state** (`Paranoid / Default / YOLO`) determines how restrictive the runtime gating is — paranoid blocks all side-effect tools wholesale (investigate-only mode), default blocks destructive bash patterns + writes to OS-root paths and the deck source dir, yolo installs no hook at all. The netrunner sets the brake via the `b` modal (paranoid is single-press; yolo is an EJECT-style 3-second held-key gesture). The watchdog can ratchet *up* (toward paranoid) but never down — that's exclusively the netrunner's call.
+
+Enforcement happens at Claude Code's `PreToolUse` hook layer: each new construct spawns with a per-construct `--settings` JSON pointing at `brake_hook.py` parameterized by the current brake. The hook is deterministic (regex/path matching, no LLM in the hot path); the watchdog observes denials via the `permission_denials` field on result events and authors hook policy over time (LLM authors, deterministic enforces).
 
 ### Tripwires
 
@@ -80,12 +82,13 @@ The deck's capability ceiling is the union of its registered tools. Three types,
   You are operating in a recon context. ...
   """
 
-  allowed_tools = ["Bash", "Read", "WebSearch"]
-  brake_profile = "default"
+  recommended_tools = ["Bash", "Read", "WebSearch"]
   default_scripts = ["scan_wifi", "geolocate_subject"]
   ```
 
-  Addendums are *appended* to the deck's baseline daemon and construct system prompts when the profile is active. They steer behavior; they do not replace foundation. The daemon picks a profile *before* writing a task — pick the right tool, then decide what to do with it.
+  Addendums are *appended* to the deck's baseline daemon and construct system prompts when the profile is active. They steer behavior; they do not replace foundation. `recommended_tools` surfaces in the construct's system-prompt addendum as a soft suggestion ("for this kind of work, prefer X / Y / Z"); the construct still has access to the full default tool set. **Profiles are prescriptive templates, not enforcement** — runtime tool gating is the brake hook's job (see *Brake state* below). The daemon picks a profile *before* writing a task — pick the right tool, then decide what to do with it.
+
+  *Refactor note:* earlier drafts of this spec described `allowed_tools` as a hard cap and `brake_profile` as a per-profile field with two-axis privesc gating. Both were dropped during the brake refactor. Brake state is now deck-global and netrunner-controlled; tool narrowing is delegated to the brake hook regardless of profile.
 
 All three types live in a hierarchical registry on disk, browsable as a folder tree. The registry emits events when tools are added, changed, or removed; the daemon subscribes and learns about new capabilities the moment they're saved. Profile file changes also notify the netrunner if pre-warmed sessions of that profile are now stale (see *Session pool* below).
 
@@ -600,6 +603,7 @@ Milestones shipped, in order:
 - **M2** — TUI skeleton over the fleet: live construct panes, fleet log, keyboard quit.
 - **M3** — Keyboard-driven cyberdeck: focus management, jump keys, spawn/kill modals, expand/collapse.
 - **M4a** — Daemon-driven goals: persistent coordinator decomposes a goal into spawns, observes outcomes, iterates to done. Includes max_concurrent gating, max_total_spawns cap, respawn-loop detection, and `files_written` propagation through outcomes so the daemon recognizes file-creating success.
+- **M5+ Profile/brake refactor** — separated brake state from profiles; brake is now deck-global with PreToolUse hook enforcement (see *Brake state* in the supervision model section). Profiles became prescriptive templates with `recommended_tools` (renamed from `allowed_tools`, no longer a hard cap). Watchdog gained brake awareness via the `permission_denials` feed on result events. See `brake_state.py`, `brake_hook.py`, and the orientation doc's Brake state subsection for the full implementation map.
 
 Layout and observability work landed alongside M4a: 3-column + bottom-bar TUI, Files / Tools right panel, token + cost tracking, configurable bounded-time `Construct.wait()` to prevent shutdown hangs.
 
@@ -622,11 +626,11 @@ Layout and observability work landed alongside M4a: 3-column + bottom-bar TUI, F
 - **Tripwire** — deterministic rule authored by a model, executed on streams.
 - **Plugin** — in-process tool exposing hardware or external APIs.
 - **Script** — standalone executable on disk, invoked by constructs via Bash.
-- **Profile** — saved Construct configuration (system prompt + tools + brake profile).
+- **Profile** — saved Construct configuration: instruction addendums (daemon-side and construct-side) plus a `recommended_tools` list surfaced as a soft hint. Prescriptive template, not enforcement.
 - **Inject** — user input delivered to a construct, with two modes (interrupt, queue).
 - **Wiring** — explicit channel between two constructs.
-- **Brake profile** — named risk/confidence policy (Paranoid / Default / YOLO).
-- **Hardware airgap** — deterministic on/off for all plugin access; sits above brake profiles in the privilege hierarchy.
+- **Brake state** — deck-global runtime gating policy (Paranoid / Default / YOLO). Set by the netrunner via the `b` modal. Persisted at `<home>/.cyberdeck/state.json`. Enforced at construct spawn time via Claude Code's `PreToolUse` hook (see `brake_hook.py`).
+- **Hardware airgap** — deterministic on/off for all plugin access; sits above brake state in the privilege hierarchy.
 - **Quickfire** — a plugin's default action, triggered with one keypress.
 - **Visible / invisible construct** — visibility to the daemon. Invisible = side-quest, daemon does not see or count it.
 - **Blacklist** — user-declared "do not retry this pattern" list, propagated through the Watchdog.

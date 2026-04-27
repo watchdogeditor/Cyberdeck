@@ -18,12 +18,42 @@ session pool with cross-restart reuse, RAM meter), Phase A Step 1–3
 Activity chatlog. Mechanical event extraction. Right-panel tab.
 Color-coded, deque-backed, ExpandModal-magnifiable.
 
-### Tier 2 — Profiles + Brake (C1, C2)
+### Tier 2 — Profiles (C1)
 TOML loader, frozen Profile dataclass, ProfileRegistry (file-watch,
 hot-reload), default profile auto-seeded, `default_construct_addendum`
-+ `default_daemon_addendum`, daemon picks profile per-spawn via JSON,
-`allowed_tools` narrowing, brake tiers (paranoid<default<yolo) with
-two-axis privesc, P/D/Y sigils.
++ `default_daemon_addendum`, daemon picks profile per-spawn via JSON.
+
+**Profile/brake refactor (shipped, post-migration to git):** the
+original Tier 2 design rolled brake state into profiles and used
+`allowed_tools` as a hard cap with two-axis privesc gating between
+profiles. Real-deck use revealed two problems: (1) profiles ended
+up reused as a security model rather than as instruction templates,
+and (2) brake-as-profile-field meant the netrunner couldn't change
+brake without editing TOMLs. Refactored to:
+- **Brake state is deck-global**, persisted at
+  `<home>/.cyberdeck/state.json`, set via the `b` modal (paranoid
+  is single-press, yolo is EJECT-style countdown gesture). One
+  brake setting governs every new spawn deck-wide.
+- **Brake enforcement happens via Claude Code's PreToolUse hooks**,
+  not via `--allowedTools`. Each spawn gets a per-construct
+  `--settings` JSON pointing at `brake_hook.py` with the current
+  brake passed via argv. Hook is a self-contained Python script
+  (~150 LOC) that reads the proposed tool call from stdin, applies
+  hand-curated patterns (OS-root paths + destructive bash), exits
+  0/2. Stderr text becomes the model-visible denial reason.
+- **Profiles are now prescriptive templates only** — instruction
+  addendums + `recommended_tools` (renamed from `allowed_tools`,
+  surfaced as a soft hint in the system-prompt addendum). No
+  brake field, no privesc check, no two-axis gating.
+- **Watchdog observes the deterministic hook layer** via the
+  `permission_denials` field on result events; chatlog renders a
+  `· brake blocked: Write×2, Bash×1` suffix on finalized lines.
+
+### Tier 2 — ~~Brake profiles (C2)~~ — superseded
+C2 is now folded into the deck-global brake refactor above. Brake
+tiers are still paranoid/default/yolo, but they're no longer per-
+profile and no longer mediated by `--permission-mode` — the hook
+layer is the enforcement gate.
 
 ### Tier 2 — Tool registry partial (C3 partial)
 Profiles + Scripts in registry; **Plugins NOT yet** (deferred).
@@ -58,12 +88,15 @@ removed; dir-reference labels removed; PERMISSIONS placeholder removed.
 
 ## Phase C — Tier 2 status
 
-- **C1 Profiles**: ✓ shipped
-- **C2 Brake profiles**: ✓ shipped (rolled into C1's privesc gate)
+- **C1 Profiles**: ✓ shipped (refactored — see profile/brake refactor
+  in Shipped section; profiles are prescriptive templates now)
+- **C2 Brake profiles**: ✓ shipped, then superseded by deck-global
+  brake refactor. Brake is no longer profile-attached.
 - **C3 Tool registry tree**: 🟡 partial
   - ✓ Profiles registry
   - ✓ Scripts registry
-  - ✗ Plugins (third leg)
+  - ✗ Plugins (third leg) — design locked, sketched as folders
+    with manifest + README + entry; deferred behind brake refactor
   - ✗ Hierarchical Esc-up navigation
   - ✗ Script manifests
 
@@ -93,9 +126,22 @@ watchdog blindfold. Personal use doesn't need it.
 Roughly ordered by likely appeal:
 
 1. **Plugin scaffolding (C3 third leg)** — the largest unscratched
-   item. Hardware (camera, IR, NFC) and external (MCP servers). Now
-   that the registry shape is real (profiles + scripts), plugins just
-   need a protocol design and a first plugin to validate the shape.
+   item. Hardware (camera, IR, NFC) and external (MCP servers).
+   Design locked during the brake-refactor session: each plugin is
+   a folder under `plugins/<name>/` containing `plugin.toml`
+   (manifest with name/category/description/entry/quickfire/
+   `requires` block / awareness=always_on|by_request /
+   mode=stateless|persistent), a `README.md` (LLM-facing interface
+   docs, lazy-loaded for by_request plugins), and an executable
+   entry point invoked via Bash for stateless plugins. v1 ships
+   stateless-only with screenshot as the first plugin; persistent
+   plugins (camera with live preview, SSH session) deferred until
+   a real use case forces the design. MCP-server-as-metadata-only
+   plugin is a v2 sub-shape.
+   The brake hook layer already in place will gate plugin
+   invocations under default/paranoid via the same regex/path
+   patterns; the airgap (`p`) becomes "deck refuses to spawn the
+   plugin subprocess" once plugins land.
 2. **Real-deck shakedown on Windows.** Several of the latest features
    are mock-tested AND user-confirmed on real deck — no further
    shakedown urgent. But ongoing real-deck use will continue to
@@ -162,9 +208,15 @@ natively, doesn't suffer chat context truncation.
 - `cyberdeck-philosophy.md` (the why)
 
 **First Claude Code session priorities (open questions):**
-1. Plugin scaffolding (largest unscratched piece)
-2. Connection consequences (smallest M5+ bite)
-3. Tools-research chat (from `cyberdeck-tools-research-seed.md`)
+1. ~~Plugin scaffolding~~ — design locked, scaffolding deferred to
+   a follow-up session. Brake refactor took priority instead.
+2. Profile/brake refactor — ✓ shipped.
+3. Connection consequences (smallest M5+ bite)
+4. Daemon planning mode — chat with the daemon before it spawns
+   anything; transitions to active when netrunner says go.
+5. Tools-research chat (from `cyberdeck-tools-research-seed.md`)
+6. Watchdog tripwires + blacklist — eventually authors goal-scoped
+   deny rules on top of the static brake patterns.
 
 ---
 

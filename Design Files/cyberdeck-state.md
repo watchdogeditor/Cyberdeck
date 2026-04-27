@@ -27,9 +27,11 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** plugin scaffolding (third leg of tool registry), then
-connection consequences (spawn-blocking on Degraded), then D1 (local
-model substrate) for the long-term Watchdog/synthesizer/arbiter story.
+**Up next:** plugin scaffolding (third leg of tool registry, design
+locked during the brake refactor — folders with manifest + README +
+entry, stateless v1), then connection consequences (spawn-blocking
+on Degraded), then daemon planning mode, then D1 (local model
+substrate) for the long-term Watchdog/synthesizer/arbiter story.
 
 ---
 
@@ -79,11 +81,37 @@ model substrate) for the long-term Watchdog/synthesizer/arbiter story.
 - Session pool with cross-restart reuse (5h stale window)
 - Activity chatlog (B1) — mechanical event extraction
 
-### Tier 2 — Profiles + Brake tiers
+### Tier 2 — Profiles (refactored post-migration)
 - TOML loader, ProfileRegistry, hot reload, default seeded
 - Daemon picks profile per-spawn via JSON
-- `allowed_tools` narrowing
-- Brake tiers: paranoid / default / yolo, two-axis privesc check
+- Profiles are **prescriptive templates**: instructions + recommended
+  tool list. They do NOT enforce — the brake hook does.
+- `recommended_tools` (renamed from `allowed_tools`) surfaced in the
+  construct's system-prompt addendum as a soft suggestion. Construct
+  still has full default tool set.
+
+### Brake state — deck-global (replaces per-profile brake)
+- Three levels: paranoid / default / yolo. Set via `b` modal
+  (paranoid is single-press, yolo requires EJECT-style 3s held-key
+  confirmation, mirroring the deliberate-consent gesture).
+- Persists at `<home>/.cyberdeck/state.json`.
+- Sidebar indicator next to connection state: ▲ paranoid (yellow),
+  = default (white), ▼ yolo (red).
+- Enforcement via Claude Code's PreToolUse hooks. Each spawn gets a
+  per-construct `--settings` JSON pointing at `brake_hook.py` with
+  current brake passed via argv. Hook is self-contained ~150 LOC,
+  exits 0 (allow) or 2 (deny). Stderr text becomes the
+  model-visible denial reason.
+- Static patterns are short and opinionated (~15 total): destructive
+  bash regex (rm -rf on system roots, format, dd of=/dev/, mkfs,
+  fork bombs, shutdown), OS-root path prefixes (Windows + Unix),
+  deck source dir.
+- Mid-flight propagation deferred — brake state is captured at
+  spawn and baked into that construct's lifetime. New spawns see
+  the new value.
+- Watchdog observes via `permission_denials` field on result events;
+  chatlog renders `· brake blocked: Write×2, Bash×1` suffix on
+  finalized lines. Watchdog system prompt grew brake awareness.
 
 ### Right-panel listification (C1g) + Phase A/B
 - Tools tab → ListView (profiles + scripts)
@@ -205,31 +233,41 @@ model substrate) for the long-term Watchdog/synthesizer/arbiter story.
 
 ## Key design decisions (carried forward)
 
-1. **Daemon cannot escalate.** Two-axis privesc (tier + tool subset).
-2. **Default profile auto-seeded; netrunner edits sacred.**
-3. **Lowercase = within-focus, uppercase = move-focus.** `z` for zoom.
-4. **`space` is "primary interact"; `z` is magnify.**
-5. **Truncation: 500 live, 5000 modal.** Bounded against megabytes.
-6. **Pool always warms with `default`.** No per-profile pools.
-7. **Files panel: dual path with dedupe (normalized).**
-8. **Marker protocol one-way (script → deck).** Versioned. Unknown
-   action logs warning; never crashes.
-9. **Tools panel:** Profiles + Scripts only. Built-ins not surfaced.
-10. **Goal-update propagation deferred to next break.** Force-push is
+1. **Brake state is deck-global, not profile-attached.** The
+   netrunner sets it via `b`; it applies to every new spawn until
+   changed. Watchdog can ratchet up (toward paranoid) but not down
+   — that's the netrunner's exclusive prerogative.
+2. **Profiles are prescriptive, not restrictive.** They steer with
+   addendums and suggest tools via `recommended_tools`; they do NOT
+   gate capability. Runtime gating is the brake hook's job, deck-wide.
+3. **Brake enforcement is via PreToolUse hook, not `--allowedTools`.**
+   The hook is deterministic (regex/path matching, no LLM in the hot
+   path). Watchdog observes denials and authors the hook's policy
+   over time (LLM authors, deterministic enforces).
+4. **Default profile auto-seeded; netrunner edits sacred.**
+5. **Lowercase = within-focus, uppercase = move-focus.** `z` for zoom.
+6. **`space` is "primary interact"; `z` is magnify.**
+7. **Truncation: 500 live, 5000 modal.** Bounded against megabytes.
+8. **Pool always warms with `default`.** No per-profile pools.
+9. **Files panel: dual path with dedupe (normalized).**
+10. **Marker protocol one-way (script → deck).** Versioned. Unknown
+    action logs warning; never crashes.
+11. **Tools panel:** Profiles + Scripts only. Built-ins not surfaced.
+12. **Goal-update propagation deferred to next break.** Force-push is
     M5+. Wake-event keeps idle sessions responsive.
-11. **Goal-diff classifier is heuristic, not model-driven.**
+13. **Goal-diff classifier is heuristic, not model-driven.**
     Cheap; "good enough"; can model-ify later.
-12. **ConnectionMonitor presumes ONLINE at start.**
-13. **DNS failure skips Degraded.** Clean signal: no network at all.
-14. **Watchdog runs cloud Claude today.** Local-model substrate (D1)
+14. **ConnectionMonitor presumes ONLINE at start.**
+15. **DNS failure skips Degraded.** Clean signal: no network at all.
+16. **Watchdog runs cloud Claude today.** Local-model substrate (D1)
     is the eventual home.
-15. **Streaming is the default; one-shot is the fallback.** For both
+17. **Streaming is the default; one-shot is the fallback.** For both
     daemon and watchdog.
-16. **Streaming wedge → kill, don't preserve-and-pray.** Once stuck,
+18. **Streaming wedge → kill, don't preserve-and-pray.** Once stuck,
     fresh subprocess is the only reliable recovery.
-17. **Origin attribution at source, not reverse-engineered.** Fleet
+19. **Origin attribution at source, not reverse-engineered.** Fleet
     payload carries who spawned each construct.
-18. **z-modal:** bracket escape on plain text, syntax highlighting
+20. **z-modal:** bracket escape on plain text, syntax highlighting
     on known languages, github-dark theme, no line numbers.
 
 ---
