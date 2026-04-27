@@ -44,6 +44,16 @@ def main(argv: list[str]) -> int:
         print("install: pip install mss", file=sys.stderr)
         return 1
 
+    # mss 10.x renamed `mss.mss` to `mss.MSS`; the old name is
+    # deprecated. Prefer `MSS` when present, fall back to `mss` so
+    # this still works on pre-10 installs without deprecation noise
+    # on stderr (which Claude Code would surface as a tool_result
+    # warning).
+    MSS = getattr(mss, "MSS", None) or getattr(mss, "mss", None)
+    if MSS is None:
+        print("ERROR: mss module missing both MSS and mss entry points", file=sys.stderr)
+        return 1
+
     args = argv[1:]
     if any(a in ("-h", "--help") for a in args):
         print(_usage())
@@ -89,7 +99,7 @@ def main(argv: list[str]) -> int:
         return 2
 
     try:
-        with mss.mss() as sct:
+        with MSS() as sct:
             # Validate monitor index against available displays.
             # mss.monitors[0] is the union of all monitors;
             # mss.monitors[1:] are individual monitors. Out-of-range
