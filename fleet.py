@@ -50,6 +50,7 @@ from brake_state import (
     make_spawn_settings,
     cleanup_spawn_settings,
 )
+from connection_monitor import ConnectionState
 
 
 @dataclass
@@ -94,6 +95,9 @@ class Fleet:
         deck_addendum: Optional[str] = None,
         brake_state_provider: Optional[Callable[[], "BrakeState"]] = None,
         home_dir: Optional[Path] = None,
+        connection_state_provider: Optional[
+            Callable[[], "ConnectionState"]
+        ] = None,
     ):
         self.run_id = f"run-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -139,6 +143,15 @@ class Fleet:
             Path(home_dir) if home_dir is not None
             else (Path(cwd) if cwd is not None else None)
         )
+
+        # Connection-aware spawn gating. When the deck has wired up a
+        # connection-state provider, every spawn checks it first and
+        # refuses to start if the connection isn't ONLINE — DEGRADED
+        # and OFFLINE both block. In-flight constructs are NOT killed;
+        # they continue with whatever connection they have. Only NEW
+        # spawns get blocked. None means no gating (e.g., fleet.py
+        # console runs without a TUI to host the monitor).
+        self.connection_state_provider = connection_state_provider
 
         # Listener list. The legacy `on_event` kwarg becomes the first
         # listener for backward compat; new code should use add_listener().
@@ -475,6 +488,39 @@ class Fleet:
         to its origin. Used by inject — the new construct is a turn-N+1
         continuation of the parent's session, not an independent task.
         """
+        # Connection-aware gate. If the deck's connection isn't ONLINE,
+        # remote-model spawns can't reach claude.ai/anthropic — they'd
+        # either timeout, fail with a network error, or burn pool
+        # warmth on a doomed turn. Refuse cleanly instead. In-flight
+        # constructs aren't touched; this only blocks NEW spawns.
+        # When no provider is wired (console runs of fleet.py without
+        # a TUI hosting ConnectionMonitor), this gate is a no-op.
+        if self.connection_state_provider is not None:
+            conn_state = self.connection_state_provider()
+            if conn_state != ConnectionState.ONLINE:
+                # Mint a placeholder id for the meta event; no
+                # Construct is created, no semaphore is acquired.
+                # The chatlog renders this as `✗ spawn blocked: ...`
+                # so the netrunner sees why the spawn didn't happen.
+                blocked_id = f"cx-blocked-{uuid.uuid4().hex[:6]}"
+                await self._queue.put(FleetEvent(
+                    timestamp=time.time(),
+                    kind="meta",
+                    construct_id=blocked_id,
+                    payload={
+                        "type": "spawn_blocked",
+                        "task": task,
+                        "reason": (
+                            f"connection state is {conn_state.value}; "
+                            f"remote-model spawns are blocked until "
+                            f"the connection recovers"
+                        ),
+                        "connection_state": conn_state.value,
+                        "origin": origin,
+                    },
+                ))
+                return None
+
         # Gate on the concurrency semaphore BEFORE creating the Construct
         # object, so queued spawns don't pile up as half-initialized
         # objects in memory. If spawn_exec fails, we release in the

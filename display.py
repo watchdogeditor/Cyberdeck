@@ -380,6 +380,19 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
             err = payload.get("error", "?")
             return f"[red b]✗[/red b] spawn failed: {err}"
 
+        if ptype == "spawn_blocked":
+            # Connection-aware refusal. Distinct from spawn_failed
+            # because the cause is environmental (connection state),
+            # not the spawn machinery itself. Yellow rather than red:
+            # this is "wait, then retry" not "broken."
+            reason = payload.get("reason", "blocked")
+            task = payload.get("task", "")
+            preview = task if len(task) < 40 else task[:37] + "..."
+            return (
+                f"[yellow b]⊘[/yellow b] spawn blocked: "
+                f"[dim]{preview}[/dim] [yellow]· {reason}[/yellow]"
+            )
+
         # Other meta types (run_start, run_end, etc) come through but
         # we don't need them in the chatlog right now.
         return None

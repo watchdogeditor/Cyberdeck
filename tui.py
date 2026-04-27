@@ -3125,6 +3125,10 @@ class CyberdeckApp(App):
             # settings JSON (.cyberdeck/spawns/).
             brake_state_provider=lambda: self.brake_state_store.state,
             home_dir=self.home_dir,
+            # Connection-aware spawn gate. ConnectionMonitor's state
+            # attribute is read at every spawn; DEGRADED or OFFLINE
+            # blocks the spawn cleanly with a fleet-log entry.
+            connection_state_provider=lambda: self.connection_monitor.state,
         )
         self.fleet.add_listener(self._handle_event)
         fleet_log = self.query_one("#fleet_log", RichLog)
