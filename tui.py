@@ -689,6 +689,23 @@ class ConstructPane(Static, can_focus=True):
         border: heavy $warning;
         text-style: not dim;
     }
+    /* Brake-blocked treatment. Set when the construct's finalized
+     * meta event reports non-empty permission_denials — the brake
+     * hook caught one or more tool calls. Yellow border (matches
+     * the brake indicator's paranoid color) so the pane visually
+     * pops out from clean dones. Survives compact mode so a row of
+     * finalized constructs stays readable: the blocked ones glow
+     * yellow, the rest sit dim. Focus / expanded styles still take
+     * priority — :focus already uses $warning, so a focused blocked
+     * pane just looks like any other focused pane (correct: focus
+     * is the more important signal). */
+    ConstructPane.-blocked {
+        border: round $warning;
+    }
+    ConstructPane.-blocked.-compact {
+        border: round $warning 60%;
+        text-style: not dim;
+    }
     """
 
     state: reactive[str] = reactive("starting")
@@ -698,6 +715,13 @@ class ConstructPane(Static, can_focus=True):
     # watcher just toggles the CSS class — actual moving between
     # zones is the App's job since panes don't reach into siblings.
     compact: reactive[bool] = reactive(False)
+    # Brake-blocked badge state. Set from set_denials() when the
+    # finalize meta event carries a non-empty permission_denials
+    # list. Just the rendered summary string, e.g. "Write×2, Bash×1"
+    # — empty string means no denials, which suppresses the badge
+    # AND the .-blocked class (see watcher below). Reactive so a
+    # late finalize event repaints the header without manual call.
+    denial_summary: reactive[str] = reactive("")
 
     def __init__(
         self,
@@ -804,6 +828,50 @@ class ConstructPane(Static, can_focus=True):
         self.injected_to = construct_id
         self._refresh_header()
 
+    def set_denials(self, denials: list) -> None:
+        """Record the brake-hook denials this construct received.
+
+        Called by the App's finalize handler with the
+        permission_denials list off the finalize meta event payload.
+        Computes a short summary ("Write×2, Bash×1") and stashes it
+        in `denial_summary`; the reactive watcher applies the
+        .-blocked CSS class and re-renders the header.
+
+        Empty list (the common case — most constructs don't hit the
+        brake) clears the summary and removes the class, so a pane
+        that's been re-spawned doesn't carry stale denial state.
+        """
+        if not denials:
+            self.denial_summary = ""
+            return
+        from collections import Counter
+        counts = Counter(
+            str(d.get("tool_name", "?"))
+            for d in denials if isinstance(d, dict)
+        )
+        # Render in stable alphabetical order so repeated denials
+        # don't flicker the badge text on each repaint.
+        self.denial_summary = ", ".join(
+            f"{name}×{n}" if n > 1 else name
+            for name, n in sorted(counts.items())
+        )
+
+    def watch_denial_summary(self, value: str) -> None:
+        """React to denial_summary changes by toggling the .-blocked
+        CSS class and re-rendering the header. Empty string removes;
+        non-empty applies."""
+        if value:
+            self.add_class("-blocked")
+        else:
+            self.remove_class("-blocked")
+        # Header re-renders even when value is "" because the badge
+        # might have been showing previously and needs to disappear.
+        try:
+            self._refresh_header()
+        except Exception:
+            # Pre-mount or torn down — ignore.
+            pass
+
     def _refresh_header(self) -> None:
         style = STATE_STYLES.get(self.state, "white")
         header = self.query_one("#pane_header", Label)
@@ -829,10 +897,26 @@ class ConstructPane(Static, can_focus=True):
         profile_badge = ""
         if self.profile_name and self.profile_name != "default":
             profile_badge = f"  [yellow]\\[{self.profile_name}][/yellow]"
+        # Brake-blocked badge. Shows immediately after the state
+        # badge (so its color visually amplifies the state's "wait,
+        # something's off about this") with the warning glyph and
+        # the per-tool count summary. Suppressed when there are no
+        # denials, which is the common case. The .-blocked CSS class
+        # also fires from the watcher, painting the pane border
+        # yellow — the badge tells you WHAT got blocked, the border
+        # tells you AT A GLANCE that something did. Two-channel
+        # visibility per the netrunner's note ("we need to know
+        # what's going on when managing ten constructs").
+        denial_badge = ""
+        if self.denial_summary:
+            denial_badge = (
+                f"  [yellow]\\[⚠ blocked: {self.denial_summary}]"
+                f"[/yellow]"
+            )
         header.update(
             f"[dim]{chev}[/dim] [b]{self.construct_id}[/b]  "
             f"[{style}]\\[{self.state.upper()}][/{style}]"
-            f"{profile_badge}  "
+            f"{denial_badge}{profile_badge}  "
             f"[dim]{task_preview}[/dim]{file_count}{inject_link}"
         )
 
@@ -3974,6 +4058,13 @@ class CyberdeckApp(App):
                     pane.state = finalized_state
                 if files:
                     pane.set_files_written(files)
+                # Brake-hook denials. List is empty (or absent on pre-
+                # brake-refactor finalize events) for clean runs;
+                # set_denials handles the empty case by clearing the
+                # badge and the .-blocked class. When non-empty, the
+                # pane's border turns yellow and a `[⚠ blocked: ...]`
+                # badge appears in the header.
+                pane.set_denials(fevent.payload.get("permission_denials") or [])
                 # Anomaly check: a construct that ran cleanly but
                 # produced zero stream-json events AND no output is
                 # almost always a sign that something went wrong silently
