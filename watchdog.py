@@ -53,7 +53,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tripwires import TripwireFire
 
 
 # Watchdog system prompt. Establishes:
@@ -133,6 +136,22 @@ spawn was refused and you've got the killed construct's context in
 the chatlog, you can also speculate about WHY the netrunner
 blacklisted it — but flag that as your reasoning, not netrunner
 intent.
+
+TRIPWIRE AWARENESS:
+The deck runs deterministic pattern matchers — "tripwires" — over
+construct events as they stream in. Tripwire fires render in the
+chatlog as:
+  `⚠ tripwire <name> on cx-XXXX: <excerpt>`
+Severity is part of the line color (today: low / warning / critical;
+slice 1 renders all the same, future slices will differ). Each fire
+means a construct's event content matched a registered pattern —
+NOT necessarily that the construct did something wrong. Tripwires
+are heuristic; they're a hint to look closer, not a verdict.
+If the netrunner asks about a tripwire fire, quote the line + the
+construct's recent activity. If they ask "any tripwires fired?" /
+"what tripwires are active?", report what's in the chatlog. The
+authoritative tripwire registry isn't visible to you directly today
+(slice 2 will plumb that through); rely on the chatlog markers.
 
 Answer concisely — typically 1-3 short paragraphs. The netrunner is
 glancing at your answer between actions, not reading an essay. If
@@ -455,6 +474,7 @@ class Watchdog:
         first_question_timeout: float = 90.0,
         on_blacklist_event: Optional[Callable[[dict], None]] = None,
         history: Optional["WatchdogHistory"] = None,
+        on_tripwire_fire: Optional[Callable[["TripwireFire"], None]] = None,
     ) -> None:
         self.id = f"wd-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -468,6 +488,18 @@ class Watchdog:
         # (tripwire authoring) will wire the watchdog's Q&A path to
         # observe entries and propose sharper rules.
         self.blacklist = Blacklist(on_event=on_blacklist_event)
+        # Tripwire engine — deterministic matchers that fire on
+        # construct events. The watchdog owns this per spec ("LLM
+        # authors, deterministic enforces"); Fleet listeners feed
+        # events in via tripwires.scan(); the TUI subscribes via the
+        # on_tripwire_fire callback for chatlog rendering. Slice 1
+        # ships with two default deck-wide tripwires (credentials
+        # keyword + destructive SQL) installed automatically; future
+        # slices add LLM-authored tripwires registered at goal-start
+        # / goal-update time.
+        from tripwires import TripwireEngine, install_default_tripwires
+        self.tripwires = TripwireEngine(on_fire=on_tripwire_fire)
+        install_default_tripwires(self.tripwires)
         # Persistent Q&A log. When set, every resolved question gets
         # appended to a JSONL file before the callback fires. The TUI
         # reads it on startup to replay prior session Q&A into the

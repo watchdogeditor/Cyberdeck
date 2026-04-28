@@ -255,6 +255,81 @@ and 10.
   brainstorm; the morgue (session-level history + resuscitation)
   remains deferred.
 
+### Watchdog Tripwires (deterministic matchers, slice 1)
+- New `tripwires.py` module — `Tripwire` dataclass, `TripwireEngine`,
+  text-extraction helpers, and `DEFAULT_TRIPWIRES`. Spec model "LLM
+  authors, deterministic enforces" — same architecture as the brake
+  hook, but the matchers run in-process per construct event rather
+  than as a per-tool subprocess hook.
+- **Small DSL** (per netrunner direction — regex-only would risk the
+  same over-block class as the brake hook): each tripwire carries a
+  `pattern_type` (today only "regex", designed to grow), `pattern`,
+  `event_kinds` (which EventKind values this matcher applies to —
+  empty tuple means "all kinds"), and `field` (which extracted text
+  to match against — `tool_use_command`, `tool_result_content`,
+  `thinking_text`, `assistant_text`, `tool_use_input`, `user_text`,
+  or `any`). The field selector keeps matchers precise — won't
+  false-fire on assistant text mentioning a dangerous command
+  pattern that's only a problem when actually executed.
+- **Severity tiers** declared (low / warning / critical) but rendered
+  uniformly today (slice 1). Slice 3 splits per-severity rendering
+  (critical pulls focus, warning badges, low logs only).
+- **Scope** field gates tripwires per-construct or deck-global. Per-
+  construct entries carry a target `construct_id`; the engine only
+  fires them for events from that id.
+- **Origin** field tracks where the tripwire came from: `default`
+  (ships with the deck), `manual` (registered via API), `llm_authored`
+  (slice 2), `blacklist_derived` (deferred — would auto-generate
+  per-construct tripwires from blacklist entries to catch in-flight
+  matches as events stream rather than at K time).
+- **Engine ownership**: lives on the Watchdog (per spec). Default
+  tripwires installed automatically at Watchdog construction. The
+  TUI registers a Fleet listener (`_scan_for_tripwires`) that feeds
+  every construct event into `watchdog.tripwires.scan()`. Fires
+  dispatch via the `on_fire` callback to the TUI's
+  `_handle_tripwire_fire`, which renders to the chatlog with
+  severity-colored markup (`yellow` for warning, `dim yellow` for
+  low; `red b` reserved for critical when slice 3 lands).
+- **Two default tripwires shipped:**
+  - `keyword_credentials` — `\b(password|api[_\s-]?key|secret|
+    credentials?)\b` matched against `tool_result_content` only,
+    severity `low`. Catches accidental secret exposure in logs /
+    fetched responses.
+  - `keyword_destructive_sql` — `DROP TABLE` / `TRUNCATE TABLE` /
+    `DELETE FROM <table>` matched against `tool_use_command` only
+    (Bash + PowerShell shapes), severity `warning`. Different
+    vector from the brake hook's bash-shaped destructive patterns
+    (rm -rf, format) but similar blast radius.
+- **Defensive register/scan**: bad regexes log to stderr and skip
+  registration rather than crashing the engine; per-listener
+  exceptions in `on_fire` dispatch are caught so a misbehaving
+  listener can't corrupt the engine; the TUI's listener wraps the
+  scan in a defensive try/except so a malformed event payload
+  can't break chatlog rendering.
+- **Watchdog system prompt** grew a TRIPWIRE AWARENESS paragraph so
+  Q&A like "any tripwires fired?" / "what's this tripwire about?"
+  works against the chatlog markers.
+- **Verified end-to-end** with 8 unit tests + an end-to-end chain
+  test covering: default tripwire matches, precision (assistant
+  text doesn't trip the credentials tripwire), per-construct
+  scoping, bad-regex graceful skip, unregister, ANY-field
+  aggregation, re-register replacement, and Fleet→Engine→TUI
+  rendered output shape with severity styling differentiation.
+- **Slice 2 next**: LLM-authored tripwires. Watchdog runs an
+  authoring pass at goal-start (and explicit goal-update via `e`)
+  asking "given this goal, what patterns should we watch for?";
+  registers the returned tripwires per-construct or globally for
+  the session. Per-outcome re-authoring (construct→daemon callback
+  triggering a re-author) is a real concern but needs a "daemon
+  signals plan shift" event we don't have yet — defer until that
+  signal exists.
+- **Other future slices**: severity-aware routing (slice 3 — critical
+  pulls focus); persistent tripwire library at `<home>/tripwires/`
+  with TOML authoring (slice 4); daemon-side severity hints (slice
+  5); blacklist-derived tripwires that catch in-flight matches by
+  scanning event content rather than just task fingerprints
+  (slice 6 — pairs with the existing in-flight match scan).
+
 ### Watchdog Blacklist (session-scoped, populated by Shift+K)
 - `Blacklist` + `BlacklistEntry` in `watchdog.py`. Lives on the
   Watchdog per spec ("the persistent memory of what's forbidden").

@@ -60,6 +60,7 @@ from watchdog import (
     WatchdogHistory,
     _fingerprint as _blacklist_fingerprint,
 )
+from tripwires import TripwireFire
 from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
@@ -2745,6 +2746,13 @@ class CyberdeckApp(App):
             history=WatchdogHistory(
                 self.home_dir / ".cyberdeck" / "watchdog.jsonl",
             ),
+            # Tripwire fire callback — engine lives on the watchdog
+            # (per spec, "LLM authors, deterministic enforces"); fires
+            # render to the chatlog via this handler. Default
+            # tripwires (credentials keyword, destructive SQL) are
+            # installed on engine construction; LLM-authored
+            # tripwires land in slice 2.
+            on_tripwire_fire=self._handle_tripwire_fire,
         )
         # Connection monitor — heartbeats api.anthropic.com:443 to
         # detect Online/Degraded/Offline transitions. Per spec line
@@ -3346,6 +3354,12 @@ class CyberdeckApp(App):
             connection_state_provider=lambda: self.connection_monitor.state,
         )
         self.fleet.add_listener(self._handle_event)
+        # Tripwire scanner listener — feeds construct events into the
+        # watchdog's TripwireEngine. Registered separately from the
+        # main event handler so the engine can be wrapped/replaced
+        # without touching chatlog rendering. Per spec, the watchdog
+        # owns the engine; Fleet stays ignorant of tripwires.
+        self.fleet.add_listener(self._scan_for_tripwires)
         fleet_log = self.query_one("#fleet_log", RichLog)
         async with self.fleet as fleet:
             self._refresh_sidebar_info()
@@ -5893,6 +5907,69 @@ class CyberdeckApp(App):
             self.fleet.kill_construct(cid),
             name=f"hard-kill-{cid}",
         )
+
+    def _scan_for_tripwires(self, fevent: "FleetEvent") -> None:
+        """Fleet listener that feeds construct events into the
+        watchdog's TripwireEngine.
+
+        Only construct events (kind="event") are scanned; meta events
+        (spawn, finalize, etc.) carry control-plane metadata that
+        tripwires don't need to match against today. The engine's
+        scope/event-kind gating decides what actually gets compared.
+
+        Best-effort: a scan failure must not break the chatlog
+        listener path. The engine itself is defensive (catches per-
+        listener exceptions in on_fire dispatch); we wrap one more
+        layer here in case the event payload is malformed."""
+        if fevent.kind != "event":
+            return
+        if self.watchdog is None or self.watchdog.tripwires is None:
+            return
+        try:
+            event_kind = fevent.payload.get("event_kind", "other")
+            raw = fevent.payload.get("raw", {}) or {}
+            if not isinstance(raw, dict):
+                return
+            self.watchdog.tripwires.scan(
+                fevent.construct_id, event_kind, raw,
+            )
+        except Exception:
+            pass
+
+    def _handle_tripwire_fire(self, fire: "TripwireFire") -> None:
+        """Render a tripwire fire to the chatlog. Today: single visual
+        tier across severities. Slice 3 will split rendering by
+        severity (critical pulls focus, warning badges, low logs).
+
+        Severity color preview is stashed now (low=dim, warning=
+        yellow, critical=red) so when the per-severity routing lands
+        the styling is already calibrated. The line shape is meant
+        to look like other chatlog markers (`⚠ tripwire ...`)
+        consistent with the brake-blocked / blacklist-refused
+        visual language."""
+        # Severity → markup style. Yellow for warning matches the
+        # brake-blocked treatment elsewhere in the chatlog.
+        from tripwires import Severity
+        if fire.severity == Severity.CRITICAL:
+            tag_style = "red b"
+        elif fire.severity == Severity.WARNING:
+            tag_style = "yellow"
+        else:  # low
+            tag_style = "dim yellow"
+        excerpt = fire.matched_text_excerpt or "(empty match)"
+        # Excerpt is already truncated to ~120 chars by the engine;
+        # bracket-escape so any [foo] inside the excerpt doesn't
+        # confuse Rich's markup parser.
+        excerpt_safe = excerpt.replace("[", r"\[")
+        try:
+            self._chatlog_write(
+                f"[{tag_style}]⚠ tripwire[/{tag_style}] "
+                f"[bold]{fire.tripwire_name}[/bold] on "
+                f"[cyan]{fire.construct_id}[/cyan]: "
+                f"[dim]{excerpt_safe}[/dim]"
+            )
+        except Exception:
+            pass
 
     def _handle_blacklist_event(self, event: dict) -> None:
         """Receive blacklist events from the Watchdog's Blacklist

@@ -198,7 +198,7 @@ worth the complexity.
 This file is huge but well-organized. When adding a feature, first
 grep for existing similar work — the pattern is almost always there.
 
-### `watchdog.py` (1043 LOC)
+### `watchdog.py` (1075 LOC)
 - `Watchdog` class with `streaming_mode` switch (Q&A oracle half)
 - One-shot path: `_process_oneshot` (claude `-p` per question, stdin)
 - Streaming path: `_process_streaming` + `_spawn_streaming` +
@@ -206,7 +206,7 @@ grep for existing similar work — the pattern is almost always there.
   `_shutdown_streaming`
 - Wedge recovery: timeout → kill → respawn-on-next-question
 - System prompt with badge legend + brake awareness + blacklist
-  awareness paragraphs
+  awareness + tripwire awareness paragraphs
 - `Blacklist` + `BlacklistEntry` + `_fingerprint` — session-scoped
   registry of forbidden task patterns. Owned by Watchdog (per spec
   "persistent memory of what's forbidden") but consumed by
@@ -221,6 +221,32 @@ grep for existing similar work — the pattern is almost always there.
   futureproofs for tripwire / blacklist records. First slice of the
   watchdog-log initiative; tripwire/blacklist kinds and a dedicated
   history-browse tab still deferred.
+- Owns the `TripwireEngine` (constructed at __init__, default
+  tripwires installed automatically) — the deterministic-enforces
+  half of the spec's tripwire architecture. See `tripwires.py`.
+
+### `tripwires.py` (452 LOC) — slice 1 shipped 2026-04-29
+- `Tripwire` dataclass — small DSL: pattern_type (regex today),
+  pattern, event_kinds (which EventKinds to scan), field selector
+  (`tool_use_command`, `tool_result_content`, `thinking_text`,
+  `assistant_text`, `tool_use_input`, `user_text`, `any`), severity,
+  scope (deck_global / per_construct), origin, authored_at.
+- `TripwireEngine` — register/unregister/scan registry. Compiles
+  regexes eagerly at register time (errors surface on registration,
+  not at first match). scan() does scope + event_kind gating before
+  text extraction, then regex match. Fires dispatch via on_fire
+  callback after the scan loop completes (so listeners can mutate
+  the registry without iterator invalidation).
+- Field-extractor functions — pull text out of stream-json events
+  by structural type (assistant text blocks, thinking blocks,
+  tool_use input/command, tool_result content). The field selector
+  is what makes tripwires precise — won't false-fire on incidental
+  text mentions of dangerous-looking tokens.
+- `DEFAULT_TRIPWIRES` — two ship-with-the-deck patterns
+  (keyword_credentials at low severity, keyword_destructive_sql at
+  warning). `install_default_tripwires(engine)` is idempotent.
+- Severity / Field / Origin / Scope class-as-namespace constants
+  (Pythonic — same pattern as construct.EventKind).
 
 ### `daemon.py` (685 LOC)
 - `Daemon` class with both backends
@@ -454,6 +480,7 @@ substantive change is still useful. Keep it.
 | Plugin awareness in prompts | `tui.py` `_build_daemon_system_prompt` + `_build_deck_addendum` |
 | Watchdog Blacklist | `watchdog.py` `Blacklist` / `BlacklistEntry` (data) + `tui.py` `action_hard_kill_focused` (populate) + `tui.py` `_handle_blacklist_event` (render + flag) + `daemon_session.py` `_execute_action` spawn branch (refusal) + `daemon_session._format_outcomes` (daemon-facing surface) |
 | Watchdog Q&A persistence | `watchdog.py` `WatchdogHistory` / `WatchdogHistoryEntry` (data + replay) + `Watchdog._safe_callback` (write on resolve) + `tui.py` `_replay_watchdog_history` (mount-time read) + `WatchdogPane.write_history_separator` / `write_live_session_marker` (visual chrome) |
+| Tripwires (slice 1) | `tripwires.py` (`Tripwire` data + `TripwireEngine` + field extractors + `DEFAULT_TRIPWIRES`) + `Watchdog.__init__` (engine ownership + default install) + `tui._scan_for_tripwires` (Fleet listener feeding events into engine) + `tui._handle_tripwire_fire` (chatlog rendering with severity-colored markup) |
 
 ---
 

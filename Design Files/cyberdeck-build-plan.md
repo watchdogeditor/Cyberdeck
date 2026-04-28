@@ -305,13 +305,20 @@ natively, doesn't suffer chat context truncation.
 - ✓ Plugin scaffolding v1 — stateless plugins, screenshot as first
 
 **Next priorities:**
-1. **Watchdog tripwires** — LLM-authored deterministic matchers on
-   top of the now-shipped Blacklist primitive. DSL design open;
-   severity routing open; alert UI open. Substrate-blocked on the
-   eventual D1 local-model swap (cloud Claude works for prototyping
-   but a tripwire-authoring pass on every event would burn quota).
-   *Blacklist half (the simpler half) shipped 2026-04-28 — see the
-   shipped section below.*
+1. **Watchdog tripwires — slice 2: LLM authoring.** Slice 1 shipped
+   2026-04-29: deterministic matcher engine (`tripwires.py`), small
+   DSL (regex + event_kinds + field selectors), severity tiers
+   declared, two default deck-wide tripwires (credentials keyword +
+   destructive SQL), wiring through Watchdog → Fleet listener →
+   chatlog rendering. Slice 2 authors tripwires from the LLM at
+   goal-start and explicit goal-update (netrunner `e`); per-outcome
+   re-authoring is the spec'd "intent-shift detection" but blocked
+   on a "daemon signals plan shift" event we don't have yet. Slice
+   3 splits per-severity rendering (critical pulls focus). Engine
+   architecture (deterministic enforces, sub-millisecond per event)
+   sidesteps the substrate concern from the original framing —
+   authoring is bounded (one LLM call per intent boundary, not per
+   event), so cloud Claude is fine for cost.
 2. Log-readability overhaul — fleet/chatlog/watchdog/daemon scattered
    across windows is hard to follow at a glance; needs structural
    thinking, not just CSS.
