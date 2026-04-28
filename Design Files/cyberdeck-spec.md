@@ -47,6 +47,8 @@ Risk classes are per-action-type, not per-command. The deck-global **brake state
 
 Enforcement happens at Claude Code's `PreToolUse` hook layer: each new construct spawns with a per-construct `--settings` JSON pointing at `brake_hook.py` parameterized by the current brake. The hook is deterministic (regex/path matching, no LLM in the hot path); the watchdog observes denials via the `permission_denials` field on result events and authors hook policy over time (LLM authors, deterministic enforces).
 
+The hook gates both `Bash` and `PowerShell` tools equivalently — Claude Code on Windows exposes PowerShell as a separate tool with the same `command` shape, and a construct denied one shell will silently pivot to the other if the gate is asymmetric. This is a general principle for any tool-gating layer: gate equivalent capabilities, not specific tool names.
+
 ### Tripwires
 
 The watchdog uses LLM capability to *author* tripwires but does not put the LLM in the hot path of detection.
@@ -604,6 +606,9 @@ Milestones shipped, in order:
 - **M3** — Keyboard-driven cyberdeck: focus management, jump keys, spawn/kill modals, expand/collapse.
 - **M4a** — Daemon-driven goals: persistent coordinator decomposes a goal into spawns, observes outcomes, iterates to done. Includes max_concurrent gating, max_total_spawns cap, respawn-loop detection, and `files_written` propagation through outcomes so the daemon recognizes file-creating success.
 - **M5+ Profile/brake refactor** — separated brake state from profiles; brake is now deck-global with PreToolUse hook enforcement (see *Brake state* in the supervision model section). Profiles became prescriptive templates with `recommended_tools` (renamed from `allowed_tools`, no longer a hard cap). Watchdog gained brake awareness via the `permission_denials` feed on result events. See `brake_state.py`, `brake_hook.py`, and the orientation doc's Brake state subsection for the full implementation map.
+- **M5+ Plugin scaffolding (third leg of tool registry)** — plugins are capability bundles at `<home>/plugins/<name>/` with a TOML manifest, a Markdown README (LLM-facing interface docs), and an executable entry point. Stateless v1: each invocation is a fresh subprocess that constructs spawn via Bash. PluginRegistry mirrors ProfileRegistry's read API; one-shot scan at startup (no hot reload — plugins are code). Plugin awareness lands in both the daemon's system prompt (catalog of available plugins) and constructs' system-prompt addendum (with explicit invocation patterns). First plugin is `screenshot` — mss-based cross-platform screen capture, real-deck verified end-to-end. Sub-features deferred: airgap (`p`), quickfire (`c`), picker (`Shift+C`), persistent (stateful) mode, MCP-as-metadata variant.
+- **Brake-denial visual indicator** — construct panes whose finalize event carries non-empty `permission_denials` get a yellow border (`.-blocked` CSS class) and a header badge (`[⚠ blocked: Write×2, Bash×1]`). Two-channel visibility: border for at-a-glance scanning, badge for what specifically got caught. Survives compact mode at 60% opacity.
+- **Connection consequences (spawn-blocking)** — Fleet's `spawn()` checks the `connection_state_provider` first; non-`ONLINE` states emit a `spawn_blocked` meta event with reason and refuse the spawn before the semaphore is acquired. In-flight constructs continue. Daemon parking and recovery flow are still deferred.
 
 Layout and observability work landed alongside M4a: 3-column + bottom-bar TUI, Files / Tools right panel, token + cost tracking, configurable bounded-time `Construct.wait()` to prevent shutdown hangs.
 

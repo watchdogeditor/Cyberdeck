@@ -4,7 +4,7 @@ A keyboard-first Textual TUI that orchestrates Claude Code subprocesses.
 The "daemon" coordinator decomposes goals; "constructs" execute in
 parallel; the "watchdog" oracle answers questions about fleet activity.
 Personal hobby project, in active production use on Windows.
-~12k LOC across 13 modules.
+~14k LOC across 19 Python modules at the deck-source root.
 
 The user is the "netrunner." Match the cyberpunk vocabulary in code
 and prose — these are the right names for what each thing does.
@@ -51,9 +51,10 @@ vars with `$env:NAME = "..."`, not bash syntax.
   but huge — grep for similar patterns before adding a feature).
 - `Design Files/` — the canon. Update these when major decisions change;
   don't let docs drift behind code.
-- `cyberdeck-home/` — runtime working dir. Profiles, dispatcher script,
-  logs, ejection snapshots. Constructs are soft-sandboxed here.
-  Override with `--home <dir>` or `$CYBERDECK_HOME`.
+- `cyberdeck-home/` — runtime working dir. Profiles, plugins,
+  dispatcher script, logs, ejection snapshots. Constructs are
+  soft-sandboxed here (cwd default; not a hard sandbox — absolute
+  paths bypass). Override with `--home <dir>` or `$CYBERDECK_HOME`.
 - `Previous Versions/` — milestone snapshots (zips). Read-only history.
 - `README.md` — current; pitch + status + run commands + design-doc
   index. Lighter than the canon; trust the design docs for depth.

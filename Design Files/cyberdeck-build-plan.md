@@ -55,14 +55,25 @@ tiers are still paranoid/default/yolo, but they're no longer per-
 profile and no longer mediated by `--permission-mode` — the hook
 layer is the enforcement gate.
 
-### Tier 2 — Tool registry partial (C3 partial)
-Profiles + Scripts in registry; **Plugins NOT yet** (deferred).
+### Tier 2 — Tool registry (C3 mostly shipped)
+All three legs registered: Profiles, Scripts, and Plugins. The
+plugin scaffolding (post-migration) lands as folders under
+`<home>/plugins/<name>/` with TOML manifest + Markdown README +
+entry script; PluginRegistry mirrors ProfileRegistry but is
+one-shot (no hot reload, plugins are code). Tools panel grows a
+PLUGINS section with availability marker for plugins whose
+`requires` checks fail. Daemon system prompt + construct
+system-prompt addendum both gain plugin awareness. Sub-features
+deferred: wiring keys (`p`/`c`/`Shift+C`), persistent (stateful)
+mode, MCP-as-metadata variant.
+
 C1g listification: nav rebind (lowercase=scroll, uppercase=walk),
 Tools→ListView, Files→ListView, LaunchScreen modal. Phase A
 deck-control protocol: dispatcher script, marker protocol parser,
 construct system prompt addendum. Phase B Tools panel restructure:
-Profiles + Scripts only; CONSTRUCT TOOLS dropped; literal `<home>`
-removed; dir-reference labels removed; PERMISSIONS placeholder removed.
+Profiles + Scripts (now also Plugins) only; CONSTRUCT TOOLS dropped;
+literal `<home>` removed; dir-reference labels removed; PERMISSIONS
+placeholder removed.
 
 ### Production-grade fixes (recent)
 - Pane-log un-trim (raw event buffer + untruncated mode)

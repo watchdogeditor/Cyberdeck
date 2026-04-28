@@ -150,41 +150,28 @@ Software first, hardware later.
 
 ---
 
-## Build state (as of latest chat)
+## Build state
 
-**Milestones done:**
+This section used to track milestone status inline, but it drifted
+behind reality every time the deck shipped a feature. Live state
+lives in two docs that get updated alongside code:
 
-- **M0** — `construct.py`: wraps a `claude -p` subprocess in headless
-  stream-json mode. `events()` streams parsed events; `wait()` is
-  idempotent and returns terminal state. `kill()` does SIGTERM →
-  SIGKILL. `Construct` is proven against real Opus 4.7 end-to-end.
-- **M1** — `fleet.py`: `Fleet` class spawns N constructs concurrently,
-  multiplexes events into a shared `asyncio.Queue`, drains to console
-  + NDJSON log. Signal handling optional (for TUI parity). `on_event`
-  callback for fan-out. `shutdown()` for external-controlled
-  teardown. Proven with two Opus constructs running in parallel with
-  ~40% wall-time savings over sequential.
-- **M2** — `tui.py`: Textual app with sidebar (fleet info, short
-  fleet log) and dynamic grid of construct panes (ID, colored state
-  badge, current activity, scrolling event log). `q` / `Ctrl+C`
-  quits cleanly.
+- `cyberdeck-state.md` — what's shipped, design decisions carried
+  forward, the cumulative gotchas list.
+- `cyberdeck-build-plan.md` — milestone status, what's next,
+  what's deferred and why.
 
-**Milestones next:**
+Read those for the current snapshot. The orientation doc
+(`cyberdeck-claude-code-orientation.md`) has the file-by-file map
+of the codebase.
 
-- **M3** — first real keymap. Focus navigation (`Tab`, `1..9`, `/`),
-  interactive construct spawning (`n` or `Space` with a prompt),
-  kill (`k`), inject-and-interrupt (`i`), queue-inject (`I`), undo
-  (`z`). This is when the deck becomes *operable*.
-- **M4+** — daemon (goal decomposition + delegation), watchdog
-  (tripwire engine), wiring between constructs, local-model routing,
-  plugin surface for additional tools.
+**Running state, briefly (specific to running the deck):**
 
-**Running state files:**
-
-- `construct.py`, `display.py`, `fleet.py`, `tui.py`, `main.py`,
-  `mock_claude.py`, `cyberdeck-spec.md`, `cyberdeck.log` (run log).
-- Mock binary exists for offline testing: `CLAUDE_BIN=./mock_claude.py
-  python tui.py ...`
+- `python tui.py` is the entry point. `--goal "..."` for daemon mode,
+  positional args for ad-hoc constructs, plain launch for idle. See
+  the README and the orientation doc for details.
+- `CLAUDE_BIN=./mock_claude.py python tui.py ...` for offline
+  testing against the mock fixture.
 - Real runs require `npm install -g @anthropic-ai/claude-code` and
   a logged-in Max account.
 

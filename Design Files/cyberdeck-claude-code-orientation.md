@@ -251,13 +251,21 @@ grep for existing similar work — the pattern is almost always there.
 - Self-contained PreToolUse hook script invoked by claude per tool
   call. Reads JSON from stdin, brake state from argv, exits 0/2
   with stderr denial reason
-- ~150 LOC; depends only on stdlib (json, re, os, sys, pathlib)
-- Patterns are hand-curated and short — destructive bash regex,
-  OS-root path prefixes, deck source dir self-protection
-- Path-aware bash check: any Bash command mentioning a protected
-  path or the three sentinel deck filenames (brake_hook.py,
-  brake_state.py, brake_patterns.py) is denied — closes the bash-
-  redirect bypass route
+- ~180 LOC; depends only on stdlib (json, re, os, sys, pathlib)
+- Patterns are hand-curated and short — destructive bash regex
+  and OS-root path prefixes
+- **Both Bash and PowerShell are gated** (`SHELL_TOOLS` set +
+  `PARANOID_DENY_TOOLS` includes both). Claude Code on Windows
+  exposes PowerShell as a separate tool with the same `command`
+  shape; an LLM denied Bash will pivot to PowerShell automatically
+  if PowerShell isn't gated equivalently
+- Path-aware shell check: any Bash/PowerShell command mentioning
+  one of three sentinel deck filenames (brake_hook.py,
+  brake_state.py, brake_patterns.py) is denied — closes the
+  redirect bypass route to the brake config itself
+- Deck-source-dir-as-substring matching was deliberately dropped:
+  cyberdeck-home/ sits inside the deck source dir, so a substring
+  match denies every legitimate plugin and dispatcher invocation
 - Future: watchdog will eventually author additional goal-scoped
   patterns; this script's pattern lists are the always-on baseline
 
@@ -372,6 +380,18 @@ substantive change is still useful. Keep it.
   brake is deck-global and netrunner-controlled, profiles are
   prescriptive templates, and runtime gating happens via the brake
   hook regardless of which profile a construct spawned with.
+- Don't gate one shell tool without the other. Bash and PowerShell
+  are equivalent execution surfaces on Windows. An LLM whose Bash
+  is denied will silently pivot to PowerShell (verified on real-
+  deck — the screenshot construct did exactly this without being
+  asked). Any tool-gating layer must consider equivalent
+  capabilities, not just the tool the human happens to think of.
+- Don't substring-match the deck source dir for protection.
+  cyberdeck-home/ lives inside the deck source dir, so a prefix
+  check denies every legitimate plugin/dispatcher invocation. Use
+  sentinel filenames (brake_hook.py / brake_state.py /
+  brake_patterns.py) for tampering protection — they survive the
+  path overlap and are precise enough on their own.
 - Don't try to make the daemon "smarter." It already is — it's
   Claude Code with a system prompt. The daemon doesn't need
   scaffolding; it needs clear inputs and clean propagation paths.

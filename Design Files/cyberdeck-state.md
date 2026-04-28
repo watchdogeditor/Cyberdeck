@@ -126,13 +126,25 @@ first wave of post-migration work.
   = default (white), ▼ yolo (red).
 - Enforcement via Claude Code's PreToolUse hooks. Each spawn gets a
   per-construct `--settings` JSON pointing at `brake_hook.py` with
-  current brake passed via argv. Hook is self-contained ~150 LOC,
+  current brake passed via argv. Hook is self-contained ~180 LOC,
   exits 0 (allow) or 2 (deny). Stderr text becomes the
   model-visible denial reason.
-- Static patterns are short and opinionated (~15 total): destructive
-  bash regex (rm -rf on system roots, format, dd of=/dev/, mkfs,
-  fork bombs, shutdown), OS-root path prefixes (Windows + Unix),
-  deck source dir.
+- **Both Bash and PowerShell are gated.** Claude Code on Windows
+  exposes PowerShell as a separate tool with the same `command`
+  shape as Bash. A construct given Bash-denied will silently pivot
+  to PowerShell — verified on real-deck without the construct being
+  asked to. Both shells share `SHELL_TOOLS` set in the hook; both
+  go through the same destructive-pattern + protected-path checks
+  under default brake; both are in `PARANOID_DENY_TOOLS`.
+- Static patterns are short and opinionated: destructive bash regex
+  (rm -rf on system roots, format, dd of=/dev/, mkfs, fork bombs,
+  shutdown, sc/net stop), OS-root path prefixes (Windows + Unix),
+  and three brake-config sentinel filenames (brake_hook.py,
+  brake_state.py, brake_patterns.py). The deck-source-dir-as-
+  substring check was tried and dropped — cyberdeck-home/ is a
+  subdirectory of the deck source, so a substring match
+  inadvertently denied every legitimate plugin and dispatcher
+  invocation. Sentinel filenames are precise enough.
 - Mid-flight propagation deferred — brake state is captured at
   spawn and baked into that construct's lifetime. New spawns see
   the new value.
@@ -373,6 +385,37 @@ first wave of post-migration work.
   layout edges from dead-end empty chains.
 - **`_focus_section` branches need to be re-checked when section
   contents change.** No-op return is silent.
+- **`_right_panel_focusables` is hand-curated, not auto-derived
+  from compose().** Adding a new ListView to the Tools tab without
+  also adding it here makes it visible-but-unreachable via W/S.
+  Burned this when adding the Plugins section. Look here whenever
+  the right panel grows a new section.
+
+### Brake / hook
+- **LLMs route around denial.** A construct given Bash-denied will
+  pivot to PowerShell automatically without being asked — verified
+  on real-deck after the brake hook initially over-blocked
+  legitimate plugin invocations. Implication: any tool-gating layer
+  must consider the equivalent capability on the platform, not just
+  the tool the human happens to think of. Both Bash and PowerShell
+  must be gated equivalently on Windows; on Linux the equivalent
+  consideration is Task-spawned sub-agents (different vector but
+  similar threat model).
+- **Substring matching the deck source dir over-blocks because
+  cyberdeck-home/ is a subdirectory.** A `bash command contains
+  <deck source dir>` check denies every legitimate plugin and
+  dispatcher invocation (`python <deck>/cyberdeck-home/plugins/
+  .../run.py`). Use sentinel filenames (brake_hook.py /
+  brake_state.py / brake_patterns.py) for tampering protection;
+  the path-overlap defeats prefix matching. Layout reorg (move
+  cyberdeck-home/ outside the deck source dir) is one fix; not
+  current scope.
+- **`files_written` tracks attempted writes, not confirmed ones.**
+  Construct.py populates from the model's `tool_use` blocks (model
+  says it wrote a file), not from successful tool_results. When
+  the brake hook denies, the path stayed in the list before we
+  fixed it. fleet.py's _consume now subtracts denied paths from
+  files_written at finalize time using normcase+normpath.
 
 ---
 
