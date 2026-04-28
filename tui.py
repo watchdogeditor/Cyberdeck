@@ -2654,6 +2654,13 @@ class CyberdeckApp(App):
         self.session_manager: Optional[SessionManager] = None
         self.session_pool: Optional[SessionPool] = None
         self._daemon_task: Optional[asyncio.Task] = None
+        # Set of (construct_id, action) pairs we've already warned
+        # about for unknown deck-protocol markers. A misbehaving
+        # construct emitting the same unknown action in a tight loop
+        # would otherwise paint the fleet log yellow until restart;
+        # one warning per (source, action) is plenty — the netrunner
+        # gets the signal once and isn't drowned in repeats.
+        self._unknown_action_seen: set[tuple[str, str]] = set()
         # Profile registry is always live, regardless of goal mode.
         # Started in on_mount, shut down in on_unmount. Listens to
         # disk and pushes events into _handle_profile_event so the
@@ -3883,10 +3890,18 @@ class CyberdeckApp(App):
         if action == "FILES_REMOVE":
             self._remove_file_from_panel(payload)
             return
-        # Unknown / future action.
+        # Unknown / future action. Suppress repeats per
+        # (construct_id, action) — the first warning conveys the
+        # signal; a tight emit loop on the construct side shouldn't
+        # be able to paint the fleet log yellow.
+        key = (construct_id, action)
+        if key in self._unknown_action_seen:
+            return
+        self._unknown_action_seen.add(key)
         self._notify_fleet_log(
             f"[dim]deck protocol: unknown action "
-            f"'{action}' from {construct_id} (ignored)[/dim]"
+            f"'{action}' from {construct_id} (ignored; "
+            f"further repeats from this construct suppressed)[/dim]"
         )
 
     def _remove_file_from_panel(self, abs_path: str) -> None:

@@ -436,7 +436,6 @@ and 10.
 - Script polling at refresh time
 - Script manifests not implemented (raw filenames only)
 - Esc-up tree navigation deferred
-- Unknown-action warnings could spam
 - Construct script-launch wiring stubbed
 - Watchdog substrate cloud-only
 - Connection consequences indicator-only
