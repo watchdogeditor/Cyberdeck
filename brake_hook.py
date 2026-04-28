@@ -189,6 +189,30 @@ def deck_source_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def cyberdeck_home_dir() -> Path:
+    """Resolve the deck's runtime workspace.
+
+    Default location: <deck source>/cyberdeck-home/. Can be overridden
+    via the $CYBERDECK_HOME environment variable, matching the deck's
+    CLI/env contract for --home.
+
+    Why this matters: the workspace sits *inside* the deck source dir
+    by layout, so the deck-source-protection check would otherwise
+    deny every legitimate write into the workspace (the place where
+    constructs are actually supposed to do their work). Real-deck
+    verified — a synthesis construct trying to write a research
+    report into the workspace got denied because Path.parents picked
+    up the deck source. Same class of over-block as the shell-path
+    substring case (already fixed in `bash_touches_protected_path`)."""
+    env = os.environ.get("CYBERDECK_HOME")
+    if env:
+        try:
+            return Path(env).resolve()
+        except (OSError, ValueError):
+            pass
+    return deck_source_dir() / "cyberdeck-home"
+
+
 def bash_touches_protected_path(cmd: str) -> tuple[bool, str]:
     """Detect shell commands that WRITE TO or MODIFY a protected path
     or deck-owned filename. Catches the redirect/copy/move/tee class
@@ -281,9 +305,26 @@ def bash_touches_protected_path(cmd: str) -> tuple[bool, str]:
 
 def path_is_protected(path: str) -> bool:
     """True if `path` is under an OS root or the deck source dir.
-    Bias toward over-protection — when normalization fails, we don't
-    deny by default (file might be a relative path that's fine; we
-    return False rather than guess)."""
+
+    Workspace exemption: paths inside the cyberdeck-home/ workspace
+    are NOT protected even though that directory sits inside the deck
+    source dir by layout. Constructs are supposed to write there —
+    that's the whole point of the workspace. Real-deck verified: a
+    synthesis construct trying to write a research report into the
+    workspace got denied because the workspace's parents include the
+    deck source dir.
+
+    Sub-exemption inside the exemption: <home>/.cyberdeck/ stays
+    protected. That's where deck-internal state lives (brake state
+    file, per-spawn settings JSON), and a construct that writes
+    state.json to YOLO would change the next spawn's permissions —
+    not a path the brake should leave open.
+
+    Bias toward over-protection elsewhere: when normalization fails,
+    we don't deny by default (the file might be a relative path
+    that's fine; better to allow ambiguous cases and let the
+    watchdog catch what we miss).
+    """
     if not path:
         return False
     if sys.platform.startswith("win"):
@@ -296,16 +337,27 @@ def path_is_protected(path: str) -> bool:
         for prefix in PROTECTED_UNIX_PREFIXES:
             if norm.startswith(prefix):
                 return True
-    # Deck source dir check — same on both platforms.
+    # Deck source dir check — but with workspace exemption.
     try:
         target = Path(path).resolve()
         deck = deck_source_dir()
+        home = cyberdeck_home_dir()
+        # Workspace exemption checked FIRST: if the target is inside
+        # the workspace, it's allowed unless it's specifically inside
+        # the deck-internal state subdirectory.
+        if target == home or home in target.parents:
+            internal = home / ".cyberdeck"
+            if target == internal or internal in target.parents:
+                # Deck-internal state — protected even inside workspace.
+                return True
+            return False
+        # Outside the workspace but inside the deck source dir =
+        # genuine deck source (tui.py, daemon.py, Design Files/, etc.)
+        # = protected.
         if target == deck or deck in target.parents:
             return True
     except (OSError, ValueError):
-        # Can't resolve — assume not protected. Better to allow
-        # ambiguous cases than to break the construct over a path
-        # quirk; the watchdog catches what we miss.
+        # Can't resolve — assume not protected.
         pass
     return False
 

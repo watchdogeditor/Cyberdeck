@@ -482,6 +482,25 @@ and 10.
   "adversarial." Bonus: the denial reason no longer hardcodes "bash
   references" when the actual tool was PowerShell — uses the outer
   `{tool}` field consistently.
+- **Same bug in the Write/Edit path: `path_is_protected` denied
+  writes inside cyberdeck-home/.** The deck-source-dir parents-walk
+  caught the workspace as collateral because `cyberdeck-home/` lives
+  inside the deck source dir by layout. Real-deck verified: a
+  daemon-orchestrated research goal completed five parallel recon
+  constructs successfully, then the synthesis construct tried to
+  write its report to `<workspace>/super_chipmunk_engine_report.md`
+  and got denied. Fix: `path_is_protected` exempts the workspace
+  from the deck-source check (with `<workspace>/.cyberdeck/` as a
+  sub-exemption — that's the deck-internal state directory and a
+  construct overwriting `state.json` to YOLO would change the next
+  spawn's permissions, so it stays protected). Workspace location
+  resolves via `$CYBERDECK_HOME` env var if set, else
+  `<deck>/cyberdeck-home/`. Same class of half-fix bug as the shell
+  path case — both code paths inherited the deck-source-dir prefix
+  match, and the shell version got fixed first because it surfaced
+  first. Lesson: when fixing a "protection over-blocks workspace"
+  bug in one code path, audit ALL code paths that share the
+  protection logic.
 
 ---
 
@@ -504,7 +523,19 @@ and 10.
 - **Plugins** — third leg of tool registry
 - **Watchdog tripwires + blacklist** — DSL, deterministic matcher
 - **Connection consequences** — spawn-blocking, daemon parking
-- **Routing** (`r`) — wire constructs together
+- **Routing** (`r`) — wire constructs together. Originally framed
+  as a coordination primitive (let two constructs talk through a
+  direct channel for tightly-coupled work). Real-deck use surfaced
+  a second use case at least as compelling: **wiring as a recovery
+  primitive**. When a construct does substantive work and the final
+  step fails (the report-write-blocked-by-brake case being the
+  canonical example), today's only recovery paths are (a) netrunner
+  copy-pastes the output by hand, or (b) the daemon redoes the
+  whole pipeline. With wiring, the netrunner could route the
+  failed construct's output into a fresh construct with task "take
+  this and write it to disk" — cheap, fast, no re-research. Strong
+  argument for prioritizing wiring sooner than its current "future
+  work" placement implies.
 - **Plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`)**
 - **Daemon pause/unpause (`E`)**
 - **Goal-edit force-push** — apply-now interrupt
