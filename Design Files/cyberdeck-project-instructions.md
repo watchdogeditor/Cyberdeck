@@ -191,9 +191,11 @@ From the first code-quality critique pass on `construct.py`:
   `state = KILLED`; wait() reads intent so the race is closed).
 - `tools` default hardcoded in `__init__` signature → should live in
   a module-level `DEFAULT_TOOLS`.
-- `classify_event` kind values are bare strings across the codebase.
-  Should be an enum/constants to prevent typos in downstream switch-
-  style consumers (watchdog, tripwire DSL).
+- ✅ `classify_event` kind values were bare strings — fixed
+  (`EventKind` namespace class in `construct.py`; consumers in
+  `display.py` import and reference). Open-ended pass-through
+  preserved so tripwire/watchdog future code can still see novel
+  types Claude Code adds.
 
 Open research items:
 

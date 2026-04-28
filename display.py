@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from construct import EventKind
+
 
 def summarize(raw: dict, *, untruncated: bool = False) -> str:
     """One-line human-readable summary of a stream-json event.
@@ -406,18 +408,18 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
 
     # System init: same boilerplate every spawn. Skip — the spawn line
     # already announced the construct.
-    if event_kind == "system_init":
+    if event_kind == EventKind.SYSTEM_INIT:
         return None
 
     # Tool result: the tool_use that preceded it already told the
     # netrunner what was happening. Skip to avoid doubling every line.
-    if event_kind == "tool_result":
+    if event_kind == EventKind.TOOL_RESULT:
         return None
 
     # Tool use: render with the verb form we use elsewhere ("reading
     # auth.py", "running: grep ..."). This is the workhorse — most of
     # the chatlog will be these.
-    if event_kind == "tool_use":
+    if event_kind == EventKind.TOOL_USE:
         content = raw.get("message", {}).get("content", [])
         if isinstance(content, list):
             for block in content:
@@ -429,7 +431,7 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
     # Thinking: include but truncate aggressively. Thinking is one of
     # the most useful debugging signals — it tells the netrunner what
     # the model is reasoning about before it acts.
-    if event_kind == "thinking":
+    if event_kind == EventKind.THINKING:
         content = raw.get("message", {}).get("content", [])
         if isinstance(content, list):
             for block in content:
@@ -452,7 +454,7 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
 
     # Rate limit: surface only when not 'allowed' — the green-light
     # ones are noise.
-    if event_kind == "rate_limit":
+    if event_kind == EventKind.RATE_LIMIT:
         info = raw.get("rate_limit_info", {})
         status = info.get("status", "?")
         if status == "allowed":
@@ -466,14 +468,14 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
     # Result: Claude Code emits its own per-turn 'result' event. The
     # user-visible version of this is the meta finalized event. Skip
     # to avoid doubling.
-    if event_kind == "result" or event_kind == "system_result":
+    if event_kind == EventKind.RESULT or event_kind == EventKind.SYSTEM_RESULT:
         return None
 
     # Plain assistant text / user text events come through too. The
     # final response gets surfaced in the meta finalized payload as
     # final_output; intermediate text is usually less interesting.
     # Skip by default; if a netrunner finds they want it, easy to flip.
-    if event_kind in ("user", "assistant"):
+    if event_kind in (EventKind.USER, EventKind.ASSISTANT):
         return None
 
     return None

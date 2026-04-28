@@ -441,7 +441,6 @@ and 10.
 - Watchdog substrate cloud-only
 - Connection consequences indicator-only
 - Goal-diff classifier crude stem
-- `classify_event` kind values are bare strings
 - Read tool 25k token limit — profiles bias toward Bash+wc-l
 - Long-running watchdog session accumulates context indefinitely
 

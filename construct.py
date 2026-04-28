@@ -83,11 +83,40 @@ class Event:
     raw: dict
 
 
+class EventKind:
+    """Constants for `classify_event` return values.
+
+    Class-as-namespace pattern (Pythonic; see tkinter / Qt). Values are
+    plain strings so the open-ended return path (raw type pass-through
+    for shapes the deck doesn't have a special case for) keeps working
+    — classify_event still returns bare strings, just sourced from
+    these constants for the recognized cases.
+
+    Downstream switch-style consumers (display formatters, watchdog,
+    future tripwire DSL) should compare against these constants rather
+    than literal strings — a typo on a literal is a silent dead branch;
+    a typo on EventKind.FOO_BAR is an AttributeError at import.
+    """
+    SYSTEM_INIT = "system_init"
+    SYSTEM_RESULT = "system_result"
+    SYSTEM = "system"
+    RESULT = "result"
+    RATE_LIMIT = "rate_limit"
+    TOOL_USE = "tool_use"
+    TOOL_RESULT = "tool_result"
+    THINKING = "thinking"
+    USER = "user"
+    ASSISTANT = "assistant"
+    OTHER = "other"
+
+
 def classify_event(raw: dict) -> str:
     """Bucket a raw stream-json event into a high-level kind.
 
     We accept whatever Claude Code emits and map it to a short label the
-    rest of the system can switch on. Unknown shapes bucket to 'other'
+    rest of the system can switch on. Recognized shapes return an
+    `EventKind` constant; unknown shapes pass through the raw type
+    string (or `EventKind.OTHER` if the type field is missing entirely)
     rather than crashing.
     """
     t = raw.get("type", "unknown")
@@ -95,19 +124,19 @@ def classify_event(raw: dict) -> str:
     if t == "system":
         subtype = raw.get("subtype", "")
         if subtype == "init":
-            return "system_init"
+            return EventKind.SYSTEM_INIT
         if subtype == "result":
-            return "system_result"
-        return "system"
+            return EventKind.SYSTEM_RESULT
+        return EventKind.SYSTEM
 
     # Top-level result event (distinct from system/result subtype)
     if t == "result":
-        return "result"
+        return EventKind.RESULT
 
     # Rate limit / quota events — worth routing explicitly since the
     # watchdog will care about these separately from normal flow.
     if t == "rate_limit_event":
-        return "rate_limit"
+        return EventKind.RATE_LIMIT
 
     if t in ("user", "assistant"):
         content = raw.get("message", {}).get("content", [])
@@ -117,14 +146,14 @@ def classify_event(raw: dict) -> str:
             # the most "significant" block present, in priority order.
             types = [b.get("type") for b in content if isinstance(b, dict)]
             if "tool_use" in types:
-                return "tool_use"
+                return EventKind.TOOL_USE
             if "tool_result" in types:
-                return "tool_result"
+                return EventKind.TOOL_RESULT
             if "thinking" in types:
-                return "thinking"
-        return t  # plain user/assistant text
+                return EventKind.THINKING
+        return t  # plain user/assistant text — same string as EventKind.USER/ASSISTANT
 
-    return t or "other"
+    return t or EventKind.OTHER
 
 
 class Construct:
