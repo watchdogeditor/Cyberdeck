@@ -6263,10 +6263,16 @@ class CyberdeckApp(App):
         tags get stripped because the model doesn't need them and
         they waste tokens.
 
-        Prepends a single `DECK BRAKE: <state>` line so the watchdog
-        knows the current brake level when interpreting denials it
-        sees in the chatlog. Cheap (~10 tokens) and bounded (one
-        line per question, not per event).
+        Headers prepended (cheap, bounded, deterministic):
+          - `DECK BRAKE: <state>` — current brake level so the
+            watchdog can interpret `brake blocked: ...` markers it
+            sees on finalized events.
+          - `CURRENT BLACKLIST:` — entries currently registered with
+            the watchdog's session blacklist. Authoritative current-
+            state source; the chatlog markers (`⛔ blacklist + ...`)
+            tell the watchdog WHEN entries were added, but those can
+            scroll off the buffer. The header is the source of truth
+            for "what's blacklisted right now."
         """
         # Tail of the buffer — most recent first in the deque, but we
         # want chronological order in the prompt so the model reads
@@ -6304,9 +6310,26 @@ class CyberdeckApp(App):
         # Watchdog uses this to interpret `brake blocked: ...` markers
         # the chatlog renders on finalized events.
         brake_header = f"DECK BRAKE: {self.brake_state_store.state.value}"
+
+        # Prepend the current-blacklist block. Authoritative current-
+        # state — without this, the watchdog can only see blacklist
+        # additions that happen to still be in the chatlog buffer
+        # window. Empty case suppresses the header entirely so a
+        # session with no blacklist entries doesn't waste tokens on
+        # an "empty list" line.
+        blacklist_block = ""
+        if (self.watchdog is not None
+                and self.watchdog.blacklist is not None
+                and len(self.watchdog.blacklist) > 0):
+            bl_lines = ["CURRENT BLACKLIST:"]
+            for entry in self.watchdog.blacklist.entries:
+                bl_lines.append(f"  - {entry.short_summary()}")
+            blacklist_block = "\n".join(bl_lines) + "\n\n"
+
+        header = brake_header + "\n\n" + blacklist_block
         if not lines:
-            return brake_header + "\n\n(no recent activity)"
-        return brake_header + "\n\n" + "\n".join(lines)
+            return header + "(no recent activity)"
+        return header + "\n".join(lines)
 
     def _on_watchdog_answer(self, wq: WatchdogQuestion) -> None:
         """Callback fired by the Watchdog worker when an answer is
