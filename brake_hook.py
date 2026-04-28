@@ -93,9 +93,21 @@ PROTECTED_UNIX_PREFIXES = (
 
 # Tools that paranoid brake denies wholesale. Read/Glob/Grep/WebSearch/
 # TodoWrite are the read-only / agent-internal kit and stay allowed.
+# Both Bash and PowerShell get denied — Claude Code on Windows
+# exposes PowerShell as a separate tool that takes the same
+# {"command": "..."} shape as Bash, and a construct given Bash-denied
+# will pivot to PowerShell automatically (verified on real-deck —
+# we caught a screenshot construct doing exactly this without being
+# asked). Both shells must be gated equivalently or the brake is
+# trivially bypassable.
 PARANOID_DENY_TOOLS = frozenset({
-    "Write", "Edit", "Bash", "WebFetch", "NotebookEdit",
+    "Write", "Edit", "Bash", "PowerShell", "WebFetch", "NotebookEdit",
 })
+
+# Shell-execution tools that need the same destructive-pattern + path
+# checks under default brake. Same rationale as PARANOID_DENY_TOOLS:
+# don't let PowerShell be the silent escape hatch.
+SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
 
 # Filenames the deck owns that bash should never modify, even when
 # the construct uses a relative path or a clever indirection. These
@@ -165,21 +177,26 @@ def bash_touches_protected_path(cmd: str) -> tuple[bool, str]:
             if prefix in haystack:
                 return True, f"bash references protected OS path '{prefix}'"
 
-    # Deck source dir — the parent of brake_hook.py itself.
-    deck = str(deck_source_dir())
-    deck_norm = deck.lower().replace("\\", "/") if on_windows else deck
-    if deck_norm in haystack_alt:
-        return True, f"bash references deck source dir"
-
     # Deck-owned filenames (sentinel substring match). Catches the
     # "construct cd's into the deck source then runs `> brake_hook.py`"
     # path even when the deck source dir prefix isn't in the same
     # command string.
+    #
+    # Note: we deliberately do NOT match the deck source dir as a
+    # substring. Earlier versions did, but cyberdeck-home/ is a
+    # subdirectory of the deck source dir, which meant every
+    # legitimate plugin invocation (`python <deck>/cyberdeck-home/
+    # plugins/.../run.py`) and dispatcher call got denied. Legitimate
+    # use sits inside the deck-source tree by design (the layout
+    # reorg that would move cyberdeck-home/ outside is deferred).
+    # Sentinel filenames are precise enough: a construct writing to
+    # brake_hook.py necessarily mentions that filename, regardless
+    # of which path leads there.
     for fname in PROTECTED_DECK_FILENAMES:
         needle = fname.lower() if on_windows else fname
         if needle in haystack:
             return True, (
-                f"bash references protected deck file '{fname}' "
+                f"shell references protected deck file '{fname}' "
                 f"(brake-config tampering attempt)"
             )
 
@@ -219,7 +236,13 @@ def path_is_protected(path: str) -> bool:
 
 def check_paranoid(tool: str, inp: dict) -> tuple[bool, str]:
     """Returns (deny, reason). Paranoid is wholesale: any side-effect
-    tool is denied. The construct can read and reason; it cannot act."""
+    tool is denied. The construct can read and reason; it cannot act.
+
+    Both Bash and PowerShell are in PARANOID_DENY_TOOLS — they're
+    equivalent shells from a "construct can act on the system"
+    perspective, and a construct denied one will silently route to
+    the other unless both are gated. Don't let the brake be a soft
+    request that the construct can negotiate with."""
     if tool in PARANOID_DENY_TOOLS:
         return True, (
             f"PARANOID brake: {tool} is not permitted in this mode. "
@@ -240,7 +263,7 @@ def check_default(tool: str, inp: dict) -> tuple[bool, str]:
                 f"DEFAULT brake: {tool} to protected path denied "
                 f"(OS root or deck source): {path}"
             )
-    elif tool == "Bash":
+    elif tool in SHELL_TOOLS:
         cmd = str(inp.get("command", ""))
         for pattern, label in DESTRUCTIVE_BASH_PATTERNS:
             if re.search(pattern, cmd, re.IGNORECASE):
@@ -248,18 +271,20 @@ def check_default(tool: str, inp: dict) -> tuple[bool, str]:
                 # doesn't wreck the tool_result the model sees.
                 preview = cmd[:120] + ("..." if len(cmd) > 120 else "")
                 return True, (
-                    f"DEFAULT brake: bash command denied "
+                    f"DEFAULT brake: {tool} command denied "
                     f"({label}): {preview}"
                 )
-        # Path-aware second pass: catches bash commands that bypass
+        # Path-aware second pass: catches shell commands that bypass
         # the Write/Edit path check via redirect / cp / mv / tee /
         # python inline / etc. Substring match for protected paths
-        # and deck-owned filenames.
+        # and deck-owned filenames. Applies equally to Bash and
+        # PowerShell — same patterns work because both shells use
+        # similar redirect/path syntax for the cases we care about.
         touches, label = bash_touches_protected_path(cmd)
         if touches:
             preview = cmd[:120] + ("..." if len(cmd) > 120 else "")
             return True, (
-                f"DEFAULT brake: bash command denied ({label}): {preview}"
+                f"DEFAULT brake: {tool} command denied ({label}): {preview}"
             )
     return False, ""
 
