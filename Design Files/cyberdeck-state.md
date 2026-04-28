@@ -648,6 +648,47 @@ and 10.
   this and write it to disk" — cheap, fast, no re-research. Strong
   argument for prioritizing wiring sooner than its current "future
   work" placement implies.
+- **Universal list-names** — netrunner direction. Every listable
+  object (files, plugins, profiles, blacklist entries, constructs,
+  goals, watchdog Q&A, future tripwires, future morgue entries —
+  basically anything that could appear as a row in a list) gets a
+  short **list name** (~3–4 words, chat-name-style) generated at
+  creation time and stored on the object. UI surfaces use the list
+  name in row chrome instead of raw paths / full task text /
+  fingerprints. Eliminates a whole class of overflow / horizontal-
+  scrollbar / line-wrapping bugs where long content blows out
+  list-row layouts.
+  - **Why "creation time, not render time":** generating per-render
+    is expensive and produces inconsistent names (different code
+    paths, different truncation rules). Bake the name once, reuse
+    forever. Also matches the deck's "files on disk are the
+    database" pattern — list_name lives next to the object.
+  - **Generation:** two-tier. **Mechanical fallback** (basename,
+    first significant words, slugify) lands instantly so the row
+    never shows blank. **LLM-authored name** (~$0.001 per name via
+    Haiku, async) overwrites the fallback once it returns. Same
+    pattern as Claude.ai's conversation names — the model picks a
+    crisp 3-4 word slug from the content.
+  - **Storage:** the list_name field lives wherever the object's
+    canonical record lives — `files_written` entries, blacklist
+    entries' `BlacklistEntry`, watchdog `WatchdogHistoryEntry`,
+    profiles' TOML, etc. For runtime objects (constructs, goals)
+    it lives in-memory on the object.
+  - **Consistency rule:** any new object type added to the deck
+    that gets surfaced as a list row MUST carry a list_name field.
+    This is a spec-level rule, not a per-feature decision.
+  - **Open questions:** how to display the longer original text
+    when needed (z-magnify the row to see the full content?);
+    whether list names should be regeneratable (construct finishes
+    its work, generate a name from the OUTCOME instead of the
+    original task — outcomes are usually more meaningful); how to
+    namespace short names so two unrelated objects don't collide
+    visually in a list.
+  - **Relationship to existing infrastructure:** dovetails with
+    the morgue (browsing past sessions becomes useful only if each
+    row has a glanceable name) and with the keymap revision pass
+    (the actions-first inventory should treat list_name as a
+    first-class attribute of every focusable surface).
 - **Plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`)**
 - **Daemon pause/unpause (`E`)**
 - **Goal-edit force-push** — apply-now interrupt
