@@ -122,6 +122,61 @@ PROTECTED_DECK_FILENAMES = (
     "brake_patterns.py",
 )
 
+# Tokens that indicate a shell command WRITES to or MODIFIES a path,
+# rather than just reading it. Used to gate the protected-path match —
+# a read-only mention (Test-Path, ls, cat, Get-Item) of a protected
+# path is fine; a write/modify needs to be denied.
+#
+# Real-deck verification surfaced the false positive this addresses:
+# a recon_specialist construct doing
+#     Test-Path "C:\Program Files (x86)\Nmap\nmap.exe"
+# got denied because the command string contained "C:\Program Files."
+# The path-protection check didn't distinguish reads from writes, so
+# checking whether nmap was installed at its standard location got
+# caught the same way as `Remove-Item C:\Windows\thing.dll` would.
+# Same class of over-block as the deck-source-dir substring case
+# (which got fixed earlier with sentinel filenames).
+#
+# Heuristic, not airtight — a construct could write via `python -c
+# "open('C:/Windows/x','w').write(...)"` to evade. But: (1)
+# DESTRUCTIVE_BASH_PATTERNS catches the catastrophic stuff regardless;
+# (2) the Write/Edit tool gating already blocks tool-based writes
+# to protected paths; (3) the spec is explicit that the threat model
+# is "construct goes off-rails," not "construct is adversarial."
+WRITE_INDICATOR_TOKENS = (
+    # POSIX file-modifying utilities
+    "tee", "cp", "mv", "rm", "ln", "dd", "mkdir", "rmdir",
+    "touch", "chmod", "chown", "chgrp",
+    # Windows cmd verbs (case-insensitive)
+    "del", "erase", "copy", "xcopy", "robocopy",
+    "move", "ren", "rename", "md", "rd",
+    # PowerShell write/modify cmdlets
+    "set-content", "add-content", "out-file", "tee-object",
+    "new-item", "remove-item", "move-item", "copy-item",
+    "rename-item", "set-itemproperty", "set-acl",
+    "clear-content", "clear-item",
+)
+
+
+def has_write_indicator(cmd: str) -> bool:
+    """True if `cmd` contains a redirect operator or a known
+    file-modifying utility/cmdlet token. Word-boundary matched on
+    tokens to avoid substring false positives (e.g. won't flag
+    "remove-item-related" or paths containing token names).
+
+    `>` in any form (>, >>, *>, *>>) counts. Comparison in PowerShell
+    uses `-gt`/`-lt` syntax, not `>`, so a `>` in a shell command
+    almost always indicates redirection."""
+    if not cmd:
+        return False
+    if ">" in cmd:
+        return True
+    lower = cmd.lower()
+    for token in WRITE_INDICATOR_TOKENS:
+        if re.search(r"\b" + re.escape(token) + r"\b", lower):
+            return True
+    return False
+
 
 # -- decision logic -----------------------------------------------------------
 
@@ -135,26 +190,43 @@ def deck_source_dir() -> Path:
 
 
 def bash_touches_protected_path(cmd: str) -> tuple[bool, str]:
-    """Detect bash commands that mention a protected path or deck-
-    owned filename. Catches the redirect/copy/move/tee class of
-    bypass — `echo > brake_hook.py`, `cp foo /usr/bin/`, `tee
+    """Detect shell commands that WRITE TO or MODIFY a protected path
+    or deck-owned filename. Catches the redirect/copy/move/tee class
+    of bypass — `echo > brake_hook.py`, `cp foo /usr/bin/`, `tee
     C:\\Windows\\thing.dll`, etc. — without trying to fully parse
-    bash. Substring match is over-broad on purpose: a construct
-    that needs to mention a protected path in a command can do
-    legitimately read-only work via Read/Glob/Grep instead.
+    the shell.
 
     Returns (deny, reason). Deny=False if the command doesn't touch
-    a protected target.
+    a protected target OR if it only reads from one.
+
+    Two-prong gate:
+      1. Does the command contain a write indicator? (redirect, mv,
+         cp, Remove-Item, etc.) If no, allow — reads of protected
+         paths are fine. The construct can `Test-Path "C:\\Program
+         Files\\..."` to check whether a tool is installed without
+         tripping this.
+      2. If yes, does it ALSO mention a protected OS path or deck
+         sentinel filename? If yes, deny.
+
+    The first prong is what was missing in slice 1 of this file. A
+    plain substring match for protected paths denied legitimate read
+    operations (real-deck verification: a recon_specialist construct
+    checking for nmap at its standard install location got blocked).
 
     Threat model is "construct goes off-rails," not "construct is
     adversarial" — a determined adversary can hide intent (variable
-    substitution, base64'd commands, scripts that compose paths
-    dynamically). The defense here is structural enough to catch
-    the casual-drift failure mode while staying simple. Tighter
-    sandboxing belongs at the OS layer (AppContainer / namespaces /
-    different uid), out of scope for this hook.
+    substitution, base64'd commands, python -c open(...).write).
+    The defense here is structural enough to catch the casual-drift
+    failure mode while staying simple. Tighter sandboxing belongs at
+    the OS layer (AppContainer / namespaces / different uid), out of
+    scope for this hook.
     """
     if not cmd:
+        return False, ""
+
+    # First prong: no write indicator → no denial. Reads of protected
+    # paths (Test-Path, ls, cat, Get-Item, ...) are allowed.
+    if not has_write_indicator(cmd):
         return False, ""
 
     on_windows = sys.platform.startswith("win")
@@ -171,11 +243,11 @@ def bash_touches_protected_path(cmd: str) -> tuple[bool, str]:
         for prefix in PROTECTED_WINDOWS_PREFIXES:
             p_norm = prefix.lower().replace("\\", "/")
             if p_norm in haystack_alt:
-                return True, f"bash references protected OS path '{prefix}'"
+                return True, f"writes to protected OS path '{prefix}'"
     else:
         for prefix in PROTECTED_UNIX_PREFIXES:
             if prefix in haystack:
-                return True, f"bash references protected OS path '{prefix}'"
+                return True, f"writes to protected OS path '{prefix}'"
 
     # Deck-owned filenames (sentinel substring match). Catches the
     # "construct cd's into the deck source then runs `> brake_hook.py`"
@@ -192,11 +264,15 @@ def bash_touches_protected_path(cmd: str) -> tuple[bool, str]:
     # Sentinel filenames are precise enough: a construct writing to
     # brake_hook.py necessarily mentions that filename, regardless
     # of which path leads there.
+    #
+    # The write-indicator gate also covers reads here: a construct
+    # legitimately reading brake_hook.py to inspect the policy
+    # (`cat brake_hook.py`) won't trip this. Writes still get caught.
     for fname in PROTECTED_DECK_FILENAMES:
         needle = fname.lower() if on_windows else fname
         if needle in haystack:
             return True, (
-                f"shell references protected deck file '{fname}' "
+                f"writes to protected deck file '{fname}' "
                 f"(brake-config tampering attempt)"
             )
 

@@ -465,6 +465,23 @@ and 10.
   the brake hook denies, the path stayed in the list before we
   fixed it. fleet.py's _consume now subtracts denied paths from
   files_written at finalize time using normcase+normpath.
+- **OS-path substring match in the brake hook over-blocked reads.**
+  `bash_touches_protected_path` denied any shell command that
+  mentioned a protected path (c:\program files, /usr/, /etc/, etc.),
+  regardless of whether the command was reading or writing. Real-
+  deck recon work hit this immediately: a `recon_specialist`
+  construct doing `Test-Path "C:\Program Files (x86)\Nmap\nmap.exe"`
+  to check whether nmap was installed got denied. Same class of
+  over-block as the deck-source-dir-as-substring case. Fix: gated
+  the path match on `has_write_indicator(cmd)` — `>`, `tee`, `cp`,
+  `mv`, `Remove-Item`, `Out-File`, `Set-Content`, etc. Reads of
+  protected paths now allowed; writes still denied. Heuristic, not
+  airtight (python -c open().write evasion possible) but the
+  destructive-bash regex + Write/Edit gating cover the catastrophic
+  cases regardless, and the spec's threat model is "off-rails," not
+  "adversarial." Bonus: the denial reason no longer hardcodes "bash
+  references" when the actual tool was PowerShell — uses the outer
+  `{tool}` field consistently.
 
 ---
 
