@@ -510,14 +510,41 @@ def _format_outcomes(
         # at the top so the daemon reads the constraints before
         # reading the outcomes that might tempt it to spawn into
         # a blacklisted shape.
-        lines.append("⛔ SESSION BLACKLIST — do NOT spawn matching tasks:")
+        #
+        # Forceful language deliberate: real-deck verification of slice 1
+        # surfaced exactly the failure mode the spec warned about — the
+        # daemon read the blacklist, then rephrased a forbidden task
+        # into a structurally different sentence that did the same job
+        # ("Go find the nonsense file in documents and read it" became
+        # "Find a file with 'nonsense' in its name under the netrunner's
+        # Documents directory ... and read its contents. Steps: 1...").
+        # The fingerprint matcher couldn't catch the rephrase. So the
+        # prompt has to do the work of telling the daemon that
+        # rephrasing IS the violation, not a clever workaround. Slice 2
+        # tripwires (LLM-authored semantic matchers) will close this
+        # for real; until then, prompt discipline is the gate.
+        lines.append("⛔ SESSION BLACKLIST — these task patterns are FORBIDDEN:")
         for entry in blacklist_entries:
             lines.append(f"  - {entry.short_summary()}")
         lines.append(
-            "  → If your plan needed any of the above, halt that "
-            "branch and ask the netrunner via `chat` for direction. "
-            "Don't try to rephrase around the fingerprint — that's "
-            "what got the previous one killed."
+            "  → THE NETRUNNER ENDED THESE WITH Shift+K. That is the "
+            "loudest signal in the system: not a transient failure, "
+            "not a request to retry, not an invitation to clarify. "
+            "It means \"do not do this task in this session.\""
+        )
+        lines.append(
+            "  → \"Forbidden\" applies to the WORK, not the wording. "
+            "Rephrasing the task, breaking it into numbered steps, "
+            "renaming the deliverable, or routing the same goal "
+            "through a different verb all count as the same forbidden "
+            "task. The fingerprint match is a baseline; YOU are "
+            "expected not to weasel past it."
+        )
+        lines.append(
+            "  → If your plan depended on any of the above, halt that "
+            "branch and ASK the netrunner via the `chat` field. Do "
+            "not spawn anything that gets the same outcome as a "
+            "blacklisted task by other means."
         )
         lines.append("")
 
@@ -572,10 +599,35 @@ def _format_outcomes(
         )
         lines.append("")
 
+    # Build a fast lookup of source_construct_id → blacklist entry so the
+    # outcome rendering below can mark K-killed outcomes inline. The
+    # daemon's general respawn discipline ("state: killed warrants
+    # respawning") collides with the blacklist's anti-respawn intent
+    # when the daemon sees a K-killed outcome — both signals are real,
+    # and without an explicit per-outcome marker the killed-outcome
+    # signal can win (real-deck slice 1 verification surfaced this).
+    # The marker tells the daemon: "this killed outcome was the
+    # netrunner's K, not a system failure — do NOT respawn it."
+    blacklisted_by_source: dict[str, "BlacklistEntry"] = {}
+    if blacklist_entries:
+        for entry in blacklist_entries:
+            blacklisted_by_source[entry.source_construct_id] = entry
+
     if outcomes:
         lines.append("CONSTRUCT OUTCOMES:")
         for o in outcomes:
             lines.append(f"- [{o.construct_id}] {o.state}: {o.task}")
+            # If this outcome's construct was hard-killed (Shift+K), the
+            # blacklist has an entry whose source_construct_id matches.
+            # Surface that explicitly so the daemon's respawn logic
+            # cannot mistake the killed state for a transient failure.
+            if o.construct_id in blacklisted_by_source:
+                lines.append(
+                    "  ⛔ NETRUNNER Shift+K — task pattern blacklisted "
+                    "above. Do NOT respawn this construct OR any "
+                    "semantic variant of its task. Treat its result "
+                    "as final."
+                )
             if o.summary and o.summary.strip():
                 lines.append(f"  result: {o.summary}")
             else:

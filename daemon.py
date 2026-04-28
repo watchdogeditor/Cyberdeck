@@ -73,6 +73,17 @@ task-pattern three times. STOP. Either mark the goal done/failed or
 try a completely different decomposition. Spawning a fourth near-
 duplicate is forbidden — do not do it.
 
+BLACKLIST DISCIPLINE: An outcome line annotated with
+"⛔ NETRUNNER Shift+K — task pattern blacklisted above" overrides
+the general "state: killed warrants respawning" guidance below.
+Shift+K is the netrunner's "do not do this in this session" gesture.
+A K-killed outcome is final. Do NOT respawn it, do NOT rephrase the
+task into a different sentence, do NOT break it into numbered steps,
+do NOT route the same goal through a different verb. If your plan
+depended on that work, halt the branch and ASK the netrunner via
+`chat`. The session blacklist block at the top of the message lists
+all currently-forbidden patterns; consult it before spawning.
+
 CRITICAL: You MUST respond with exactly ONE fenced json block. Do not
 add prose before or after the JSON block. The block must match this
 shape:
