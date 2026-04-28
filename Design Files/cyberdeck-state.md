@@ -27,13 +27,25 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** daemon planning mode + daemon pause/unpause (paired
-state-machine work), then watchdog tripwires + blacklist (the harder
-half of watchdog), then log-readability overhaul, then D1 (local
-model substrate) for the long-term Watchdog/synthesizer/arbiter
-story. Plugin scaffolding, brake-as-deck-state, connection
-spawn-blocking, and the brake-denial visual all shipped in the
-first wave of post-migration work.
+**Up next:** watchdog tripwires + blacklist (the harder half of
+watchdog), then log-readability overhaul, then D1 (local model
+substrate) for the long-term Watchdog/synthesizer/arbiter story.
+Plugin scaffolding, brake-as-deck-state, connection spawn-blocking,
+and the brake-denial visual all shipped in the first wave of
+post-migration work.
+
+**Deferred mid-design (2026-04-27):** keymap revision pass and
+daemon planning mode + pause/unpause. Both started this session,
+both pulled before landing because the design needed more
+bandwidth than was available. Working draft for the keymap
+preserved at `cyberdeck-keymap-revision.md` with Layer 1 inventory
+populated; the actions-first methodology (enumerate actions →
+derive UI → derive keymap) is the new approach. Planning mode
+revised intent: it's a **modal** the netrunner opens (not a
+daemon state), used for goals too complex for a single-message
+goal-set, post-confirm produces a persistent tracking panel akin
+to Claude Code's "tasks" panel. Full notes in build plan items 8
+and 10.
 
 ---
 

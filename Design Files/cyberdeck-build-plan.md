@@ -161,8 +161,60 @@ Roughly ordered by likely appeal:
 6. **Construct script-launch wiring** — ScriptListItem space lands
    here once manifests exist.
 7. **Goal-edit force-push** — apply-now interrupt of in-flight turn.
-8. **Daemon pause/unpause (`E`).**
+8. **Daemon planning mode + pause/unpause (`E`).** Originally framed
+   as the next milestone post-migration; deferred behind the keymap
+   revision because (a) it'd add new bindings to a keymap that's about
+   to shift, and (b) the design needs more thought than the first
+   sketch captured. Revised intent (netrunner, 2026-04-27):
+   - Three workflow paths to getting work done on the deck:
+     **(A)** direct construct ("send this file to email") — one-shot,
+     bypasses daemon decomposition; **(B)** goal to daemon — the
+     everyday hot path; **(C)** planning mode for goals too complex
+     to dump in a single message.
+   - Planning mode is an **input modality (a modal), not a daemon
+     state**. You open the planning modal, hash out the intent with
+     the daemon inside it, confirm — and on confirm the modal closes
+     and a normal goal-launch fires with the matured plan attached.
+     Daemon stays a binary idle/working machine; planning is a
+     netrunner-side conversation surface that produces a structured
+     goal. Easier to back out of (Esc dismisses, no goal was set);
+     less state-machine surface; cleaner separation.
+   - Planning mode is an **addendum** to the current goal-set flow,
+     not a replacement. The everyday `e → submit → working` path
+     stays exactly as-is. Planning is opt-in for the complex case.
+   - Once confirmed and launched, the plan needs to produce a
+     **persistent tracking panel** akin to Claude Code's "tasks"
+     panel — the plan's steps stay visible and tick off as constructs
+     finish. The construct pool shows live state; the plan panel
+     shows progress against intent. Two surfaces, two purposes.
+   - This means a structured `plan: [{step, task, ...}]` field in the
+     daemon's response shape (not just prose in `chat`), plus a new
+     panel surface for the post-launch tracking view. Panel placement
+     and how it relates to the goal pane / construct pool is open.
+   - Pause/unpause is the simpler half of the original pairing and
+     can ship independently if planning mode stalls on design.
+   - Open question for next pickup: does the visible/invisible spawn
+     distinction (`n`/`N`) actually track with how path A is used?
+     When daemon is working, invisible is almost always wanted for a
+     side-task; visible (woven into plan) is rare. Soft/loud framing
+     may be upside-down here. Worth examining as part of the keymap
+     revision when that thread re-opens.
 9. **Plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`).**
+10. **Keymap revision pass.** Real-deck use surfaced that the keymap
+    is starting to feel obtuse — too many global verbs to memorize,
+    semantic-amplifier convention only actually applies cleanly to
+    `q/Q` and `k/K` (the rest are arbitrary modal switches), some keys
+    (`r`, `c`, `C`, `p`, `E`) wired to stubs that may not survive,
+    plus awkward physical reaches. Tee'd up as next-priorities #1 on
+    2026-04-27 with an actions-first methodology (enumerate every
+    user-facing action; derive UI surfaces and keybinds from that).
+    Working draft preserved at `cyberdeck-keymap-revision.md` with
+    Layer 1 inventory populated. Pulled mid-design same session
+    because it needs more bandwidth to do well than was available.
+    Pickup next time: netrunner marks up Layer 1 (frequency, tags,
+    capability gaps), AI does Layer 2 synthesis, Layer 3 keymap
+    proposal lands jointly. Blocks new bindings until done — so
+    planning mode (item 8) sits behind this when both unblock.
 10. **Quota-aware throttling.** Daemon gates spawns on remaining Max
     quota — warn or hold when the 5h or weekly window is near full.
     Mechanism: Claude Code's status-line script receives
@@ -235,19 +287,20 @@ natively, doesn't suffer chat context truncation.
 - ✓ Plugin scaffolding v1 — stateless plugins, screenshot as first
 
 **Next priorities:**
-1. Daemon planning mode + daemon pause/unpause — paired state-machine
-   work; chat with the daemon before it spawns anything, transitions
-   to active when netrunner says go.
-2. Watchdog tripwires + blacklist — eventually authors goal-scoped
+1. Watchdog tripwires + blacklist — eventually authors goal-scoped
    deny rules on top of the static brake patterns. Largest remaining
    chunk.
-3. Log-readability overhaul — fleet/chatlog/watchdog/daemon scattered
+2. Log-readability overhaul — fleet/chatlog/watchdog/daemon scattered
    across windows is hard to follow at a glance; needs structural
    thinking, not just CSS.
-4. Connection consequences round 2: daemon parking on connection-
+3. Connection consequences round 2: daemon parking on connection-
    blocked spawns + recovery flow.
-5. Tools-research chat (from `cyberdeck-tools-research-seed.md`).
-6. Plugin sub-features: airgap `p`, quickfire `c`, picker `Shift+C`.
+4. Tools-research chat (from `cyberdeck-tools-research-seed.md`).
+5. Plugin sub-features: airgap `p`, quickfire `c`, picker `Shift+C`.
+
+(Keymap revision pass was tee'd up here on 2026-04-27 but moved to
+deferred mid-design — needs more brain cells to do well than were
+available that session. Working draft preserved; see deferred list.)
 
 ---
 
