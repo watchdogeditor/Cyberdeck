@@ -15,6 +15,7 @@ Flow:
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional, TYPE_CHECKING
 
@@ -260,6 +261,13 @@ class DaemonSession:
             task = action.get("task", "").strip()
             if not task:
                 return
+            # Strip markdown autolinks from task text. Constructs
+            # read tasks as plain strings, never as markdown — and
+            # an autolink that survives into a filename produces
+            # literal brackets in the path. See the note above
+            # `_strip_markdown_autolinks` for the real-deck case
+            # this fixes.
+            task = _strip_markdown_autolinks(task)
 
             # Blacklist gate. Checked before any other spawn gating
             # because blacklist refusal means "we will never run this,
@@ -463,6 +471,34 @@ class DaemonSession:
         the iterator is cancelled by control flow."""
         self._goal_done.set()
         await self.daemon.shutdown()
+
+
+# Markdown autolink syntax: `[text](url)`. Real-deck failure: when
+# daemon outcomes contain URLs, the model auto-wraps them in this
+# syntax in its response (model behavior, not deck behavior). The
+# bracketed wrapper survives into the next task's text and constructs
+# read it literally — observed: a research goal's report-write
+# construct received task text containing
+#   "...super_chipmunk_engine_[report.md](http://report.md)..."
+# and dutifully created a file called `super_chipmunk_engine_[report.md]`,
+# brackets and all.
+#
+# Tasks are passed verbatim to constructs, which read them as plain
+# text — markdown rendering never happens at the construct boundary,
+# so the syntax is pure noise (and worse, gets baked into filenames).
+# Strip aggressively: convert `[text](url)` to `text` regardless of
+# what the url is. Construct prompts that genuinely need a URL can
+# include it as plain text alongside; that's how the daemon system
+# prompt now teaches it.
+_MARKDOWN_AUTOLINK_RE = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
+
+
+def _strip_markdown_autolinks(s: str) -> str:
+    """Replace `[text](url)` patterns with just `text`. Idempotent
+    on strings without autolinks. Handles multiple links per string."""
+    if not s or "](" not in s:
+        return s
+    return _MARKDOWN_AUTOLINK_RE.sub(r"\1", s)
 
 
 def _format_outcomes(

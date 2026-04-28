@@ -460,6 +460,23 @@ and 10.
   Burned this when adding the Plugins section. Look here whenever
   the right panel grows a new section.
 
+### Daemon / task plumbing
+- **Markdown autolinks bake into filenames if not stripped.** When
+  daemon outcomes contain URLs, the daemon (claude subprocess)
+  auto-wraps them in markdown autolink syntax — `[text](url)` — in
+  its response. That syntax survives into the next task's text and
+  constructs read it literally. Real-deck case: a research-goal
+  report-write task contained `super_chipmunk_engine_[report.md]
+  (http://report.md)` and the construct dutifully created a file
+  called `super_chipmunk_engine_[report.md]`, brackets and all.
+  Fix in `daemon_session._execute_action`: strip markdown autolinks
+  from the spawn action's task field before passing it to the
+  fleet (`_strip_markdown_autolinks` regex helper). Belt-and-
+  suspenders: daemon system prompt now explicitly tells the daemon
+  to use plain text in task strings (no markdown link syntax, no
+  fenced code blocks, no inline formatting). Constructs read tasks
+  as literal strings; markdown is pure noise at that boundary.
+
 ### Brake / hook
 - **LLMs route around denial.** A construct given Bash-denied will
   pivot to PowerShell automatically without being asked — verified

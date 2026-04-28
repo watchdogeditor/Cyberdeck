@@ -135,6 +135,13 @@ Task-authoring guidelines (CRITICAL for getting useful outcomes back):
   exactly N lines with Y format", "respond with just the count."
 - Specify exclusions up front: "exclude venv, __pycache__, .git."
 - Quote paths and identifiers so there's no ambiguity.
+- Use PLAIN TEXT in task strings. Do NOT use markdown link syntax —
+  no `[text](url)` autolinks, no fenced code blocks, no inline
+  formatting. Constructs read the task as a literal string; markdown
+  syntax becomes noise (and worse, autolinked file paths have
+  caused literal brackets to end up in created filenames). If a URL
+  matters, write it plain: `https://example.com`. If a path matters,
+  write it plain: `cyberdeck-home/report.md`.
 
 Other guidelines:
 - Each construct task must be self-contained.
