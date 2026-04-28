@@ -256,7 +256,6 @@ Roughly ordered by likely appeal:
 - Watchdog substrate cloud-only until D1
 - Connection consequences indicator-only until M5+
 - Goal-diff classifier crude stem (-es plurals mis-class sometimes)
-- `Fleet.spawn()` slice (`_build_command()[1:]`) — builder API ugly
 - `Construct.kill()` state pre-confirmation
 - `classify_event` bare strings
 - Read tool 25k token limit — profiles bias toward Bash+wc-l

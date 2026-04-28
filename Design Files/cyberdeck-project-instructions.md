@@ -183,8 +183,9 @@ From the first code-quality critique pass on `construct.py`:
 
 - ✅ `events()` conflated streaming with lifecycle finalization —
   fixed (split into `events()` + `wait()`).
-- `spawn()` slices `_build_command()[1:]` to splice in the resolved
-  binary path. The builder API should take the resolved path.
+- ✅ `spawn()` slices `_build_command()[1:]` to splice in the resolved
+  binary path — fixed (`_build_command(claude_bin)` takes the resolved
+  path as a required arg).
 - `kill()` sets `state = KILLED` *before* confirming termination.
   Should transition only after the process is confirmed dead.
 - `tools` default hardcoded in `__init__` signature → should live in

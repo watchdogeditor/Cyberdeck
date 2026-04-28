@@ -245,8 +245,13 @@ class Construct:
 
     # ---- lifecycle ------------------------------------------------------
 
-    def _build_command(self) -> list[str]:
-        cmd = [self.claude_bin]
+    def _build_command(self, claude_bin: str) -> list[str]:
+        # claude_bin is the resolved path the caller already located via
+        # shutil.which (or equivalent). Required arg, no fallback to
+        # self.claude_bin: the resolved path is the only one safe to
+        # hand to create_subprocess_exec on Windows, and threading it
+        # through the API removes the temptation to ever skip resolving.
+        cmd = [claude_bin]
         # When piping prompt via stdin, omit the prompt arg so claude
         # reads from stdin. Otherwise, pass the task as -p's argument.
         if self.stdin_prompt is not None:
@@ -334,7 +339,7 @@ class Construct:
                 f"explicit path (e.g. the output of `npm config get prefix`)."
             )
 
-        cmd = [resolved] + self._build_command()[1:]
+        cmd = self._build_command(resolved)
         self._started_at = time.time()
 
         stdin_mode = (
