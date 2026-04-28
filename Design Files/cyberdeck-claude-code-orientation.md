@@ -198,7 +198,7 @@ worth the complexity.
 This file is huge but well-organized. When adding a feature, first
 grep for existing similar work — the pattern is almost always there.
 
-### `watchdog.py` (898 LOC)
+### `watchdog.py` (1043 LOC)
 - `Watchdog` class with `streaming_mode` switch (Q&A oracle half)
 - One-shot path: `_process_oneshot` (claude `-p` per question, stdin)
 - Streaming path: `_process_streaming` + `_spawn_streaming` +
@@ -214,6 +214,13 @@ grep for existing similar work — the pattern is almost always there.
   in-flight match scan). Tripwire authoring (slice 2) will read
   entries' rich context to author sharper rules than the current
   first-80-fingerprint matcher.
+- `WatchdogHistory` + `WatchdogHistoryEntry` — persistent JSONL log
+  of resolved Q&A at `<home>/.cyberdeck/watchdog.jsonl`. Watchdog
+  appends in `_safe_callback` before firing the listener; TUI
+  replays last N into WatchdogPane on mount. Per-entry `kind` field
+  futureproofs for tripwire / blacklist records. First slice of the
+  watchdog-log initiative; tripwire/blacklist kinds and a dedicated
+  history-browse tab still deferred.
 
 ### `daemon.py` (685 LOC)
 - `Daemon` class with both backends
@@ -446,6 +453,7 @@ substantive change is still useful. Keep it.
 | Plugin shape (manifest, README, entry) | `<home>/plugins/<name>/` |
 | Plugin awareness in prompts | `tui.py` `_build_daemon_system_prompt` + `_build_deck_addendum` |
 | Watchdog Blacklist | `watchdog.py` `Blacklist` / `BlacklistEntry` (data) + `tui.py` `action_hard_kill_focused` (populate) + `tui.py` `_handle_blacklist_event` (render + flag) + `daemon_session.py` `_execute_action` spawn branch (refusal) + `daemon_session._format_outcomes` (daemon-facing surface) |
+| Watchdog Q&A persistence | `watchdog.py` `WatchdogHistory` / `WatchdogHistoryEntry` (data + replay) + `Watchdog._safe_callback` (write on resolve) + `tui.py` `_replay_watchdog_history` (mount-time read) + `WatchdogPane.write_history_separator` / `write_live_session_marker` (visual chrome) |
 
 ---
 

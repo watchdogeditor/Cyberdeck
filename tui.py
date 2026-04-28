@@ -57,6 +57,7 @@ from watchdog import (
     WatchdogQuestion,
     Blacklist,
     BlacklistEntry,
+    WatchdogHistory,
     _fingerprint as _blacklist_fingerprint,
 )
 from connection_monitor import (
@@ -644,6 +645,25 @@ class WatchdogPane(Static, can_focus=False):
     def write_failure(self, error: str) -> None:
         """Watchdog returned an error instead of an answer."""
         self._write_line(f"[red]✗ failed:[/red] {error}")
+
+    def write_history_separator(self, count: int) -> None:
+        """Visual marker delimiting replayed prior-session Q&A from
+        live current-session Q&A. Called once at startup before any
+        prior entries are replayed; the count tells the netrunner
+        how much they're looking at.
+
+        Format chosen to be unmistakable but compact: a yellow-dimmed
+        rule line with the count, so it reads as 'context, not new.'
+        """
+        self._write_line(
+            f"[dim yellow]──── prior session ({count} entries) ────[/dim yellow]"
+        )
+
+    def write_live_session_marker(self) -> None:
+        """Bookend after history replay, before live Q&A starts."""
+        self._write_line(
+            f"[dim yellow]──── live session ────[/dim yellow]"
+        )
 
     def _write_line(self, line: str) -> None:
         try:
@@ -2715,6 +2735,16 @@ class CyberdeckApp(App):
         self.watchdog = Watchdog(
             claude_bin=self.claude_bin,
             on_blacklist_event=self._handle_blacklist_event,
+            # Persistent Q&A log under the deck's internal state
+            # directory. Replayed into WatchdogPane on mount so the
+            # netrunner's prior Q&A history survives a deck restart.
+            # First slice of the watchdog-log initiative filed in
+            # cyberdeck-state.md; future expansions (tripwire fires,
+            # blacklist change records) will share the same JSONL
+            # via a `kind` field.
+            history=WatchdogHistory(
+                self.home_dir / ".cyberdeck" / "watchdog.jsonl",
+            ),
         )
         # Connection monitor — heartbeats api.anthropic.com:443 to
         # detect Online/Degraded/Offline transitions. Per spec line
@@ -3219,6 +3249,11 @@ class CyberdeckApp(App):
             self.watchdog.start(),
             name="watchdog-start",
         )
+        # Replay prior-session Q&A history into the WatchdogPane so
+        # the netrunner's conversation persists across deck restarts.
+        # First slice of the watchdog-log initiative; safe to fail
+        # silently (history is best-effort observability).
+        self._replay_watchdog_history()
         # ConnectionMonitor heartbeats start immediately. Independent
         # of fleet/daemon lifecycle — the indicator should be live
         # from the moment the deck opens, not just during sessions.
@@ -6375,6 +6410,46 @@ class CyberdeckApp(App):
             self.watchdog_pane.write_answer(answer)
             qd = self.watchdog.queue_depth()
             self.watchdog_pane.set_status(busy=qd > 0, queue_depth=qd)
+
+    def _replay_watchdog_history(self) -> None:
+        """Read the persistent watchdog Q&A log and render the last
+        N entries into WatchdogPane before live activity begins.
+
+        Counterpart to the live `_on_watchdog_answer` writer. Best-
+        effort throughout — if the history file is missing, empty,
+        or unparseable, we render nothing. The pane is initialized
+        empty in compose() so the no-history case looks like a fresh
+        deck, which is the correct UX.
+
+        Replayed entries get a 'prior session' visual marker so the
+        netrunner can tell them apart from live current-session Q&A.
+        """
+        if self.watchdog is None or self.watchdog.history is None:
+            return
+        if self.watchdog_pane is None:
+            return
+        try:
+            entries = self.watchdog.history.replay(n=50)
+        except Exception:
+            entries = []
+        if not entries:
+            return
+        try:
+            self.watchdog_pane.write_history_separator(len(entries))
+            for e in entries:
+                self.watchdog_pane.write_question(e.question)
+                if e.failed:
+                    self.watchdog_pane.write_failure(
+                        e.error or "(unknown failure)"
+                    )
+                else:
+                    self.watchdog_pane.write_answer(e.answer)
+            self.watchdog_pane.write_live_session_marker()
+        except Exception:
+            # If the pane render fails (mount race / Textual quirk),
+            # we already have the entries on disk; the netrunner can
+            # still find them via cat/grep against the JSONL.
+            pass
 
     def action_talk_daemon(self) -> None:
         """T — open the talk-to-daemon modal.

@@ -235,6 +235,26 @@ and 10.
 - Space on daemon_log → action_talk_daemon; space on watchdog_log →
   action_talk_watchdog
 
+### Watchdog log (persistent Q&A history — v1)
+- `WatchdogHistory` + `WatchdogHistoryEntry` in `watchdog.py`.
+  Append-only JSONL at `<home>/.cyberdeck/watchdog.jsonl`. Each
+  resolved question is persisted by `_safe_callback` BEFORE the
+  listener fires (so the entry survives a listener crash).
+- TUI replays the last 50 entries on `on_mount` via
+  `_replay_watchdog_history`, with `──── prior session (N entries)
+  ────` / `──── live session ────` separators in the WatchdogPane
+  so historical and current Q&A are visually distinct.
+- Per-entry `kind` field (currently always "qa") futureproofs the
+  file for tripwire / blacklist record kinds. Schema-drift
+  tolerant: replay drops unparseable lines silently, skips
+  non-qa kinds.
+- Best-effort throughout — persistence is observability, not
+  correctness. Disk errors don't crash the watchdog. Parent
+  directory created on demand if missing.
+- First slice of the netrunner's "deck history infrastructure"
+  brainstorm; the morgue (session-level history + resuscitation)
+  remains deferred.
+
 ### Watchdog Blacklist (session-scoped, populated by Shift+K)
 - `Blacklist` + `BlacklistEntry` in `watchdog.py`. Lives on the
   Watchdog per spec ("the persistent memory of what's forbidden").
@@ -577,26 +597,39 @@ and 10.
     personal capability library — fits the spec's "capability
     accumulates" thesis directly. Every successful construct
     becomes a callable artifact later.
-- **Watchdog log (persistent watchdog history)** — netrunner
-  direction. The WatchdogPane shows live Q&A but doesn't persist;
-  closing the deck loses everything the watchdog ever observed or
-  was asked. With tripwires landing eventually, this gap widens —
-  tripwire fires would also need somewhere to live.
-  - **Storage:** append-only JSONL at `<home>/.cyberdeck/watchdog.jsonl`.
-    Per-entry fields: `kind` (qa | tripwire | blacklist_change),
-    timestamp, content (question+answer for qa, fingerprint+severity
-    for tripwire, etc.), context_size, cost, status.
-  - **UI:** replay last N into the WatchdogPane on startup so prior
-    conversation is still visible. Optional "Watchdog History" tab
-    in the right panel for full retrospective browsing (separate
-    from the live bottom-panel Watchdog tab).
-  - **Cross-cutting:** both the morgue and the watchdog log are
-    "deck history infrastructure" — could be designed together as
-    a single retrospective-observability initiative rather than two
-    independent features. Both follow the deck's "files on disk are
-    the database" pattern (per philosophy doc); both are bounded in
-    scope; both have obvious recovery / debugging value the moment
-    they exist.
+- **Watchdog log (persistent watchdog history)** — v1 shipped
+  2026-04-28; tripwire/blacklist record kinds still deferred. The
+  shipped slice:
+  - `WatchdogHistory` + `WatchdogHistoryEntry` in `watchdog.py`,
+    persisting to `<home>/.cyberdeck/watchdog.jsonl` (append-only,
+    one JSONL line per resolved Q&A).
+  - Watchdog accepts `history=` at construction; `_safe_callback`
+    persists to history before firing the listener so the entry
+    is recorded even if the listener crashes or no listener is
+    wired.
+  - TUI's `_replay_watchdog_history` runs in `on_mount` and renders
+    the last 50 entries into WatchdogPane with a `──── prior
+    session (N entries) ────` / `──── live session ────` separator
+    pair so the netrunner can tell historical from current.
+  - Per-entry shape includes a `kind` field (currently always
+    "qa", future "tripwire" / "blacklist_change" entries will share
+    the same file). Schema-drift tolerant: replay drops unparseable
+    lines silently and skips non-qa kinds.
+  - Best-effort throughout: disk errors don't crash the watchdog
+    (the question already resolved by the time we try to write;
+    persistence is observability, not correctness).
+  - **Still deferred:** dedicated "Watchdog History" right-panel
+    tab for retrospective browsing distinct from the live tab; the
+    tripwire/blacklist record kinds; cost/status fields beyond
+    success/fail.
+- **Cross-cutting:** the morgue and the watchdog log were filed
+  together as "deck history infrastructure" — both follow the
+  deck's "files on disk are the database" pattern (per philosophy
+  doc) and would benefit from being designed as one initiative.
+  Watchdog log v1 shipped first because it's tighter scope and the
+  netrunner-immediate value (Q&A surviving restart) was clearer.
+  The morgue (session-level history + resuscitation) remains
+  deferred.
 
 ---
 

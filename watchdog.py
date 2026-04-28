@@ -52,6 +52,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 
@@ -268,6 +269,135 @@ class Blacklist:
 
 
 @dataclass
+class WatchdogHistoryEntry:
+    """A serialized record of one resolved watchdog question.
+
+    Persisted to a JSONL file so the netrunner's prior Q&A history
+    survives a deck restart. First step of the watchdog log
+    initiative filed in cyberdeck-state.md; future expansions
+    (tripwire fires, blacklist change records) will share the same
+    file via a `kind` field — for now the only kind is "qa" and the
+    field is implicit.
+    """
+    qid: str
+    submitted_at: float
+    answered_at: float
+    question: str
+    answer: str           # empty string if failed
+    failed: bool
+    error: str            # empty string if successful
+
+    @classmethod
+    def from_question(cls, wq: "WatchdogQuestion") -> "WatchdogHistoryEntry":
+        return cls(
+            qid=wq.qid,
+            submitted_at=wq.submitted_at,
+            answered_at=wq.answered_at or time.time(),
+            question=wq.question,
+            answer=wq.answer or "",
+            failed=wq.failed,
+            error=wq.error or "",
+        )
+
+    def to_json_line(self) -> str:
+        return json.dumps({
+            "qid": self.qid,
+            "kind": "qa",
+            "submitted_at": self.submitted_at,
+            "answered_at": self.answered_at,
+            "question": self.question,
+            "answer": self.answer,
+            "failed": self.failed,
+            "error": self.error,
+        })
+
+    @classmethod
+    def from_json_line(cls, line: str) -> Optional["WatchdogHistoryEntry"]:
+        try:
+            d = json.loads(line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(d, dict):
+            return None
+        # `kind` filtering: skip non-qa entries when (eventually) the
+        # log holds tripwire/blacklist records too. For now everything
+        # is qa, and old entries written before this field existed
+        # default to qa via .get(...,"qa").
+        if d.get("kind", "qa") != "qa":
+            return None
+        try:
+            return cls(
+                qid=str(d.get("qid", "")),
+                submitted_at=float(d.get("submitted_at", 0.0) or 0.0),
+                answered_at=float(d.get("answered_at", 0.0) or 0.0),
+                question=str(d.get("question", "")),
+                answer=str(d.get("answer", "")),
+                failed=bool(d.get("failed", False)),
+                error=str(d.get("error", "")),
+            )
+        except (TypeError, ValueError):
+            return None
+
+
+class WatchdogHistory:
+    """Persistent JSONL log of resolved watchdog Q&A.
+
+    Append-only at `path` (typically `<home>/.cyberdeck/watchdog.jsonl`).
+    `append(wq)` fires from the Watchdog when a question resolves;
+    `replay(n)` reads the last n entries for the TUI to render into
+    WatchdogPane on startup.
+
+    Best-effort throughout: disk errors don't crash the watchdog.
+    Persistence is observability, not correctness — the question has
+    already resolved by the time we try to write, so a failed write
+    just means the netrunner loses retrospective access to that one
+    Q&A. The file is also gitignored (lives under cyberdeck-home/),
+    so it's local-only by design.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def append(self, wq: "WatchdogQuestion") -> None:
+        """Serialize and append. Creates the parent dir on demand —
+        first run typically lands before .cyberdeck/ exists."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            entry = WatchdogHistoryEntry.from_question(wq)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(entry.to_json_line() + "\n")
+        except Exception:
+            # Best-effort. The question already resolved; we just
+            # lose the persisted record.
+            pass
+
+    def replay(self, n: int = 50) -> list[WatchdogHistoryEntry]:
+        """Read the last `n` parseable entries in chronological order.
+        Returns an empty list if the file is missing, unreadable, or
+        empty — callers treat absence the same as 'no prior history.'"""
+        if not self.path.exists():
+            return []
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception:
+            return []
+        # Take the tail to bound parse cost on long-running decks.
+        # Drop unparseable lines silently — schema drift over time
+        # shouldn't break replay; the netrunner just sees fewer
+        # historical entries than expected.
+        out: list[WatchdogHistoryEntry] = []
+        for line in lines[-n:]:
+            line = line.strip()
+            if not line:
+                continue
+            entry = WatchdogHistoryEntry.from_json_line(line)
+            if entry is not None:
+                out.append(entry)
+        return out
+
+
+@dataclass
 class WatchdogQuestion:
     """A question in flight or waiting in the queue.
 
@@ -324,6 +454,7 @@ class Watchdog:
         streaming_mode: bool = True,
         first_question_timeout: float = 90.0,
         on_blacklist_event: Optional[Callable[[dict], None]] = None,
+        history: Optional["WatchdogHistory"] = None,
     ) -> None:
         self.id = f"wd-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -337,6 +468,13 @@ class Watchdog:
         # (tripwire authoring) will wire the watchdog's Q&A path to
         # observe entries and propose sharper rules.
         self.blacklist = Blacklist(on_event=on_blacklist_event)
+        # Persistent Q&A log. When set, every resolved question gets
+        # appended to a JSONL file before the callback fires. The TUI
+        # reads it on startup to replay prior session Q&A into the
+        # WatchdogPane. None in tests / headless contexts where
+        # persistence is unwanted; the rest of the watchdog flow is
+        # unchanged regardless.
+        self.history = history
         # Streaming mode keeps a single `claude --input-format stream-json`
         # subprocess alive across all questions. Saves the per-question
         # spawn cost (which dominates wall-time on a fast cache and
@@ -889,7 +1027,14 @@ class Watchdog:
         """Fire the question's callback, swallowing exceptions so a
         broken UI handler doesn't kill the worker loop. The exception
         gets stashed as the question's error if no other error was
-        already recorded — better than dropping it silently."""
+        already recorded — better than dropping it silently.
+
+        Persists to history (if configured) BEFORE firing the
+        callback so the Q&A is recorded even if the listener crashes
+        or no listener exists. The history layer is itself
+        best-effort and won't raise."""
+        if self.history is not None:
+            self.history.append(wq)
         try:
             wq.callback(wq)
         except Exception as e:
