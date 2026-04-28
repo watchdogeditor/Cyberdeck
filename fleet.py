@@ -688,6 +688,26 @@ class Fleet:
                 return True
         return False
 
+    def get_construct(self, construct_id: str) -> Optional[Construct]:
+        """Lookup a tracked construct by id. Returns None if not found.
+
+        Used by callers (the TUI hard-kill / blacklist path) that need
+        to read the actual Construct object — task text, files_written,
+        final_output, state — to capture context at kill time. Cleaner
+        than reaching into fleet._constructs directly."""
+        for c in self._constructs:
+            if c.id == construct_id:
+                return c
+        return None
+
+    @property
+    def constructs(self) -> list[Construct]:
+        """Snapshot of currently-tracked constructs. Returns a fresh
+        list so callers can iterate without worrying about concurrent
+        spawn/finalize churning the underlying list. Used by the TUI's
+        in-flight blacklist-match scan."""
+        return list(self._constructs)
+
     # ---- orchestration --------------------------------------------------
 
     async def run(self, tasks: list[str], keep_alive: bool = False) -> None:

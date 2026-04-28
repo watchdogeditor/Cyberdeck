@@ -87,6 +87,10 @@ placeholder removed.
 - Path-normalized Files panel dedupe
 - Focus navigation fall-through with empty-section escape
 - Windows ProactorEventLoop shutdown noise filter
+- Watchdog Blacklist primitive (Shift+K populates; DaemonSession
+  refuses spawns matching registered fingerprints; in-flight
+  constructs whose task matches get red-bordered but not auto-killed;
+  daemon sees the blacklist on every outcome turn)
 
 ---
 
@@ -284,9 +288,13 @@ natively, doesn't suffer chat context truncation.
 - ✓ Plugin scaffolding v1 — stateless plugins, screenshot as first
 
 **Next priorities:**
-1. Watchdog tripwires + blacklist — eventually authors goal-scoped
-   deny rules on top of the static brake patterns. Largest remaining
-   chunk.
+1. **Watchdog tripwires** — LLM-authored deterministic matchers on
+   top of the now-shipped Blacklist primitive. DSL design open;
+   severity routing open; alert UI open. Substrate-blocked on the
+   eventual D1 local-model swap (cloud Claude works for prototyping
+   but a tripwire-authoring pass on every event would burn quota).
+   *Blacklist half (the simpler half) shipped 2026-04-28 — see the
+   shipped section below.*
 2. Log-readability overhaul — fleet/chatlog/watchdog/daemon scattered
    across windows is hard to follow at a glance; needs structural
    thinking, not just CSS.

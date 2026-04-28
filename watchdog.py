@@ -1,12 +1,23 @@
 """
-Watchdog: the async oracle.
+Watchdog: the async oracle, plus the session-scoped Blacklist.
 
 The cyberdeck spec describes the Watchdog as having two halves:
   1. Tripwire engine — pattern matching + alerts (the harder half)
   2. Q&A oracle — read-only conversational lookup (the simpler half)
 
-This module implements ONLY the Q&A half. Tripwires + blacklist land
-in a later milestone alongside the LLM-authored tripwire DSL.
+The Q&A half is implemented (see Watchdog class). The Blacklist
+primitive — session-scoped memory of forbidden task patterns,
+populated by the netrunner's Shift+K — is also here (see Blacklist
+class) because the spec is explicit that "the blacklist lives with
+the Watchdog because the Watchdog is the persistent memory of what's
+forbidden."
+
+The full tripwire engine (LLM-authored matchers + DSL + severity
+routing) lands in a later slice alongside the Watchdog's authoring
+substrate. The Blacklist ships first because it makes Shift+K do its
+spec'd job today, and because tripwires will want to author into the
+same data structure when they land — getting the home settled now
+avoids a later refactor.
 
 Per spec (line 247): "The netrunner can ask the Watchdog anything
 via `t` (talk-to-watchdog). Async queue: questions stack up, the
@@ -101,6 +112,27 @@ you see `brake blocked` markers on its finalize line, that's
 probably the answer. Quote the tools that were blocked and the
 brake state — concrete signal beats abstract speculation.
 
+BLACKLIST AWARENESS:
+The session blacklist is the netrunner's way of saying "we are NOT
+going to keep trying that." Lines you may see in the chatlog:
+  - `⛔ blacklist + "..." (source: cx-XXXX)` — the netrunner just
+    hard-killed cx-XXXX and registered its task fingerprint as
+    forbidden for the rest of this session.
+  - `⚠ in-flight matches flagged (not auto-killed): cx-A, cx-B` —
+    other still-running constructs whose task matches the new
+    entry's fingerprint. They keep running but get a red border so
+    the netrunner can decide whether to k them individually.
+  - `⚠ blacklist: spawn refused "..."` — the daemon tried to spawn
+    something matching a registered fingerprint; the session
+    refused before it could reach the fleet.
+If the netrunner asks "what's on the blacklist?" or "why was that
+spawn refused?", quote the relevant lines. The fingerprint is the
+first 80 chars lowercased of the killed construct's task. If a new
+spawn was refused and you've got the killed construct's context in
+the chatlog, you can also speculate about WHY the netrunner
+blacklisted it — but flag that as your reasoning, not netrunner
+intent.
+
 Answer concisely — typically 1-3 short paragraphs. The netrunner is
 glancing at your answer between actions, not reading an essay. If
 the question can be answered in one sentence, do that.
@@ -108,6 +140,131 @@ the question can be answered in one sentence, do that.
 If you genuinely cannot answer from the events shown — say so
 directly, briefly. Don't pad with disclaimers.
 """
+
+
+def _fingerprint(task: str) -> str:
+    """First 80 chars lowercased of the task text. Same scheme as
+    `daemon_session._task_fingerprints` so the daemon's mental model of
+    "same task" is consistent across the respawn-loop detector and the
+    blacklist matcher. Loose by design: the daemon doesn't know the
+    exact wording of a previously-killed task; it knows the shape, so
+    the matcher needs to be shape-tolerant."""
+    return task[:80].lower().strip()
+
+
+@dataclass
+class BlacklistEntry:
+    """One entry in the session blacklist.
+
+    Carries enough context that a future tripwire-authoring pass (slice
+    2) can read the entry and author a sharper rule than first-80
+    fingerprint matching — what the killed construct was working on,
+    what it produced, what state it was in when killed. Today only
+    `fingerprint` is consulted by the matcher; the rest is for
+    consumers who want to reason about WHY this pattern was forbidden
+    rather than just WHAT.
+    """
+    fingerprint: str
+    full_task: str
+    source_construct_id: str
+    source_construct_state: str
+    source_final_output: str = ""
+    source_files_written: tuple[str, ...] = ()
+    reason: str = "hard-kill"
+    added_at: float = field(default_factory=time.time)
+
+    def short_summary(self) -> str:
+        """One-line render for daemon-facing system-prompt sections.
+        Compact on purpose — the daemon sees this on every outcome turn
+        until the session ends, and we don't want to bloat every turn
+        with the rich context fields."""
+        preview = self.full_task[:60]
+        if len(self.full_task) > 60:
+            preview += "..."
+        return (
+            f'"{preview}" — {self.reason} on {self.source_construct_id}'
+        )
+
+
+class Blacklist:
+    """Session-scoped registry of forbidden task patterns.
+
+    Owned by the Watchdog per spec ("the persistent memory of what's
+    forbidden"). DaemonSession holds a reference and queries
+    `is_blacklisted` before each daemon-issued spawn; matching spawns
+    are refused and the daemon sees a feedback line in the next turn.
+    The TUI also queries `is_blacklisted` against in-flight constructs
+    when a new entry is added, so existing matching constructs get
+    flagged for the netrunner's attention (per netrunner direction:
+    flag, do not auto-kill — at-that-point-we-should-be-ejecting).
+
+    Today: in-memory only, cleared when the Watchdog shuts down (i.e.
+    on session end / EJECT). Cross-session stickiness is an open spec
+    question and a deferred feature; the in-memory choice today does
+    not preclude adding a persisted "sticky" list later as a separate
+    surface.
+
+    Optional `on_event` callback fires when an entry is added so the
+    TUI can update chrome (chatlog line, in-flight match scan) without
+    polling. The callback receives a dict
+    {"type": "blacklist_added", "entry": BlacklistEntry}.
+    """
+
+    def __init__(
+        self,
+        on_event: Optional[Callable[[dict], None]] = None,
+    ) -> None:
+        self._entries: list[BlacklistEntry] = []
+        self.on_event = on_event
+
+    def add(self, entry: BlacklistEntry) -> None:
+        """Register a forbidden pattern. Idempotent on fingerprint —
+        adding the same fingerprint twice updates the latest context
+        (in case a second hard-kill against a similar pattern produces
+        more useful tripwire-authoring context) but doesn't double-list
+        and doesn't refire the on_event callback. The original add
+        timestamp is preserved on update."""
+        existing = next(
+            (e for e in self._entries if e.fingerprint == entry.fingerprint),
+            None,
+        )
+        if existing is not None:
+            existing.full_task = entry.full_task
+            existing.source_construct_id = entry.source_construct_id
+            existing.source_construct_state = entry.source_construct_state
+            existing.source_final_output = entry.source_final_output
+            existing.source_files_written = entry.source_files_written
+            existing.reason = entry.reason
+            return
+        self._entries.append(entry)
+        if self.on_event is not None:
+            try:
+                self.on_event({"type": "blacklist_added", "entry": entry})
+            except Exception:
+                # Listener errors must not corrupt the blacklist —
+                # the entry is registered regardless.
+                pass
+
+    def is_blacklisted(self, task: str) -> Optional[BlacklistEntry]:
+        """Return the matching entry, or None. Comparison is on
+        fingerprint (first 80 chars lowercased), same scheme as the
+        daemon-session respawn detector."""
+        if not task:
+            return None
+        fp = _fingerprint(task)
+        for entry in self._entries:
+            if entry.fingerprint == fp:
+                return entry
+        return None
+
+    @property
+    def entries(self) -> list[BlacklistEntry]:
+        """Snapshot of registered entries. Returns a copy so callers
+        can iterate without worrying about concurrent add()."""
+        return list(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 @dataclass
@@ -166,12 +323,20 @@ class Watchdog:
         timeout: float = DEFAULT_TIMEOUT,
         streaming_mode: bool = True,
         first_question_timeout: float = 90.0,
+        on_blacklist_event: Optional[Callable[[dict], None]] = None,
     ) -> None:
         self.id = f"wd-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
         self.cwd = cwd
         self.system_prompt = system_prompt
         self.timeout = timeout
+        # Session-scoped blacklist. Lives on the watchdog per spec.
+        # The watchdog object itself doesn't read from or write to the
+        # blacklist today — DaemonSession (gates spawns) and the TUI
+        # (Shift+K, in-flight match scan) are the consumers. Slice 2
+        # (tripwire authoring) will wire the watchdog's Q&A path to
+        # observe entries and propose sharper rules.
+        self.blacklist = Blacklist(on_event=on_blacklist_event)
         # Streaming mode keeps a single `claude --input-format stream-json`
         # subprocess alive across all questions. Saves the per-question
         # spawn cost (which dominates wall-time on a fast cache and

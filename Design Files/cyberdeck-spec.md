@@ -239,9 +239,12 @@ Airgap UI follows hybrid drama: first toggle in a session is a visible alert ("A
 `Shift+K` is the loud variant of `k` (soft kill). Where soft kill says "not like that," hard kill says "not at all":
 
 - Construct is killed immediately.
-- The task pattern is added to the blacklist for the active session.
-- The blacklist propagates to the Watchdog (when implemented), which authors a tripwire to refuse future spawns matching that fingerprint.
-- If the daemon's plan depended on the blacklisted pattern, it halts and asks for direction rather than retrying.
+- The task pattern is registered with the Watchdog's session Blacklist (`watchdog.Blacklist`). Fingerprint = first 80 chars lowercased of the killed task; entry also captures full task text, source construct id/state/final_output/files_written so the future tripwire-authoring pass can read context, not just match strings.
+- DaemonSession refuses any subsequent spawn whose task matches a registered fingerprint. The refusal surfaces as a feedback line in the next outcome turn so the daemon can re-plan.
+- The daemon sees the blacklist on every outcome turn (a `⛔ SESSION BLACKLIST` block at the top of the message) and is told to halt branches that depended on the forbidden pattern rather than rephrase around the fingerprint.
+- In-flight constructs whose task matches a newly-registered fingerprint get visually flagged (red `.-blacklisted` border on their pane) but are NOT auto-killed. The netrunner decides whether to k them individually; mass-kill is what EJECT is for.
+
+Slice 1 (the Blacklist primitive + Shift+K wiring + spawn refusal + in-flight flagging) shipped 2026-04-28. Slice 2 — LLM-authored tripwires that read entry context to author sharper rules than first-80 matching — is the open work.
 
 The blacklist lives with the Watchdog because the Watchdog is the *persistent memory of what's forbidden*. The Fleet executes; the Daemon plans; the Watchdog remembers.
 
@@ -418,7 +421,7 @@ WASD-spatial navigation, no Ctrl-chording for primary actions. Left-hand-heavy b
 | `q` | Queue-inject focused construct |
 | `Q` | Interrupt-inject focused construct |
 | `k` | Soft-kill focused construct |
-| `K` | Hard-kill + blacklist (propagates to Watchdog) |
+| `K` | Hard-kill + register fingerprint with Watchdog Blacklist |
 
 ### Daemon and goal
 
@@ -609,6 +612,7 @@ Milestones shipped, in order:
 - **M5+ Plugin scaffolding (third leg of tool registry)** — plugins are capability bundles at `<home>/plugins/<name>/` with a TOML manifest, a Markdown README (LLM-facing interface docs), and an executable entry point. Stateless v1: each invocation is a fresh subprocess that constructs spawn via Bash. PluginRegistry mirrors ProfileRegistry's read API; one-shot scan at startup (no hot reload — plugins are code). Plugin awareness lands in both the daemon's system prompt (catalog of available plugins) and constructs' system-prompt addendum (with explicit invocation patterns). First plugin is `screenshot` — mss-based cross-platform screen capture, real-deck verified end-to-end. Sub-features deferred: airgap (`p`), quickfire (`c`), picker (`Shift+C`), persistent (stateful) mode, MCP-as-metadata variant.
 - **Brake-denial visual indicator** — construct panes whose finalize event carries non-empty `permission_denials` get a yellow border (`.-blocked` CSS class) and a header badge (`[⚠ blocked: Write×2, Bash×1]`). Two-channel visibility: border for at-a-glance scanning, badge for what specifically got caught. Survives compact mode at 60% opacity.
 - **Connection consequences (spawn-blocking)** — Fleet's `spawn()` checks the `connection_state_provider` first; non-`ONLINE` states emit a `spawn_blocked` meta event with reason and refuse the spawn before the semaphore is acquired. In-flight constructs continue. Daemon parking and recovery flow are still deferred.
+- **Watchdog Blacklist primitive** — `Shift+K` registers the focused construct's task fingerprint with `Watchdog.blacklist`; DaemonSession refuses subsequent matching spawns; in-flight matches get red-bordered without auto-killing; daemon sees the active blacklist on every outcome turn. Slice 1 of the watchdog tripwires + blacklist chunk; the LLM-authored tripwire half is still deferred. See `watchdog.Blacklist`/`BlacklistEntry`, the `_handle_blacklist_event` route in `tui.py`, and the `Hard-kill blacklist` section above for the full picture.
 
 Layout and observability work landed alongside M4a: 3-column + bottom-bar TUI, Files / Tools right panel, token + cost tracking, configurable bounded-time `Construct.wait()` to prevent shutdown hangs.
 

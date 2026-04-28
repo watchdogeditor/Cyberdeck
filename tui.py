@@ -52,7 +52,13 @@ from profile_registry import ProfileRegistry, ProfileEvent
 from plugins import Plugin
 from plugin_registry import PluginRegistry, PluginEvent
 from session_manager import SessionManager, SessionPool, PoolEvent
-from watchdog import Watchdog, WatchdogQuestion
+from watchdog import (
+    Watchdog,
+    WatchdogQuestion,
+    Blacklist,
+    BlacklistEntry,
+    _fingerprint as _blacklist_fingerprint,
+)
 from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
@@ -721,6 +727,23 @@ class ConstructPane(Static, can_focus=True):
     }
     ConstructPane.-blocked.-compact {
         border: round $warning 60%;
+        text-style: not dim;
+    }
+    /* Blacklist-match treatment. Set when a Shift+K elsewhere added
+     * a fingerprint that matches THIS construct's task — the construct
+     * keeps running per netrunner direction (no auto-kill — at that
+     * point we should be ejecting), but the pane gets visually flagged
+     * so the netrunner can decide whether to k it manually. Red border
+     * to differentiate from the yellow brake-blocked treatment: brake
+     * is "this thing was caught by a static rule" (mechanical),
+     * blacklist is "this thing matches what you just told us to ban"
+     * (netrunner-authored). Compact + focus rules layer the same way
+     * as -blocked. */
+    ConstructPane.-blacklisted {
+        border: round $error;
+    }
+    ConstructPane.-blacklisted.-compact {
+        border: round $error 60%;
         text-style: not dim;
     }
     """
@@ -2691,6 +2714,7 @@ class CyberdeckApp(App):
         # for the swap point.
         self.watchdog = Watchdog(
             claude_bin=self.claude_bin,
+            on_blacklist_event=self._handle_blacklist_event,
         )
         # Connection monitor — heartbeats api.anthropic.com:443 to
         # detect Online/Degraded/Offline transitions. Per spec line
@@ -3725,6 +3749,12 @@ class CyberdeckApp(App):
             # Wire the registry as the profile resolver so the daemon's
             # per-spawn profile picks land against live profile data.
             profile_lookup=self.profile_registry.get,
+            # Hand the daemon-session a reference to the watchdog's
+            # session blacklist. _execute_action checks each daemon
+            # spawn against it; matching spawns get refused with a
+            # feedback line in the next outcome turn. Watchdog owns
+            # the data structure (per spec); DaemonSession just reads.
+            blacklist=self.watchdog.blacklist,
         )
 
         if self.daemon_pane is not None:
@@ -5765,18 +5795,146 @@ class CyberdeckApp(App):
         self.run_worker(self.fleet.kill_construct(cid), name=f"kill-{cid}")
 
     def action_hard_kill_focused(self) -> None:
-        """Hard kill + blacklist. Currently delegates to soft kill;
-        the blacklist propagation lands when Watchdog is implemented."""
+        """Hard kill: terminate the focused construct AND register its
+        task fingerprint with the Watchdog's session blacklist.
+
+        After registration:
+          - DaemonSession refuses any future spawn whose first 80
+            chars (lowercased) match the registered fingerprint.
+          - In-flight constructs whose task ALSO matches get visually
+            flagged (red border) but NOT auto-killed. The netrunner
+            decides whether to k them individually; the spec is
+            explicit that automatic mass-kill is what EJECT is for.
+          - The daemon sees the blacklist on every outcome turn and
+            knows to halt branches of its plan that depended on the
+            forbidden pattern.
+
+        "Hard" here refers to the blacklist propagation, not a more
+        violent termination — the actual process kill is the same
+        SIGTERM/SIGKILL escalation as soft-kill.
+        """
         pane = self._focused_pane()
         if pane is None:
             return
         if pane.state in TERMINAL_PANE_STATES:
-            self._toast(f"{pane.construct_id} already {pane.state}; not killing")
+            self._toast(
+                f"{pane.construct_id} already {pane.state}; not killing"
+            )
             return
-        # TODO(M5+): propagate to Watchdog blacklist when available.
-        # For now, hard-kill behaves as soft-kill so the binding works.
-        self._toast("hard-kill: blacklist not yet implemented; soft-killing")
-        self.action_kill_focused()
+        if self.fleet is None:
+            return
+
+        cid = pane.construct_id
+
+        # Capture rich context BEFORE the kill — final_output and
+        # files_written are populated mid-stream and will still be
+        # readable post-kill, but state changes during the kill window
+        # so we snapshot it now. The construct may have produced no
+        # output yet (just spawned); that's fine — entry just carries
+        # less context for the future tripwire-authoring pass to
+        # reason over.
+        construct = self.fleet.get_construct(cid)
+        if construct is not None and self.watchdog is not None:
+            entry = BlacklistEntry(
+                fingerprint=_blacklist_fingerprint(construct.task),
+                full_task=construct.task,
+                source_construct_id=cid,
+                source_construct_state=construct.state.value,
+                source_final_output=construct.final_output[:500],
+                source_files_written=tuple(construct._files_written),
+                reason="hard-kill",
+            )
+            self.watchdog.blacklist.add(entry)
+            # Note: scan-and-flag of in-flight matches happens in
+            # _handle_blacklist_event, which fires via Blacklist's
+            # on_event callback. Single source of truth for the
+            # flagging logic, regardless of who added the entry.
+
+        fleet_log = self.query_one("#fleet_log", RichLog)
+        fleet_log.write(
+            f"[red]×[/red] {cid} [dim](hard-kill: blacklisted)[/dim]"
+        )
+        self.run_worker(
+            self.fleet.kill_construct(cid),
+            name=f"hard-kill-{cid}",
+        )
+
+    def _handle_blacklist_event(self, event: dict) -> None:
+        """Receive blacklist events from the Watchdog's Blacklist
+        instance. Today only fires on `blacklist_added`; future
+        tripwire-authored entries will use the same channel.
+
+        Two responsibilities:
+          1. Render a chatlog line so the netrunner sees the addition
+             in the same surface they read everything else through.
+          2. Scan in-flight constructs for fingerprint matches and
+             visually flag any matches (red border + chatlog notice).
+             Per netrunner direction: flag, do not auto-kill — at
+             that point we should be ejecting.
+
+        Called from the watchdog's Blacklist when an entry is added.
+        Synchronous, fast, no async; safe to call from any context."""
+        if event.get("type") != "blacklist_added":
+            return
+        entry = event.get("entry")
+        if not isinstance(entry, BlacklistEntry):
+            return
+
+        # Chatlog announcement. Goes to the fleet log since blacklist
+        # is a session-scoped concept that affects future spawns
+        # across the whole fleet.
+        try:
+            fleet_log = self.query_one("#fleet_log", RichLog)
+            fleet_log.write(
+                f"[red]⛔ blacklist[/red] [dim]+[/dim] "
+                f'"{entry.full_task[:50]}'
+                f'{"..." if len(entry.full_task) > 50 else ""}" '
+                f"[dim](source: {entry.source_construct_id})[/dim]"
+            )
+        except Exception:
+            pass
+
+        # In-flight match scan. Iterate the fleet snapshot for
+        # constructs whose task matches the new entry's fingerprint.
+        # Skip the source construct itself (it's about to die from
+        # the kill we just kicked off) and skip terminal-state
+        # constructs (they're not "in flight" — flagging a done
+        # pane is just visual noise).
+        if self.fleet is None:
+            return
+        matched: list[str] = []
+        for c in self.fleet.constructs:
+            if c.id == entry.source_construct_id:
+                continue
+            if c.state.value in ("done", "failed", "killed"):
+                continue
+            if _blacklist_fingerprint(c.task) != entry.fingerprint:
+                continue
+            matched.append(c.id)
+            # Find the pane and apply the .-blacklisted class. Pane
+            # may not exist if the construct hasn't been mounted yet
+            # (rare but possible in the spawn race window) — skip
+            # silently; future scans (none today, but slice 2's
+            # tripwire-authored entries will run at richer cadence)
+            # will catch it on a later add.
+            try:
+                for pane in self.query(ConstructPane):
+                    if pane.construct_id == c.id:
+                        pane.add_class("-blacklisted")
+                        break
+            except Exception:
+                pass
+
+        if matched:
+            try:
+                fleet_log = self.query_one("#fleet_log", RichLog)
+                fleet_log.write(
+                    f"[yellow]⚠[/yellow] [dim]in-flight matches "
+                    f"flagged (not auto-killed): "
+                    f"{', '.join(matched)}[/dim]"
+                )
+            except Exception:
+                pass
 
     def action_queue_inject(self) -> None:
         """Open inject modal pre-set to queue mode (deliver at next break)."""

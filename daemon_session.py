@@ -20,6 +20,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from profiles import Profile
+    from watchdog import Blacklist, BlacklistEntry
 
 from daemon import Daemon, DaemonEvent
 from fleet import Fleet, FleetEvent
@@ -46,6 +47,7 @@ class DaemonSession:
         max_total_spawns: int = 20,
         default_profile: Optional["Profile"] = None,
         profile_lookup: Optional[Callable[[str], Optional["Profile"]]] = None,
+        blacklist: Optional["Blacklist"] = None,
     ) -> None:
         self.daemon = daemon
         self.fleet = fleet
@@ -68,6 +70,13 @@ class DaemonSession:
         # This is the right default for tests and for the headless
         # CLI; the TUI wires this up to point at the registry.
         self.profile_lookup = profile_lookup
+        # Session blacklist (lives on the Watchdog per spec). When set,
+        # _execute_action checks each daemon-issued spawn against it
+        # and refuses matches with feedback in the next outcome turn.
+        # When None (tests, headless CLI without a Watchdog), the
+        # blacklist gating is a no-op — daemon spawns proceed
+        # unimpeded.
+        self.blacklist = blacklist
 
         # Track task-per-construct so we can report useful outcomes
         # (the finalized event doesn't carry the original task text).
@@ -157,11 +166,15 @@ class DaemonSession:
                     return
                 if self._goal_done.is_set():
                     return
+                blacklist_entries = (
+                    self.blacklist.entries if self.blacklist is not None else []
+                )
                 message = _format_outcomes(
                     outcomes,
                     self._respawn_warnings,
                     goal_update=self._pending_goal_update,
                     netrunner_messages=self._pending_netrunner_messages,
+                    blacklist_entries=blacklist_entries,
                 )
                 self._respawn_warnings = []  # clear after surfacing
                 self._pending_goal_update = None  # consumed
@@ -247,6 +260,51 @@ class DaemonSession:
             task = action.get("task", "").strip()
             if not task:
                 return
+
+            # Blacklist gate. Checked before any other spawn gating
+            # because blacklist refusal means "we will never run this,
+            # don't burn a spawn slot or daemon-cap budget on it."
+            # Unlike the spawn-cap gate (which halts the session), a
+            # blacklist refusal just declines this one spawn — the
+            # daemon sees a feedback line in the next outcome turn
+            # and re-plans. No session halt, since the daemon may
+            # have other valid work in flight or queued.
+            if self.blacklist is not None:
+                match = self.blacklist.is_blacklisted(task)
+                if match is not None:
+                    refusal_text = (
+                        f'[blacklist] refused spawn matching '
+                        f'"{task[:60]}{"..." if len(task) > 60 else ""}" '
+                        f'— blacklisted by {match.reason} on '
+                        f'{match.source_construct_id}'
+                    )
+                    # Stash for next outcome turn (same surface as
+                    # respawn-loop warnings — both are "daemon, here's
+                    # something you should know before deciding next
+                    # steps" annotations on the outcome message).
+                    self._respawn_warnings.append(refusal_text)
+                    # Surface to UI directly via the daemon event
+                    # channel so the netrunner sees the refusal in
+                    # the daemon pane immediately, not just on the
+                    # next outcome turn.
+                    if self.on_daemon_event is not None:
+                        import time as _time
+                        self.on_daemon_event(DaemonEvent(
+                            timestamp=_time.time(),
+                            kind="error",
+                            payload={
+                                "text": (
+                                    f"⚠ blacklist: spawn refused "
+                                    f"\"{task[:50]}"
+                                    f"{'...' if len(task) > 50 else ''}\""
+                                ),
+                            },
+                        ))
+                    # Wake the outcome loop so the daemon hears
+                    # about this even if no constructs are running.
+                    self._outcome_event.set()
+                    return  # do not increment _total_spawns or call fleet.spawn
+
             if self._total_spawns >= self.max_total_spawns:
                 # Wood-chipper shutoff. Stop the session cleanly and
                 # surface the reason via the on_daemon_event channel so
@@ -412,6 +470,7 @@ def _format_outcomes(
     respawn_warnings: Optional[list[str]] = None,
     goal_update: Optional[tuple[str, str, str]] = None,
     netrunner_messages: Optional[list[str]] = None,
+    blacklist_entries: Optional[list["BlacklistEntry"]] = None,
 ) -> str:
     """Render a batch of construct outcomes as a daemon-input message.
 
@@ -442,6 +501,25 @@ def _format_outcomes(
             and not goal_update and not netrunner_messages):
         return ""
     lines: list[str] = []
+
+    if blacklist_entries:
+        # Persistent visibility: surface the blacklist on every outcome
+        # turn so the daemon can plan around it. The list is short
+        # (one line per entry) and session-scoped, so this stays
+        # well under the bloat threshold even on long sessions. Goes
+        # at the top so the daemon reads the constraints before
+        # reading the outcomes that might tempt it to spawn into
+        # a blacklisted shape.
+        lines.append("⛔ SESSION BLACKLIST — do NOT spawn matching tasks:")
+        for entry in blacklist_entries:
+            lines.append(f"  - {entry.short_summary()}")
+        lines.append(
+            "  → If your plan needed any of the above, halt that "
+            "branch and ask the netrunner via `chat` for direction. "
+            "Don't try to rephrase around the fingerprint — that's "
+            "what got the previous one killed."
+        )
+        lines.append("")
 
     if goal_update is not None:
         new_goal, classification, old_goal = goal_update

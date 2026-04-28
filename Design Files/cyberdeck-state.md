@@ -27,12 +27,13 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** watchdog tripwires + blacklist (the harder half of
-watchdog), then log-readability overhaul, then D1 (local model
+**Up next:** watchdog tripwires (the harder half of watchdog —
+LLM-authored deterministic matchers; **blacklist primitive shipped
+2026-04-28**), then log-readability overhaul, then D1 (local model
 substrate) for the long-term Watchdog/synthesizer/arbiter story.
 Plugin scaffolding, brake-as-deck-state, connection spawn-blocking,
-and the brake-denial visual all shipped in the first wave of
-post-migration work.
+brake-denial visual, and the watchdog blacklist all shipped in the
+post-migration wave.
 
 **Deferred mid-design (2026-04-27):** keymap revision pass and
 daemon planning mode + pause/unpause. Both started this session,
@@ -233,6 +234,42 @@ and 10.
 - Both inner logs focusable (W/S nav reaches them via fall-through)
 - Space on daemon_log → action_talk_daemon; space on watchdog_log →
   action_talk_watchdog
+
+### Watchdog Blacklist (session-scoped, populated by Shift+K)
+- `Blacklist` + `BlacklistEntry` in `watchdog.py`. Lives on the
+  Watchdog per spec ("the persistent memory of what's forbidden").
+  Session-scoped, in-memory; cleared when the watchdog shuts down.
+  Cross-session stickiness deferred (spec lists as open question).
+- Fingerprint = first 80 chars lowercased of the killed task's text.
+  Matches the existing daemon-session respawn-detector scheme so the
+  daemon's mental model of "same task" is consistent across both
+  surfaces. Loose by design.
+- Entry carries rich context (fingerprint, full_task, source
+  construct id/state/final_output/files_written, reason, timestamp)
+  for the future tripwire-authoring pass to read; today only the
+  fingerprint is consulted by matchers.
+- `Shift+K` registers the focused construct's fingerprint with the
+  blacklist before killing — replaces the prior "blacklist not yet
+  implemented; soft-killing" toast. Soft-kill `k` unchanged.
+- DaemonSession `_execute_action` checks each spawn against the
+  blacklist; matches are refused with feedback in the next outcome
+  turn (and a `⚠ blacklist: spawn refused` line in the daemon pane
+  immediately). Spawn is NOT counted against caps when refused.
+- `_format_outcomes` surfaces the active blacklist on every outcome
+  turn as a `⛔ SESSION BLACKLIST` block at the top of the message
+  with one line per entry. Daemon sees what's forbidden persistently
+  and is told to halt branches that depended on a blacklisted shape
+  rather than rephrase around the fingerprint.
+- In-flight matching constructs get a red `.-blacklisted` border on
+  their pane (mirrors the `.-blocked` brake-denial pattern in shape;
+  red vs yellow to differentiate netrunner-authored from static-rule
+  blocking) plus a chatlog notice. Per netrunner direction: flag, do
+  NOT auto-kill — automatic mass-kill is what EJECT is for.
+- Watchdog system prompt grew a BLACKLIST AWARENESS paragraph so
+  questions like "what's blacklisted?" or "why was that spawn
+  refused?" get useful answers from the chatlog markers.
+- Tripwire half (LLM-authored matchers, DSL, severity routing) still
+  deferred — slice 2.
 
 ### Spawn provenance (origin badges)
 - `fleet.spawn(..., origin=...)` — `daemon` / `netrunner` / `inject`

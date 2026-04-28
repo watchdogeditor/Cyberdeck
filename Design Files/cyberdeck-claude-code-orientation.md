@@ -198,14 +198,22 @@ worth the complexity.
 This file is huge but well-organized. When adding a feature, first
 grep for existing similar work — the pattern is almost always there.
 
-### `watchdog.py` (715 LOC)
-- `Watchdog` class with `streaming_mode` switch
+### `watchdog.py` (898 LOC)
+- `Watchdog` class with `streaming_mode` switch (Q&A oracle half)
 - One-shot path: `_process_oneshot` (claude `-p` per question, stdin)
 - Streaming path: `_process_streaming` + `_spawn_streaming` +
   `_drain_streaming_question` + `_kill_streaming_proc` +
   `_shutdown_streaming`
 - Wedge recovery: timeout → kill → respawn-on-next-question
-- System prompt with badge legend
+- System prompt with badge legend + brake awareness + blacklist
+  awareness paragraphs
+- `Blacklist` + `BlacklistEntry` + `_fingerprint` — session-scoped
+  registry of forbidden task patterns. Owned by Watchdog (per spec
+  "persistent memory of what's forbidden") but consumed by
+  DaemonSession (spawn refusal) and the TUI (Shift+K population +
+  in-flight match scan). Tripwire authoring (slice 2) will read
+  entries' rich context to author sharper rules than the current
+  first-80-fingerprint matcher.
 
 ### `daemon.py` (685 LOC)
 - `Daemon` class with both backends
@@ -437,6 +445,7 @@ substantive change is still useful. Keep it.
 | Plugin registry / loader | `plugin_registry.py` + `plugins.py` |
 | Plugin shape (manifest, README, entry) | `<home>/plugins/<name>/` |
 | Plugin awareness in prompts | `tui.py` `_build_daemon_system_prompt` + `_build_deck_addendum` |
+| Watchdog Blacklist | `watchdog.py` `Blacklist` / `BlacklistEntry` (data) + `tui.py` `action_hard_kill_focused` (populate) + `tui.py` `_handle_blacklist_event` (render + flag) + `daemon_session.py` `_execute_action` spawn branch (refusal) + `daemon_session._format_outcomes` (daemon-facing surface) |
 
 ---
 
