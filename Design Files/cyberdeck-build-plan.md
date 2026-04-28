@@ -219,7 +219,24 @@ Roughly ordered by likely appeal:
     capability gaps), AI does Layer 2 synthesis, Layer 3 keymap
     proposal lands jointly. Blocks new bindings until done — so
     planning mode (item 8) sits behind this when both unblock.
-10. **Quota-aware throttling.** Daemon gates spawns on remaining Max
+11. **Retrospective observability — the morgue + watchdog log.**
+    Two paired ideas from a netrunner brainstorm: (a) a "morgue"
+    persistent session log + UI that lets the netrunner browse and
+    *resuscitate* past construct sessions via `--resume`, turning
+    ephemeral sessions into a personal capability library; (b) a
+    persistent watchdog log so Q&A history (and future tripwire
+    fires) survive a deck restart. Today: finalized session_ids are
+    dropped from active tracking and watchdog Q&A lives only in the
+    live pane. Both are bounded-scope, follow the deck's
+    files-on-disk pattern, and have obvious recovery/debugging
+    value the moment they exist. Could be designed together as a
+    single "deck history infrastructure" initiative. Full design
+    sketch in `cyberdeck-state.md` under Not Implemented. Note:
+    pairs nicely with wiring (item also called out under Routing
+    in state.md) — wiring resuscitates by *piping* output into a
+    new construct; the morgue resuscitates by *resuming* the same
+    session_id. Different recovery paths, complementary.
+12. **Quota-aware throttling.** Daemon gates spawns on remaining Max
     quota — warn or hold when the 5h or weekly window is near full.
     Mechanism: Claude Code's status-line script receives
     `rate_limits.five_hour.used_percentage` and `seven_day.used_percentage`

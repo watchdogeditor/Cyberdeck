@@ -542,6 +542,61 @@ and 10.
 - **B2 fleet synthesizer** — substrate-blocked on D1
 - **D1/D2/D3** — local-model runtime, arbiter, B2 on local
 - **Compliance mode (Phase E)**
+- **The morgue (session history / past-session resuscitation)** —
+  netrunner direction. Today, finalized construct sessions are
+  effectively scattered: `session_manager.py` tracks the warm pool
+  and the active session, but once a construct finalizes its
+  `session_id` is dropped from active tracking. Anthropic keeps the
+  server-side session for some retention window, so `--resume <id>`
+  would still work — but the netrunner has no way to *find* that
+  id later. The morgue is a persistent log + UI surface that fixes
+  this:
+  - **Storage:** append-only JSONL at `<home>/.cyberdeck/sessions.jsonl`,
+    one record per finalized construct. Fields: session_id,
+    construct_id, task (truncated), state, started_at, finished_at,
+    final_output (truncated/summary), files_written, cost_usd,
+    profile_name, origin (daemon/netrunner/inject), and a goal_id
+    linking back to the goal session it served (if any).
+  - **UI:** new right-panel tab "Morgue" (or "History") listing
+    sessions newest-first, with summary/cost/state visible at a
+    glance. `z` to expand a row into the full final_output. A
+    "resuscitate" action (Space?) opens a NewConstructScreen
+    pre-populated with `--resume <session_id>` and an empty task
+    field for the netrunner to fill in.
+  - **Filter/search:** by task substring, by date, by state. Bonus:
+    "show me everything from last Tuesday's goal."
+  - **Retention:** keep forever locally; the actual ceiling is
+    Anthropic's server-side session retention. Resuscitation that
+    hits an expired session reports "session expired" and the
+    netrunner can spawn fresh from the morgue's saved task text.
+  - **Implementation note:** likely just an extension of
+    `session_manager.py`'s manifest — keep finalized records with a
+    `state: finalized` marker instead of dropping. New file vs.
+    extending the existing one is a small design call.
+  - **Why it matters:** transforms ephemeral sessions into a
+    personal capability library — fits the spec's "capability
+    accumulates" thesis directly. Every successful construct
+    becomes a callable artifact later.
+- **Watchdog log (persistent watchdog history)** — netrunner
+  direction. The WatchdogPane shows live Q&A but doesn't persist;
+  closing the deck loses everything the watchdog ever observed or
+  was asked. With tripwires landing eventually, this gap widens —
+  tripwire fires would also need somewhere to live.
+  - **Storage:** append-only JSONL at `<home>/.cyberdeck/watchdog.jsonl`.
+    Per-entry fields: `kind` (qa | tripwire | blacklist_change),
+    timestamp, content (question+answer for qa, fingerprint+severity
+    for tripwire, etc.), context_size, cost, status.
+  - **UI:** replay last N into the WatchdogPane on startup so prior
+    conversation is still visible. Optional "Watchdog History" tab
+    in the right panel for full retrospective browsing (separate
+    from the live bottom-panel Watchdog tab).
+  - **Cross-cutting:** both the morgue and the watchdog log are
+    "deck history infrastructure" — could be designed together as
+    a single retrospective-observability initiative rather than two
+    independent features. Both follow the deck's "files on disk are
+    the database" pattern (per philosophy doc); both are bounded in
+    scope; both have obvious recovery / debugging value the moment
+    they exist.
 
 ---
 
