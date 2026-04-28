@@ -186,8 +186,9 @@ From the first code-quality critique pass on `construct.py`:
 - ✅ `spawn()` slices `_build_command()[1:]` to splice in the resolved
   binary path — fixed (`_build_command(claude_bin)` takes the resolved
   path as a required arg).
-- `kill()` sets `state = KILLED` *before* confirming termination.
-  Should transition only after the process is confirmed dead.
+- ✅ `kill()` set `state = KILLED` *before* confirming termination —
+  fixed (split intent flag `_kill_requested` from confirmation flag
+  `state = KILLED`; wait() reads intent so the race is closed).
 - `tools` default hardcoded in `__init__` signature → should live in
   a module-level `DEFAULT_TOOLS`.
 - `classify_event` kind values are bare strings across the codebase.

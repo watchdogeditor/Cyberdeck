@@ -615,7 +615,7 @@ Layout and observability work landed alongside M4a: 3-column + bottom-bar TUI, F
 ### Tech debt (tracked, not blocking)
 
 - ~~`spawn()` slices `_build_command()[1:]` to splice in the resolved binary path — builder API should take the resolved path as an argument instead.~~ Fixed: `_build_command(claude_bin)` now takes the resolved path as a required arg.
-- `kill()` sets `state = KILLED` before confirming termination; should transition only after the process is confirmed dead.
+- ~~`kill()` sets `state = KILLED` before confirming termination; should transition only after the process is confirmed dead.~~ Fixed: split intent (`_kill_requested` flag, set immediately) from confirmation (`state = KILLED`, set after process dies). wait() reads the intent flag so the race is closed without changing the visible state-flip semantics.
 - `tools` default hardcoded in `Construct.__init__` — bake policy into a module-level `DEFAULT_TOOLS` constant.
 - `classify_event` kind values are bare strings — should be an enum or constant set.
 - 2KB `final_output` truncation may be aggressive for long reports; reconsider when use cases warrant.

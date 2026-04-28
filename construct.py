@@ -219,6 +219,13 @@ class Construct:
         self._exit_code: Optional[int] = None
         self._stderr_buf: bytes = b""
         self._finalized: bool = False
+        # Intent flag for kill(): set immediately when a kill is
+        # requested, even though `state` only flips to KILLED after the
+        # process is confirmed dead. This split lets wait() know "don't
+        # overwrite the eventual KILLED with DONE/FAILED based on exit
+        # code" the moment kill() is called, while keeping the visible
+        # state honest about whether the kill has actually completed.
+        self._kill_requested: bool = False
         # Server-side session_id for this conversation. When resuming
         # a warm session, we know it up front; otherwise it's captured
         # from the `system_init` event when the subprocess starts up.
@@ -487,6 +494,11 @@ class Construct:
             # bounded wait with escalation, and if even that fails,
             # the subprocess is truly wedged and nothing we do matters.
             await self.kill(timeout=1.0)
+            # kill() now sets state = KILLED only on confirmed death.
+            # If kill() didn't make it that far (e.g. the wait inside
+            # kill itself timed out and the process is truly wedged),
+            # mark this as FAILED so we don't leave a stale STARTING
+            # /RUNNING state on a finalized construct.
             if self.state != ConstructState.KILLED:
                 self.state = ConstructState.FAILED
             self._finalized = True
@@ -500,7 +512,11 @@ class Construct:
             except (OSError, asyncio.IncompleteReadError):
                 pass
 
-        if self.state != ConstructState.KILLED:
+        # Don't overwrite a kill-in-progress with DONE/FAILED. The
+        # kill() may not have flipped state to KILLED yet (it does so
+        # only after confirming the process is dead), but the intent
+        # was set the moment kill() was called, so respect it.
+        if not self._kill_requested:
             if self._exit_code == 0:
                 self.state = ConstructState.DONE
             else:
@@ -510,10 +526,19 @@ class Construct:
         return self.state
 
     async def kill(self, timeout: float = 2.0) -> None:
-        """SIGTERM first; escalate to SIGKILL if it won't die."""
+        """SIGTERM first; escalate to SIGKILL if it won't die.
+
+        State transition order: `_kill_requested` flips immediately so
+        wait() knows not to overwrite with DONE/FAILED. `state` flips
+        to KILLED only after the process is confirmed dead (or after
+        ProcessLookupError, which means it died on its own — same
+        end-state). If even the SIGKILL escalation doesn't return,
+        state stays at whatever it was; the wait() caller (or the
+        finalize path) sees not-KILLED and can treat that as FAILED.
+        """
         if self._proc is None:
             return
-        self.state = ConstructState.KILLED
+        self._kill_requested = True
         try:
             self._proc.terminate()
             await asyncio.wait_for(self._proc.wait(), timeout=timeout)
@@ -525,6 +550,7 @@ class Construct:
                 pass
         except ProcessLookupError:
             pass  # already gone
+        self.state = ConstructState.KILLED
 
     # ---- introspection --------------------------------------------------
 
