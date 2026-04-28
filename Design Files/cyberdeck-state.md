@@ -27,13 +27,18 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** watchdog tripwires (the harder half of watchdog —
-LLM-authored deterministic matchers; **blacklist primitive shipped
-2026-04-28**), then log-readability overhaul, then D1 (local model
-substrate) for the long-term Watchdog/synthesizer/arbiter story.
-Plugin scaffolding, brake-as-deck-state, connection spawn-blocking,
-brake-denial visual, and the watchdog blacklist all shipped in the
-post-migration wave.
+**Up next:** **watchdog tripwires slice 2 — LLM authoring** (slice 1
+shipped 2026-04-29: deterministic matcher engine, small DSL with
+field selectors, two default deck-wide tripwires, full Watchdog →
+Fleet listener → chatlog rendering chain). Slice 2 authors
+tripwires from the LLM at goal-start and explicit goal-update
+(netrunner `e`); per-outcome adaptive re-authoring is blocked on a
+"daemon signals plan shift" event we don't have yet. Then
+log-readability overhaul, then D1 (local model substrate) for the
+long-term Watchdog/synthesizer/arbiter story. Plugin scaffolding,
+brake-as-deck-state, connection spawn-blocking, brake-denial
+visual, watchdog blacklist, watchdog Q&A persistence, and tripwires
+slice 1 all shipped in the post-migration wave.
 
 **Deferred mid-design (2026-04-27):** keymap revision pass and
 daemon planning mode + pause/unpause. Both started this session,
