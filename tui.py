@@ -4805,10 +4805,66 @@ class CyberdeckApp(App):
             pass
 
     async def action_quit(self) -> None:
-        # Tell fleet to kill constructs, then let the worker finish.
-        # If Textual exits before fleet fully tears down, the Fleet's
-        # async-context-manager cleanup may not run — that's acceptable
-        # for a quick quit. The NDJSON log is flushed per-write anyway.
+        """Smart quit (Phase 7b of the unified-event-stream slice).
+
+        Idle path: clean exit, fleet teardown, normal Textual exit.
+
+        Running path: blocks the quit and surfaces a toast pointing
+        at EJECT (Ctrl+F). Reasoning: Ctrl+Q used to drop work mid-
+        flight without warning — easy to lose a goal-in-progress by
+        muscle memory. Now Ctrl+Q has a "do you actually mean it?"
+        gate when work is in flight; the netrunner can either let
+        it finish OR EJECT to halt deliberately. The escape hatch is
+        always one keypress (Ctrl+F held) — see
+        cyberdeck-philosophy.md, design principle 6.
+
+        "Running" means: a daemon session is alive OR the fleet has
+        non-terminal constructs in flight. Either signals "real work
+        the netrunner cares about losing."
+        """
+        # Detect running state. Defensive — fleet/session might be
+        # partially constructed during early startup.
+        live_constructs: list[str] = []
+        if self.fleet is not None:
+            try:
+                live_constructs = [
+                    c.id for c in self.fleet._constructs
+                    if c.state.value not in ("done", "failed", "killed")
+                ]
+            except Exception:
+                pass
+        daemon_running = (
+            self.session is not None
+            and self._daemon_task is not None
+            and not self._daemon_task.done()
+        )
+
+        if live_constructs or daemon_running:
+            # Block + toast. The netrunner gets concrete feedback about
+            # what's holding the deck so they can decide: wait for the
+            # work to settle, or EJECT to halt deliberately.
+            parts: list[str] = []
+            if daemon_running:
+                parts.append("daemon session active")
+            if live_constructs:
+                if len(live_constructs) == 1:
+                    parts.append(f"1 construct in flight ({live_constructs[0]})")
+                else:
+                    parts.append(
+                        f"{len(live_constructs)} constructs in flight: "
+                        + ", ".join(live_constructs[:3])
+                        + ("…" if len(live_constructs) > 3 else "")
+                    )
+            self._toast(
+                f"[yellow]quit blocked:[/yellow] {' + '.join(parts)}. "
+                "Hold Ctrl+F to EJECT if you need to halt now."
+            )
+            return
+
+        # Idle path — clean exit. Tell fleet to tear down (cheap if
+        # it's already idle), then let Textual unwind. The DeckLogger's
+        # close-with-shutdown-reason fires from _drive_fleet's bottom-
+        # of-loop teardown.
         if self.fleet is not None:
             self.fleet.shutdown()
         self.exit()
@@ -7443,6 +7499,30 @@ class CyberdeckApp(App):
 
 
 if __name__ == "__main__":
+    # Phase 7b of the unified-event-stream slice — silent SIGINT
+    # swallow so Ctrl+C-as-copy in Windows Terminal stops killing
+    # the deck mid-session. The netrunner uses Ctrl+C as the copy
+    # shortcut; without this handler, when there's no selection, WT
+    # forwards the signal to the Python process and Textual unwinds
+    # mid-work. With the handler installed before any deck code runs,
+    # the deck never sees Ctrl+C at all — WT either copies (if a
+    # selection exists) or the signal is silently dropped. Ctrl+F
+    # held remains the only way to halt the deck immediately; Ctrl+Q
+    # is the polite quit (with the running-state guard from
+    # action_quit). See cyberdeck-philosophy.md design principle 6
+    # — "the escape hatch is always one key away" — that key is
+    # Ctrl+F, not Ctrl+C.
+    import signal as _signal
+    try:
+        _signal.signal(_signal.SIGINT, lambda *_a: None)
+    except (ValueError, OSError):
+        # signal.signal() can fail in non-main-thread contexts and
+        # under some embedded runtimes. The deck is always launched
+        # as the main process so this should never fail in practice;
+        # the guard is belt-and-suspenders so a bad Python
+        # configuration doesn't take down the deck.
+        pass
+
     # Suppress the asyncio ProactorEventLoop noise on shutdown.
     # On Windows, when subprocess transports get garbage-collected
     # after the loop has closed, BaseSubprocessTransport.__del__
