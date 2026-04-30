@@ -53,7 +53,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tripwires import TripwireFire
@@ -257,9 +257,16 @@ class Blacklist:
     def __init__(
         self,
         on_event: Optional[Callable[[dict], None]] = None,
+        bus: Optional[Any] = None,
     ) -> None:
         self._entries: list[BlacklistEntry] = []
         self.on_event = on_event
+        # Phase 4 of the unified-event-stream slice. When wired,
+        # `add()` ALSO publishes a `blacklist.added` DeckEvent
+        # alongside the existing on_event callback. Type is `Any`
+        # to avoid circular imports — see TripwireEngine docstring
+        # for the same pattern.
+        self.bus = bus
 
     def add(self, entry: BlacklistEntry) -> None:
         """Register a forbidden pattern. Idempotent on fingerprint —
@@ -287,6 +294,27 @@ class Blacklist:
             except Exception:
                 # Listener errors must not corrupt the blacklist —
                 # the entry is registered regardless.
+                pass
+        # Phase 4: also publish on the bus. Severity is WARNING —
+        # blacklist additions are netrunner-deliberate halts, more
+        # significant than INFO but not critical.
+        if self.bus is not None:
+            try:
+                from event_bus import DeckEvent
+                self.bus.publish(DeckEvent(
+                    kind="blacklist.added",
+                    source="watchdog.blacklist",
+                    timestamp=entry.added_at,
+                    construct_id=entry.source_construct_id,
+                    severity="warning",
+                    text=(
+                        f"⛔ blacklist + \"{entry.full_task[:50]}"
+                        f"{'...' if len(entry.full_task) > 50 else ''}\" "
+                        f"(source: {entry.source_construct_id})"
+                    ),
+                    payload=entry,
+                ))
+            except Exception:
                 pass
 
     def is_blacklisted(self, task: str) -> Optional[BlacklistEntry]:
@@ -499,30 +527,38 @@ class Watchdog:
         on_blacklist_event: Optional[Callable[[dict], None]] = None,
         history: Optional["WatchdogHistory"] = None,
         on_tripwire_fire: Optional[Callable[["TripwireFire"], None]] = None,
+        bus: Optional[Any] = None,
     ) -> None:
         self.id = f"wd-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
         self.cwd = cwd
         self.system_prompt = system_prompt
         self.timeout = timeout
+        # Phase 4 of the unified-event-stream slice. The watchdog
+        # passes the bus through to its owned components (Blacklist
+        # and TripwireEngine), and uses it directly to publish
+        # tripwire-authoring lifecycle events. None means no bus —
+        # behavior unchanged from pre-Phase-4. Type is `Any` to
+        # avoid an import cycle through event_bus.
+        self.bus = bus
         # Session-scoped blacklist. Lives on the watchdog per spec.
         # The watchdog object itself doesn't read from or write to the
         # blacklist today — DaemonSession (gates spawns) and the TUI
         # (Shift+K, in-flight match scan) are the consumers. Slice 2
-        # (tripwire authoring) will wire the watchdog's Q&A path to
+        # (tripwire authoring) wires the watchdog's authoring path to
         # observe entries and propose sharper rules.
-        self.blacklist = Blacklist(on_event=on_blacklist_event)
+        self.blacklist = Blacklist(on_event=on_blacklist_event, bus=bus)
         # Tripwire engine — deterministic matchers that fire on
         # construct events. The watchdog owns this per spec ("LLM
         # authors, deterministic enforces"); Fleet listeners feed
         # events in via tripwires.scan(); the TUI subscribes via the
         # on_tripwire_fire callback for chatlog rendering. Slice 1
         # ships with two default deck-wide tripwires (credentials
-        # keyword + destructive SQL) installed automatically; future
-        # slices add LLM-authored tripwires registered at goal-start
-        # / goal-update time.
+        # keyword + destructive SQL) installed automatically; slice 2
+        # adds LLM-authored tripwires registered at goal-start /
+        # goal-update time.
         from tripwires import TripwireEngine, install_default_tripwires
-        self.tripwires = TripwireEngine(on_fire=on_tripwire_fire)
+        self.tripwires = TripwireEngine(on_fire=on_tripwire_fire, bus=bus)
         install_default_tripwires(self.tripwires)
         # Persistent Q&A log. When set, every resolved question gets
         # appended to a JSONL file before the callback fires. The TUI
@@ -690,6 +726,56 @@ class Watchdog:
         started_at = time.time()
         blacklist_summary = blacklist_summary or []
 
+        # Phase 4 of the unified-event-stream slice: publish authoring
+        # lifecycle on the bus when wired. Subscribers (file logger,
+        # future maintbot, future morgue) can observe the watchdog's
+        # session-shaping without parsing chatlog text. Three events:
+        # _STARTED here at the top of the call, _COMPLETED on success,
+        # and _FAILED on parse / subprocess / timeout failure. The
+        # _wrap helper below routes _COMPLETED vs _FAILED based on
+        # the result's success flag and is called at every return
+        # site so we don't miss any exit path.
+        if self.bus is not None:
+            try:
+                from event_bus import DeckEvent
+                self.bus.publish(DeckEvent(
+                    kind="tripwire.author_started",
+                    source="watchdog",
+                    timestamp=started_at,
+                    payload={
+                        "goal": goal,
+                        "classification": classification,
+                        "old_goal": old_goal,
+                        "brake_label": brake_label,
+                        "blacklist_summary": list(blacklist_summary),
+                    },
+                ))
+            except Exception:
+                pass
+
+        def _wrap(result: TripwireAuthoringResult) -> TripwireAuthoringResult:
+            """Publish the COMPLETED or FAILED lifecycle event and
+            return the result unchanged. Closure over self.bus so
+            `result` flows through one helper at every return site."""
+            if self.bus is not None:
+                try:
+                    from event_bus import DeckEvent
+                    self.bus.publish(DeckEvent(
+                        kind=(
+                            "tripwire.author_completed"
+                            if result.success
+                            else "tripwire.author_failed"
+                        ),
+                        source="watchdog",
+                        severity=(
+                            "info" if result.success else "warning"
+                        ),
+                        payload=result,
+                    ))
+                except Exception:
+                    pass
+            return result
+
         # Build the prompt. System block prepended to the user body
         # because (1) rung-1 forks resume a session whose system prompt
         # is already the Q&A one, and (2) --append-system-prompt with
@@ -743,19 +829,19 @@ class Watchdog:
                 cwd=self.cwd,
             )
         except FileNotFoundError:
-            return TripwireAuthoringResult(
+            return _wrap(TripwireAuthoringResult(
                 success=False, registered=[], rejected=[],
                 used_resume=use_resume,
                 error=f"claude binary not found: {self.claude_bin}",
                 elapsed_s=time.time() - started_at,
-            )
+            ))
         except Exception as e:
-            return TripwireAuthoringResult(
+            return _wrap(TripwireAuthoringResult(
                 success=False, registered=[], rejected=[],
                 used_resume=use_resume,
                 error=f"subprocess spawn failed: {e}",
                 elapsed_s=time.time() - started_at,
-            )
+            ))
 
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -768,16 +854,16 @@ class Watchdog:
                 await proc.wait()
             except ProcessLookupError:
                 pass
-            return TripwireAuthoringResult(
+            return _wrap(TripwireAuthoringResult(
                 success=False, registered=[], rejected=[],
                 used_resume=use_resume,
                 error=f"authoring timed out after {timeout:.0f}s",
                 elapsed_s=time.time() - started_at,
-            )
+            ))
 
         if proc.returncode != 0:
             err_text = stderr.decode("utf-8", errors="replace").strip()
-            return TripwireAuthoringResult(
+            return _wrap(TripwireAuthoringResult(
                 success=False, registered=[], rejected=[],
                 used_resume=use_resume,
                 error=(
@@ -785,16 +871,16 @@ class Watchdog:
                     f"{err_text[:200] if err_text else '(no stderr)'}"
                 ),
                 elapsed_s=time.time() - started_at,
-            )
+            ))
 
         raw_output = stdout.decode("utf-8", errors="replace").strip()
         if not raw_output:
-            return TripwireAuthoringResult(
+            return _wrap(TripwireAuthoringResult(
                 success=False, registered=[], rejected=[],
                 used_resume=use_resume,
                 error="claude returned empty output",
                 elapsed_s=time.time() - started_at,
-            )
+            ))
 
         # Parse + validate the JSON response.
         parsed_tws, rejected = parse_authoring_response(raw_output)
@@ -832,7 +918,7 @@ class Watchdog:
             and rejected[0][0] == "(response)"
         )
 
-        return TripwireAuthoringResult(
+        return _wrap(TripwireAuthoringResult(
             success=not parse_failure,
             registered=registered,
             rejected=rejected,
@@ -842,7 +928,7 @@ class Watchdog:
             ),
             elapsed_s=time.time() - started_at,
             raw_response=raw_output if parse_failure else "",
-        )
+        ))
 
     async def _worker_loop(self) -> None:
         """Drain the queue, processing one question at a time."""

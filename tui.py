@@ -2769,6 +2769,11 @@ class CyberdeckApp(App):
             # installed on engine construction; LLM-authored
             # tripwires land in slice 2.
             on_tripwire_fire=self._handle_tripwire_fire,
+            # Phase 4 of the unified-event-stream slice: pass the bus
+            # so the watchdog's owned components (Blacklist + Tripwire
+            # engine) and authoring lifecycle publish to it alongside
+            # the existing on_event / on_fire callbacks.
+            bus=self.bus,
         )
         # Connection monitor — heartbeats api.anthropic.com:443 to
         # detect Online/Degraded/Offline transitions. Per spec line

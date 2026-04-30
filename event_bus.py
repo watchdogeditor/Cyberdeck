@@ -414,3 +414,21 @@ class Kind:
     DAEMON_STATUS = "daemon.status"
     DAEMON_ERROR = "daemon.error"
     DAEMON_RAW = "daemon.raw"
+
+    # Tripwires (Phase 4). The deterministic-matcher half: every fire
+    # the engine dispatches becomes a TRIPWIRE_FIRE event on the bus.
+    # Severity on the DeckEvent reflects the tripwire's own severity
+    # so subscribers can filter on `(kind=tripwire.fire, severity=critical)`
+    # for slice-3-style focus-pulling without inspecting the payload.
+    TRIPWIRE_FIRE = "tripwire.fire"
+    # The LLM-authoring half (slice 2): authoring lifecycle so
+    # subscribers can observe the watchdog's session-shaping.
+    TRIPWIRE_AUTHOR_STARTED = "tripwire.author_started"
+    TRIPWIRE_AUTHOR_COMPLETED = "tripwire.author_completed"
+    TRIPWIRE_AUTHOR_FAILED = "tripwire.author_failed"
+
+    # Blacklist (Phase 4). Today the only event is "added" — entries
+    # never get explicitly removed (session-scoped, cleared on
+    # watchdog shutdown). If a `blacklist.removed` ever lands, it
+    # joins this namespace.
+    BLACKLIST_ADDED = "blacklist.added"

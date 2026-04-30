@@ -40,7 +40,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from construct import EventKind
 
@@ -260,6 +260,7 @@ class TripwireEngine:
     def __init__(
         self,
         on_fire: Optional[Callable[[TripwireFire], None]] = None,
+        bus: Optional[Any] = None,
     ) -> None:
         # Indexed by name. Names must be unique; re-registering an
         # existing name updates in place (useful for LLM authoring
@@ -270,6 +271,18 @@ class TripwireEngine:
         # (cheap — regexes here are short).
         self._compiled: dict[str, re.Pattern] = {}
         self.on_fire = on_fire
+        # Phase 4 of the unified-event-stream slice. When wired, every
+        # fire ALSO publishes a `tripwire.fire` DeckEvent on the bus
+        # alongside the existing on_fire callback. None means no bus
+        # (e.g. headless test scenarios that only use the callback).
+        # Type is `Any` rather than `EventBus` to avoid a circular
+        # import — event_bus.py is a leaf module that imports nothing
+        # from the rest of the deck, and tripwires.py is consumed by
+        # watchdog.py which is consumed by tui.py. Adding an
+        # `EventBus` type here would force event_bus -> tripwires
+        # -> watchdog ordering at import; staying duck-typed keeps
+        # the dependency graph clean. Same pattern in Blacklist.
+        self.bus = bus
 
     # ---- registry --------------------------------------------------
 
@@ -407,6 +420,36 @@ class TripwireEngine:
                     self.on_fire(fire)
                 except Exception:
                     # Listener errors must not corrupt the engine.
+                    pass
+        # Phase 4: also publish each fire on the bus when wired.
+        # Severity on the DeckEvent mirrors the tripwire's severity
+        # so subscribers can filter by severity tier without inspecting
+        # the payload (tripwires slice 3 will use this for focus-pulling
+        # rendering of critical fires). Bus's per-callback exception
+        # isolation handles any subscriber misbehavior independently
+        # — it cannot poison the engine's existing on_fire path.
+        if self.bus is not None:
+            from event_bus import DeckEvent
+            for fire in fires:
+                try:
+                    self.bus.publish(DeckEvent(
+                        kind="tripwire.fire",
+                        source="watchdog.tripwires",
+                        timestamp=fire.fired_at,
+                        construct_id=fire.construct_id,
+                        severity=fire.severity,
+                        text=(
+                            f"⚠ tripwire {fire.tripwire_name} on "
+                            f"{fire.construct_id}: "
+                            f"{fire.matched_text_excerpt}"
+                        ),
+                        payload=fire,
+                    ))
+                except Exception:
+                    # Defensive — even with the bus's own exception
+                    # isolation, the construction or publish call
+                    # itself shouldn't crash the engine if something
+                    # weird happens (broken bus reference, etc.).
                     pass
         return fires
 
