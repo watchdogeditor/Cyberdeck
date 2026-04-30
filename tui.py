@@ -3836,6 +3836,12 @@ class CyberdeckApp(App):
             # feedback line in the next outcome turn. Watchdog owns
             # the data structure (per spec); DaemonSession just reads.
             blacklist=self.watchdog.blacklist,
+            # Phase 3 of the unified-event-stream slice: pass the
+            # bus so DaemonEvents flow through it alongside the
+            # existing on_daemon_event callback. The wrapper inside
+            # DaemonSession means callsites stay unchanged — every
+            # existing emission picks up bus publish for free.
+            bus=self.bus,
         )
 
         if self.daemon_pane is not None:

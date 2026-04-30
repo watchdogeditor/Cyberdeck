@@ -22,6 +22,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from profiles import Profile
     from watchdog import Blacklist, BlacklistEntry
+    from event_bus import EventBus
 
 from daemon import Daemon, DaemonEvent
 from fleet import Fleet, FleetEvent
@@ -49,10 +50,28 @@ class DaemonSession:
         default_profile: Optional["Profile"] = None,
         profile_lookup: Optional[Callable[[str], Optional["Profile"]]] = None,
         blacklist: Optional["Blacklist"] = None,
+        bus: Optional["EventBus"] = None,
     ) -> None:
         self.daemon = daemon
         self.fleet = fleet
-        self.on_daemon_event = on_daemon_event
+        # Phase 3 of the unified-event-stream slice. When the deck
+        # passes a bus, every DaemonEvent flowing through
+        # on_daemon_event ALSO publishes a translated DeckEvent on
+        # the bus. We wrap the user-provided callback rather than
+        # touch each emission site individually — DaemonSession has
+        # ~5 places that fire on_daemon_event (subprocess pump +
+        # synthetic events for blacklist refusal / spawn cap halt /
+        # respawn warnings + the _emit_daemon_event helper). One
+        # wrapper covers all of them with no per-site changes; the
+        # tradeoff is that `self.on_daemon_event` is now a private
+        # bus-bridging shim rather than the user's callback (kept
+        # the user's reference on `_user_daemon_event_cb` for
+        # introspection / debugging).
+        self.bus = bus
+        self._user_daemon_event_cb = on_daemon_event
+        self.on_daemon_event = self._wrap_daemon_event_callback(
+            on_daemon_event, bus,
+        )
         self.outcome_batch_delay = outcome_batch_delay
         # Hard cap on constructs per session. This is the wood-chipper
         # shutoff: if the daemon loops or fans out pathologically, we
@@ -442,6 +461,42 @@ class DaemonSession:
             payload={"text": text},
         ))
 
+    @staticmethod
+    def _wrap_daemon_event_callback(
+        user_cb: Optional[Callable[[DaemonEvent], None]],
+        bus: Optional["EventBus"],
+    ) -> Optional[Callable[[DaemonEvent], None]]:
+        """Build a single callback that fires the user-provided
+        listener AND publishes a translated DeckEvent on the bus.
+
+        Returns None if both inputs are None — callers checking
+        `if self.on_daemon_event is not None` (existing pattern at
+        ~5 sites) keep working unchanged, and DaemonSession remains
+        usable in headless tests with no listener and no bus.
+
+        Returns a wrapper otherwise. The wrapper:
+          - calls `user_cb(event)` if user_cb is set, propagating
+            any exception (matches existing behavior — user callback
+            exceptions surface, they don't get swallowed)
+          - publishes to `bus` if bus is set, with translation via
+            `_daemon_event_to_deck_event`. The bus's own
+            per-callback exception isolation prevents a misbehaving
+            subscriber from affecting the user callback or other
+            subscribers.
+        """
+        if user_cb is None and bus is None:
+            return None
+
+        def _wrapped(event: DaemonEvent) -> None:
+            if user_cb is not None:
+                user_cb(event)
+            if bus is not None:
+                deck_event = _daemon_event_to_deck_event(event)
+                if deck_event is not None:
+                    bus.publish(deck_event)
+
+        return _wrapped
+
     async def _wait_for_outcome_batch(self) -> Optional[list[PendingOutcome]]:
         """Block until at least one outcome arrives, debounce briefly,
         then return and clear the batch. Returns None if shutdown."""
@@ -491,6 +546,45 @@ class DaemonSession:
 # include it as plain text alongside; that's how the daemon system
 # prompt now teaches it.
 _MARKDOWN_AUTOLINK_RE = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
+
+
+def _daemon_event_to_deck_event(event: DaemonEvent):
+    """Translate a DaemonEvent into a DeckEvent for bus publish.
+
+    DaemonEvent.kind ∈ {thinking, chat, action, status, error, raw} →
+    `daemon.<kind>` on the bus. Unknown kinds (future additions) fall
+    through with the same dotted-namespace shape so subscribers can
+    still glob on `daemon.*`.
+
+    Imported lazily so daemon_session.py stays importable when
+    event_bus.py isn't on the path (mock-test scenarios). Practically
+    there's always a bus when there's a deck, but the module shouldn't
+    require the bus.
+
+    Returns None today only as a contract (room for future filtering
+    of session-internal events that shouldn't propagate); current
+    implementation always returns a DeckEvent.
+    """
+    from event_bus import DeckEvent
+    return DeckEvent(
+        kind=f"daemon.{event.kind}",
+        source="daemon",
+        timestamp=event.timestamp,
+        # DaemonEvents aren't construct-scoped — they're about the
+        # daemon's own activity. Subscribers filtering by
+        # construct_id won't see daemon events under any specific id.
+        construct_id=None,
+        # Severity stays INFO for now. The DaemonEvent.kind=="error"
+        # case is the obvious candidate to escalate to WARNING/ERROR
+        # but the existing taxonomy lumps "blacklist refused spawn"
+        # (informational) and "subprocess crashed" (real failure)
+        # under the same kind. Refining severity here would require
+        # disambiguating those at the call site, which is out of
+        # scope for Phase 3.
+        # The DaemonEvent itself is the payload — subscribers have
+        # full access to whatever the daemon emitted.
+        payload=event,
+    )
 
 
 def _strip_markdown_autolinks(s: str) -> str:

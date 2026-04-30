@@ -400,3 +400,17 @@ class Kind:
     FLEET_SPAWN_BLOCKED = "fleet.spawn_blocked"
     FLEET_SPAWN_FAILED = "fleet.spawn_failed"
     FLEET_EVENT = "fleet.event"  # per-construct streaming events
+
+    # Daemon (Phase 3). DaemonEvent.kind enumerates: thinking, chat,
+    # action, status, error, raw. Each maps to a daemon.<kind> bus
+    # event. DaemonSession synthesizes additional `error` events
+    # for blacklist-refused spawns, spawn-cap halts, and respawn-loop
+    # warnings — those flow through the same channel as daemon-
+    # subprocess events; subscribers can't tell synthetic from
+    # subprocess-emitted apart from the payload's `text` field.
+    DAEMON_THINKING = "daemon.thinking"
+    DAEMON_CHAT = "daemon.chat"
+    DAEMON_ACTION = "daemon.action"
+    DAEMON_STATUS = "daemon.status"
+    DAEMON_ERROR = "daemon.error"
+    DAEMON_RAW = "daemon.raw"
