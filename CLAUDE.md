@@ -4,7 +4,8 @@ A keyboard-first Textual TUI that orchestrates Claude Code subprocesses.
 The "daemon" coordinator decomposes goals; "constructs" execute in
 parallel; the "watchdog" oracle answers questions about fleet activity.
 Personal hobby project, in active production use on Windows.
-~14k LOC across 19 Python modules at the deck-source root.
+~16k LOC across 21 Python modules at the deck-source root (as of
+2026-04-30, post-spine).
 
 The user is the "netrunner." Match the cyberpunk vocabulary in code
 and prose — these are the right names for what each thing does.
@@ -23,10 +24,47 @@ Then the four other canon docs, in this order:
   - `cyberdeck-spec.md` — canonical architecture (the *what*)
   - `cyberdeck-philosophy.md` — convictions that resolve ambiguity (the *why*)
 
+Two architecture docs for the major in-flight initiatives:
+  - `cyberdeck-event-stream-design.md` — the spine (one canonical
+    event bus, role-derived filters). Phases 1-7 shipped 2026-04-30;
+    Phase 8 cleanup is the last remaining slice.
+  - `cyberdeck-maintbot-design.md` — the Mechanic (separate-process
+    supervisor + on-demand LLM session). Two-tier architecture
+    landed 2026-04-30; v0 (supervisor only — subprocess janitor) is
+    the next implementation slice.
+
 Two more for specific moments: `cyberdeck-project-instructions.md`
 (collaboration norms), `cyberdeck-tools-research-seed.md` (seed for a
 future tools-research conversation). `cyberdeck_arbiter_design.md` is
 a deferred wearable-form-factor variant — not current scope.
+
+## Where the deck is right now (2026-04-30)
+
+Just shipped a substantial spine refactor. Every event source
+publishes through `event_bus.py`; the file logger writes per-launch
+NDJSON files at `<deck source>/logs/cyberdeck-YYYY-MM-DD-HHMMSS.log`
++ `latest.log` pointer; Ctrl+C-as-copy doesn't kill the deck (silent
+SIGINT swallow); smart Ctrl+Q with running-state guard.
+
+Real-deck verified: spine 1-6, slice 2 LLM-authored tripwires (rung-1
+fork + rung-2 fresh both work), file logger end-to-end, magnified
+view + watchdog Q&A still see all event markers.
+
+**Next session picks up at: Mechanic v0 — supervisor only.** A
+sibling Python process to the deck that watches the deck's PID,
+tracks its claude subprocesses (read from the file logger's
+`fleet.spawn` events), and kills them on detected deck death.
+Cross-platform Python; no Job Object plumbing in the deck. Concrete
+v0 use case is the orphan-subprocess problem caught during
+2026-04-30's Ctrl+C autopsy. See `cyberdeck-maintbot-design.md` v0
+section for full design + the "PID publish channel" sub-section
+(lean: add `pid` to `fleet.spawn` event payloads, one-line change at
+each spawn site in fleet.py).
+
+After Mechanic v0: spine Phase 8 cleanup (retire deprecated
+`add_listener`/`on_*` shims now that everyone publishes through the
+bus), then in-deck copy keybind (sidesteps Ctrl+C-as-copy issue at
+the UX layer cross-platform).
 
 ## Running it
 
@@ -47,8 +85,15 @@ vars with `$env:NAME = "..."`, not bash syntax.
 
 ## Layout
 
-- `*.py` (root) — source. `tui.py` is the heart (~6k LOC, well-organized
-  but huge — grep for similar patterns before adding a feature).
+- `*.py` (root) — source. `tui.py` is the heart (~7.4k LOC after
+  spine, well-organized but huge — grep for similar patterns before
+  adding a feature). `event_bus.py` (the spine), `logger.py`
+  (DeckLogger + per-launch NDJSON), and per-source translators
+  (`fleet._fleet_event_to_deck_event`, `daemon_session._daemon_event_to_deck_event`)
+  are the post-2026-04-30 additions.
+- `<deck source>/logs/` — per-launch log files. Operational artifacts;
+  brake hook protects them from constructs by default. `latest.log`
+  always points at the current run.
 - `Design Files/` — the canon. Update these when major decisions change;
   don't let docs drift behind code.
 - `cyberdeck-home/` — runtime working dir. Profiles, plugins,

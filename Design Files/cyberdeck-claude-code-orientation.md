@@ -237,6 +237,42 @@ grep for existing similar work — the pattern is almost always there.
   any subprocess-death path so a respawned subprocess captures a
   fresh id rather than handing out a stale one.
 
+### `event_bus.py` — the spine (Phase 1 shipped 2026-04-30)
+- `DeckEvent` dataclass — kind (dotted-namespace), source, timestamp,
+  construct_id, severity, optional pre-rendered text, arbitrary
+  payload. Stable shape across all event sources.
+- `EventBus` — synchronous publish/subscribe on a single event loop
+  (matches Textual single-loop). Bounded ring-buffer history (default
+  10000) for late subscribers + snapshot consumers. Per-callback
+  exception isolation; errors recorded in a bounded `errors` deque.
+- `Subscription` — opaque handle returned by `subscribe()`; call
+  `unsubscribe()` when done. Idempotent.
+- Filter shape: None (everything), iterable of fnmatch patterns
+  (`["fleet.*", "tripwire.fire"]`), or predicate callable.
+- `Severity` constants (debug/info/warning/error/critical).
+- `Kind` namespace: dotted-string constants for every migrated
+  event source (`fleet.spawn`, `daemon.thinking`, `tripwire.fire`,
+  `brake.change`, `chatlog.direct`, etc.).
+- Phases 2-6 migrated every event source onto the bus; Phase 7a's
+  DeckLogger is the first non-TUI subscriber; Phase 8 cleanup
+  (retire `add_listener` / `on_*` shims) is queued.
+
+### `logger.py` — per-launch file logger (Phase 7a shipped 2026-04-30)
+- `DeckLogger` — bus subscriber that writes one NDJSON line per
+  matching event to `<deck source>/logs/cyberdeck-YYYY-MM-DD-HHMMSS.log`.
+  Severity threshold filter (default INFO; CRITICAL bypasses).
+- `latest.log` pointer alongside — symlink on Linux/macOS, hard-copy
+  on Windows. Best-effort.
+- Self-describing header: deck version, argv, env (CYBERDECK_*+CLAUDE_*),
+  brake, home, python, OS, log level, log path. Triagable in isolation.
+- `close(reason=...)` writes a footer (`shutdown` / `eject` / `crash`).
+  Mechanic supervisor will read this to distinguish clean from
+  unclean exit. Idempotent.
+- `_serialize_payload` walks dataclass-shaped payloads (FleetEvent,
+  DaemonEvent, BlacklistEntry, etc.) recursively via `__dict__`,
+  bounded depth 4, repr() fallback.
+- Best-effort throughout — disk failures degrade gracefully.
+
 ### `tripwires.py` — slices 1 + 2 shipped 2026-04-29
 - `Tripwire` dataclass — small DSL: pattern_type (regex today),
   pattern, event_kinds (which EventKinds to scan), field selector
@@ -504,6 +540,9 @@ substantive change is still useful. Keep it.
 | Watchdog Blacklist | `watchdog.py` `Blacklist` / `BlacklistEntry` (data) + `tui.py` `action_hard_kill_focused` (populate) + `tui.py` `_handle_blacklist_event` (render + flag) + `daemon_session.py` `_execute_action` spawn branch (refusal) + `daemon_session._format_outcomes` (daemon-facing surface) |
 | Watchdog Q&A persistence | `watchdog.py` `WatchdogHistory` / `WatchdogHistoryEntry` (data + replay) + `Watchdog._safe_callback` (write on resolve) + `tui.py` `_replay_watchdog_history` (mount-time read) + `WatchdogPane.write_history_separator` / `write_live_session_marker` (visual chrome) |
 | Tripwires (slices 1 + 2) | `tripwires.py` (`Tripwire` data + `TripwireEngine` + field extractors + `DEFAULT_TRIPWIRES` + `TRIPWIRE_AUTHORING_SYSTEM_PROMPT` + `build_authoring_user_prompt` + `parse_authoring_response` + `TripwireAuthoringResult`) + `Watchdog.__init__` (engine ownership + default install + `_session_id` capture) + `Watchdog.author_tripwires` (slice 2 orchestrator: subprocess + parse + engine mutation) + `tui._scan_for_tripwires` (Fleet listener feeding events into engine) + `tui._handle_tripwire_fire` (chatlog rendering with severity-colored markup) + `tui._kick_off_tripwire_authoring` / `_author_tripwires_wrapper` / `_render_tripwire_authoring_result` (slice 2 trigger + worker + chatlog announcement) — trigger sites are `_start_daemon_task` (goal-start) and the mid-flight branch of `_handle_goal_submitted` (goal-update, gated on classification != "clarification") |
+| The spine (event bus, phases 1-7 shipped) | `event_bus.py` (DeckEvent + EventBus + Subscription + Severity + Kind constants) + `tui.CyberdeckApp.bus` (instance) + producers wire bus= via constructors (Fleet, DaemonSession, Watchdog, Blacklist, TripwireEngine, BrakeStateStore, ConnectionMonitor, ProfileRegistry, PluginRegistry) + `tui._chatlog_write` publishes `chatlog.direct` + `tui._chatlog_format_bus_event` dispatches by event payload type (FleetEvent → format_fleet, DaemonEvent → format_daemon, chatlog.direct → event.text) + `tui._render_chatlog_buffer` (magnified view, reads `bus.snapshot()`) + `tui._build_watchdog_context` (Q&A snapshot, reads `bus.snapshot()`). Each producer module has its own translator (`_fleet_event_to_deck_event`, `_daemon_event_to_deck_event`, etc.) and adds bus publish AFTER the legacy callback fan-out — additive migration. See `cyberdeck-event-stream-design.md`. |
+| File logger (Phase 7a) | `logger.py` (`DeckLogger` + `_serialize_payload` + `_SEVERITY_RANKS`) + `tui.CyberdeckApp.deck_logger` instance built after `brake_state_store.load()` + `attach_to_bus(self.bus)` subscription + close(reason="shutdown") in `_drive_fleet` teardown + close(reason="eject") in `_do_eject`. CLI: `--log-dir` / `--log-level` / env `CYBERDECK_LOG_DIR` / `CYBERDECK_LOG_LEVEL`. Default dir `<deck source>/logs/`; `latest.log` pointer alongside. Header on first line, footer on last. NDJSON. |
+| Quit discipline (Phase 7b) | `signal.signal(SIGINT, lambda: None)` installed in `tui.py` `__main__` block before App construction + smart `CyberdeckApp.action_quit` (idle: clean exit; running: toast + block, lists daemon-running + live constructs). Ctrl+F (held) remains the only halt-now gesture. EJECT responsiveness via existing `asyncio.gather` parallelization in `_do_eject`; SIGTERM-grace-skip force-kill upgrade is queued separately. |
 
 ---
 
