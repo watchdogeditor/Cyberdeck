@@ -22,7 +22,6 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 
 from rich.text import Text
@@ -62,7 +61,7 @@ from watchdog import (
     _fingerprint as _blacklist_fingerprint,
 )
 from tripwires import TripwireFire, TripwireAuthoringResult
-from event_bus import EventBus
+from event_bus import EventBus, DeckEvent
 from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
@@ -2821,16 +2820,13 @@ class CyberdeckApp(App):
             str, tuple[str, str, str, str]
         ] = {}
 
-        # Chatlog event buffer. Holds the last N raw events that fed
-        # the chatlog so the ExpandModal can re-render with looser
-        # truncation caps. Each entry is (kind_marker, raw_event)
-        # where kind_marker is "fleet" or "daemon" and raw_event is
-        # the original FleetEvent or DaemonEvent. Bounded so an
-        # extremely long-running session doesn't accumulate forever.
-        # Per-event memory is bounded by the formatter's own caps in
-        # untruncated mode (5000 chars max per line), so this buffer
-        # is at most ~5MB at full saturation. Not a concern.
-        self._chatlog_event_buffer: deque = deque(maxlen=1000)
+        # (Phase 6 of the unified-event-stream slice retired the
+        # standalone `_chatlog_event_buffer` deque that used to live
+        # here. The bus's ring buffer (default maxlen=10000 events,
+        # ~10× the old chatlog buffer's capacity) is now the single
+        # source of truth. _render_chatlog_buffer and
+        # _build_watchdog_context iterate self.bus.snapshot() and
+        # filter via _chatlog_format_bus_event.)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -3907,12 +3903,15 @@ class CyberdeckApp(App):
         # from the receiving end, and we'd rather not double-log.
         line = chatlog_format_daemon(event)
         if line is not None:
-            # buffer_direct=False: we push the original DaemonEvent
-            # below for re-render with untruncated=True in the
-            # magnified view. Letting _chatlog_write also push the
-            # pre-rendered line would produce duplicates.
-            self._chatlog_write(line, buffer_direct=False)
-            self._chatlog_event_buffer.append(("daemon", event))
+            # Phase 6: skip publishing chatlog.direct because
+            # daemon→bus (Phase 3) already publishes the raw
+            # daemon.<kind> DeckEvent. The magnified view and Q&A
+            # context-builder iterate bus.snapshot() and re-render
+            # with untruncated=True from the original DaemonEvent.
+            # If we ALSO published chatlog.direct here we'd produce
+            # duplicate lines in the magnified view (one from the
+            # re-render, one from the pre-rendered direct line).
+            self._chatlog_write(line, publish_direct=False)
 
     def _handle_event(self, fevent: FleetEvent) -> None:
         """Called from Fleet on the same event loop; safe to touch widgets."""
@@ -3936,12 +3935,13 @@ class CyberdeckApp(App):
         # re-render in untruncated mode.
         line = chatlog_format_fleet(fevent)
         if line is not None:
-            # buffer_direct=False: same reasoning as the daemon path —
-            # the explicit FleetEvent push below is what enables the
-            # magnified view's untruncated re-render. Auto-buffering
-            # the pre-rendered line here would duplicate the entry.
-            self._chatlog_write(line, buffer_direct=False)
-            self._chatlog_event_buffer.append(("fleet", fevent))
+            # Phase 6: skip publishing chatlog.direct because fleet→bus
+            # (Phase 2) already publishes the raw `fleet.<kind>`
+            # DeckEvent. The magnified view + Q&A context iterate
+            # bus.snapshot() and re-render via chatlog_format_fleet
+            # with untruncated=True. Same duplication-avoidance shape
+            # as the daemon path above.
+            self._chatlog_write(line, publish_direct=False)
         # Keep sidebar counters / cost live. Cheap enough to do per event;
         # Textual only repaints when the Label's content actually changes.
         self._refresh_sidebar_info()
@@ -4320,7 +4320,7 @@ class CyberdeckApp(App):
             files_lv.append(FileListItem(construct_id, fp, display_path=display))
             existing_keys.add(key)
 
-    def _chatlog_write(self, line: str, *, buffer_direct: bool = True) -> None:
+    def _chatlog_write(self, line: str, *, publish_direct: bool = True) -> None:
         """Append a single chatlog line with an HH:MM:SS dim-prefix.
 
         The line is expected to already include color/markup from the
@@ -4331,31 +4331,37 @@ class CyberdeckApp(App):
         or pre-mount race). Mechanical extraction is best-effort by
         design — dropping a line never breaks anything else.
 
-        Buffer side-effect (`buffer_direct=True`, default): the line
-        also lands in `_chatlog_event_buffer` under kind="direct" so
-        the magnified view (`z` ExpandModal) can replay it. Without
-        this push, non-fleet/daemon markers (tripwire fires +
-        authoring announcements, brake transitions, blacklist
-        additions, goal-update markers, watchdog Q&A lines) are
-        invisible in the magnified view — the buffer used to be fed
-        only by FleetEvent / DaemonEvent routing. Verified real-deck:
-        magnified-z showed only fleet/daemon lines while the small
-        chatlog had all the markers; netrunner couldn't tell what
-        actually happened.
+        Bus publish (Phase 6 of the unified-event-stream slice,
+        controlled by `publish_direct`): when True (default), the
+        line ALSO publishes a `chatlog.direct` DeckEvent on the bus
+        so the magnified view (`z` ExpandModal) and the watchdog Q&A
+        context-builder can both see it. Both readers iterate
+        `bus.snapshot()`, dispatch on payload type for fleet/daemon
+        events (re-rendering with untruncated=True for richer content)
+        and read pre-rendered text for `chatlog.direct` events.
 
         Why the opt-out parameter: the fleet/daemon dispatch paths
-        (`_handle_event`, `_handle_daemon_event`) call this AND then
-        explicitly push the original FleetEvent / DaemonEvent into
-        the buffer. The original-event push is what lets the magnified
-        view re-render with `untruncated=True` (richer content than
-        the truncated live line). Without `buffer_direct=False` on
-        those paths, every fleet/daemon event would land in the
-        buffer twice — once as a "direct" pre-rendered line, once as
-        the original event object — and the magnified view would
-        show duplicates with slightly different content. The default
-        is True so future direct-write callers (tripwire, watchdog,
-        brake, blacklist, goal-update markers, and anything new) are
-        covered automatically with no per-callsite opt-in.
+        (`_handle_event`, `_handle_daemon_event`) already cause a
+        `fleet.*` or `daemon.*` event to land on the bus via Phase
+        2/3. If `_chatlog_write` also publishes `chatlog.direct` for
+        the same logical event, the chatlog reader iterating the bus
+        sees BOTH and emits duplicate lines (one from the fleet/daemon
+        re-render, one from the pre-rendered direct line). Those
+        dispatch paths pass `publish_direct=False` to skip the
+        chatlog.direct publish; everything else (tripwire fires,
+        watchdog markers, brake transitions, blacklist additions,
+        goal-update markers, etc.) stays on the default True so it
+        gets buffered for re-render in the magnified view.
+
+        History note: until Phase 6 this method maintained a separate
+        `_chatlog_event_buffer` deque on CyberdeckApp. That structure
+        decayed silently as new event sources landed; the tactical
+        fix added a `buffer_direct` opt-out param. Phase 6 retires
+        the buffer entirely; bus.snapshot() is the single source of
+        truth for "what's been on the chatlog." This `publish_direct`
+        parameter is the bus-shaped equivalent of the old
+        `buffer_direct` — same dispatch-path duplication concern,
+        same fix shape.
         """
         try:
             chatlog = self.query_one("#chatlog_log", RichLog)
@@ -4372,44 +4378,98 @@ class CyberdeckApp(App):
         now = time.time()
         ts = time.strftime("%H:%M:%S", time.localtime(now))
         chatlog.write(f"[dim]{ts}[/dim]  {line}")
-        # Buffer for the magnified-view replay. Pre-rendered line is
-        # stashed as-is — no formatter to re-run since the caller
-        # already did the markup composition. Skipped for fleet/daemon
-        # paths that push the original event separately (see docstring).
-        if buffer_direct:
-            self._chatlog_event_buffer.append((
-                "direct",
-                SimpleNamespace(timestamp=now, line=line),
-            ))
+        # Phase 6 bus publish — `chatlog.direct` carries the rendered
+        # line in event.text. Subscribers wanting the raw structured
+        # event should subscribe to the source kinds (tripwire.fire,
+        # brake.change, blacklist.added, etc.); those producers
+        # publish independently on the bus (Phases 4-5). The
+        # chatlog.direct event is the "this is what the netrunner
+        # saw" rendering for non-fleet/daemon markers; fleet/daemon
+        # dispatch sites set publish_direct=False to avoid duplicate
+        # bus entries (their raw events on the bus carry the
+        # re-renderable payload).
+        if publish_direct and getattr(self, "bus", None) is not None:
+            try:
+                from event_bus import DeckEvent
+                self.bus.publish(DeckEvent(
+                    kind="chatlog.direct",
+                    source="tui.chatlog",
+                    timestamp=now,
+                    text=line,
+                ))
+            except Exception:
+                pass
+
+    # Chatlog reader — Phase 6 of the unified-event-stream slice
+    # replaced the standalone `_chatlog_event_buffer` deque with
+    # bus.snapshot() iteration. Two readers share the same dispatch
+    # logic: _render_chatlog_buffer (magnified view) and
+    # _build_watchdog_context (Q&A snapshot). Both call
+    # _chatlog_format_bus_event below; they differ only in what
+    # they do with the formatted lines (chrome them with timestamps
+    # vs. strip markup for LLM input).
+
+    def _chatlog_format_bus_event(
+        self, event: "DeckEvent", *, untruncated: bool,
+    ) -> Optional[str]:
+        """Map a DeckEvent to a chatlog-ready line, or None when the
+        event isn't chatlog-relevant.
+
+        Dispatch:
+          * `chatlog.direct` → emit event.text directly (pre-rendered
+            by `_chatlog_write`)
+          * fleet.* with FleetEvent payload → chatlog_format_fleet
+          * daemon.* with DaemonEvent payload → chatlog_format_daemon
+          * everything else → None (filtered out)
+
+        Skipping non-chatlog kinds rather than rendering everything
+        keeps the magnified view focused on what the netrunner
+        already saw — tripwire.fire (raw), brake.change (raw),
+        blacklist.added (raw), etc., are all also published on the
+        bus, but they carry the structured payload, not the
+        chatlog-line rendering. The chatlog-line rendering for those
+        same events comes from `_chatlog_write` calls inside the
+        respective handlers, which publish chatlog.direct."""
+        kind = event.kind
+        if kind == "chatlog.direct":
+            return event.text
+        # Fleet / daemon path: re-render from the original payload so
+        # the magnified view can use untruncated=True for richer
+        # content. The payload is the original FleetEvent / DaemonEvent
+        # object courtesy of Phase 2 / 3's translator.
+        if kind.startswith("fleet."):
+            payload = event.payload
+            if isinstance(payload, FleetEvent):
+                return chatlog_format_fleet(payload, untruncated=untruncated)
+            return None
+        if kind.startswith("daemon."):
+            payload = event.payload
+            if isinstance(payload, DaemonEvent):
+                return chatlog_format_daemon(payload, untruncated=untruncated)
+            return None
+        return None
 
     def _render_chatlog_buffer(self, *, untruncated: bool = False) -> list[str]:
-        """Re-render the chatlog event buffer to a list of formatted
-        strings. Used by the ExpandModal so the modal can show
-        un-truncated content (untruncated=True passes through to the
-        formatters' looser sanity caps).
+        """Re-render the chatlog from the bus snapshot. Used by the
+        ExpandModal to show un-truncated content (`untruncated=True`
+        passes through to the formatters' looser sanity caps).
 
         Each entry includes the HH:MM:SS prefix that _chatlog_write
-        normally stamps on, derived from the buffered event's own
-        timestamp so the modal's lines line up with what the live
-        chatlog showed (give or take async ordering).
+        normally stamps on, derived from the bus event's own timestamp
+        so the modal's lines line up with what the live chatlog
+        showed (give or take async ordering).
 
         Returns lines suitable for direct write to a RichLog with
         markup=True; the caller doesn't need to do further formatting.
         """
         out: list[str] = []
-        for kind, event in self._chatlog_event_buffer:
+        if getattr(self, "bus", None) is None:
+            return out
+        for event in self.bus.snapshot():
             try:
-                if kind == "fleet":
-                    line = chatlog_format_fleet(event, untruncated=untruncated)
-                elif kind == "daemon":
-                    line = chatlog_format_daemon(event, untruncated=untruncated)
-                elif kind == "direct":
-                    # Pre-rendered at write-time (tripwire fires,
-                    # watchdog markers, brake transitions, etc.) — no
-                    # formatter to call, just emit the stashed line.
-                    line = event.line
-                else:
-                    line = None
+                line = self._chatlog_format_bus_event(
+                    event, untruncated=untruncated,
+                )
             except Exception:
                 # A buggy formatter shouldn't take down the modal —
                 # skip the line and continue.
@@ -6633,8 +6693,8 @@ class CyberdeckApp(App):
     def _build_watchdog_context(
         self, *, max_events: int = 30
     ) -> str:
-        """Snapshot the most recent N events from the chatlog buffer
-        as plain text for the watchdog to reason over.
+        """Snapshot the most recent N chatlog-relevant bus events as
+        plain text for the watchdog to reason over.
 
         We re-use the chatlog formatters with untruncated=True so the
         watchdog sees full content (long thinking blocks, full
@@ -6653,34 +6713,39 @@ class CyberdeckApp(App):
             tell the watchdog WHEN entries were added, but those can
             scroll off the buffer. The header is the source of truth
             for "what's blacklisted right now."
+
+        Phase 6 source: iterates `self.bus.snapshot()` and uses the
+        same `_chatlog_format_bus_event` dispatcher as the magnified
+        view. Pre-Phase-6 source was a separate `_chatlog_event_buffer`
+        deque whose readers had a fleet/daemon-only filter that
+        silently dropped tripwire/brake/blacklist/etc. markers despite
+        the watchdog system prompt instructing the model to read them.
+        Bus snapshot fixes that bug class structurally — every event
+        the netrunner sees in the chatlog is also visible to the
+        watchdog's Q&A context.
         """
-        # Tail of the buffer — most recent first in the deque, but we
-        # want chronological order in the prompt so the model reads
-        # left-to-right like a story.
-        tail = list(self._chatlog_event_buffer)[-max_events:]
+        # Tail of the bus snapshot — chronological order, capped at
+        # max_events so we don't waste tokens on a long history when
+        # the netrunner cares about recent activity. Pre-filter to
+        # chatlog-relevant kinds so the cap is measured in things-
+        # the-netrunner-saw rather than total bus volume (otherwise
+        # a busy fleet with system_init / rate_limit churn would
+        # eat the whole budget on events the chatlog formatter
+        # returns None for).
+        relevant: list[tuple[DeckEvent, str]] = []
+        if getattr(self, "bus", None) is not None:
+            for event in self.bus.snapshot():
+                try:
+                    line = self._chatlog_format_bus_event(
+                        event, untruncated=True,
+                    )
+                except Exception:
+                    continue
+                if line is not None:
+                    relevant.append((event, line))
+        tail = relevant[-max_events:]
         lines: list[str] = []
-        for kind, event in tail:
-            try:
-                if kind == "fleet":
-                    line = chatlog_format_fleet(event, untruncated=True)
-                elif kind == "daemon":
-                    line = chatlog_format_daemon(event, untruncated=True)
-                elif kind == "direct":
-                    # Pre-rendered markers (tripwire fires, brake
-                    # transitions, blacklist additions, watchdog
-                    # authoring announcements, goal-update markers).
-                    # The watchdog system prompt explicitly tells the
-                    # model to read these from the chatlog — without
-                    # this branch, those markers were filtered out of
-                    # the Q&A context even though the system prompt
-                    # invoked them. Silent half-instruction. Caught
-                    # 2026-04-29 alongside the parallel magnified-view
-                    # bug; same root cause.
-                    line = event.line
-                else:
-                    line = None
-            except Exception:
-                continue
+        for event, line in tail:
             if line is None:
                 continue
             # Strip Rich markup tags. The model doesn't need them and

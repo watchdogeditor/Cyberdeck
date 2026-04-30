@@ -464,3 +464,14 @@ class Kind:
     PLUGIN_LOADED = "plugin.loaded"
     PLUGIN_SCAN_ERROR = "plugin.scan_error"
     PLUGIN_SCAN_COMPLETE = "plugin.scan_complete"
+
+    # Direct chatlog writes (Phase 6). Pre-rendered lines that the TUI
+    # composes itself (tripwire fire chrome, brake transition lines,
+    # blacklist additions, goal-update markers, watchdog Q&A
+    # markers, authoring announcements). The line is in event.text;
+    # subscribers wanting the raw events should subscribe to the
+    # source kinds (tripwire.fire, brake.change, blacklist.added,
+    # etc.) instead. Phase 6 also retires the standalone
+    # `_chatlog_event_buffer` deque on CyberdeckApp — bus is now the
+    # single source of truth for "what's been on the chatlog."
+    CHATLOG_DIRECT = "chatlog.direct"
