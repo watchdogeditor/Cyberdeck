@@ -101,8 +101,10 @@ TERMINAL_PANE_STATES = ("done", "failed", "killed", "redirected")
 # explicit ConstructPane handling in action_primary if/when we want
 # per-pane expand.
 _EXPANDABLE_RICHLOGS: dict[str, str] = {
-    "chatlog_log": "Chatlog",
-    "fleet_log":   "Fleet log",
+    "chatlog_log":  "Chatlog",
+    "fleet_log":    "Fleet log",
+    "watchdog_log": "Watchdog",
+    "daemon_log":   "Daemon",
 }
 
 
