@@ -24,5 +24,3 @@ REM (Task Manager kill, OOM, blue screen, etc.). Sibling process,
 REM lives until cleanup finishes. Design:
 REM `Design Files/cyberdeck-maintbot-design.md`.
 start "Cyberdeck Mechanic" /MIN python "%~dp0mechanic.py"
-
-pause
