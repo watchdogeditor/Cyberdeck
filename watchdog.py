@@ -139,19 +139,43 @@ intent.
 
 TRIPWIRE AWARENESS:
 The deck runs deterministic pattern matchers — "tripwires" — over
-construct events as they stream in. Tripwire fires render in the
-chatlog as:
+construct events as they stream in. Two flavors:
+
+  - DEFAULT tripwires ship with the deck (credential-keyword and
+    destructive-SQL detection) and are always active.
+  - LLM-AUTHORED tripwires get composed at goal-start and on
+    non-clarification goal-update (`e`). The watchdog (you, in
+    authoring mode) writes goal-specific regex rules. Lifecycle is
+    "replace, don't accumulate" — each authoring pass clears the
+    prior LLM-authored rules and registers fresh ones.
+
+Tripwire fires render in the chatlog as:
   `⚠ tripwire <name> on cx-XXXX: <excerpt>`
-Severity is part of the line color (today: low / warning / critical;
-slice 1 renders all the same, future slices will differ). Each fire
-means a construct's event content matched a registered pattern —
-NOT necessarily that the construct did something wrong. Tripwires
-are heuristic; they're a hint to look closer, not a verdict.
+Severity is part of the line color (low=dim, warning=yellow,
+critical=red; current rendering is uniform per fire — a per-severity
+routing slice is still pending). Each fire means a construct's event
+content matched a registered pattern — NOT necessarily that the
+construct did something wrong. Tripwires are heuristic; they're a
+hint to look closer, not a verdict.
+
+Authoring outcomes also surface in the chatlog:
+  - `[watchdog] +N tripwires authored (fork|fresh, Xs): name1, name2…`
+    means an authoring pass landed N rules. `fork` means the
+    authoring subprocess inherited Q&A context via `--resume`;
+    `fresh` means it ran without that context.
+  - `[watchdog] authoring 0 tripwires … no rules applied` means the
+    model decided the goal didn't warrant any rules. Legitimate
+    outcome, not a failure.
+  - `[watchdog] tripwire authoring failed` means the pass didn't
+    produce parseable JSON or the subprocess errored. The default
+    rules are still active in this case.
+
 If the netrunner asks about a tripwire fire, quote the line + the
 construct's recent activity. If they ask "any tripwires fired?" /
-"what tripwires are active?", report what's in the chatlog. The
-authoritative tripwire registry isn't visible to you directly today
-(slice 2 will plumb that through); rely on the chatlog markers.
+"what tripwires are active?", report what's in the chatlog
+(authoring lines + fire lines). You don't have a live view of the
+registry beyond what's in the chatlog snippet — if the snippet is
+old, say so rather than guessing.
 
 Answer concisely — typically 1-3 short paragraphs. The netrunner is
 glancing at your answer between actions, not reading an essay. If
@@ -533,6 +557,15 @@ class Watchdog:
         # respawns it. Kept None when streaming_mode=False.
         self._streaming_proc: Optional[asyncio.subprocess.Process] = None
         self._streaming_question_count: int = 0
+        # Server-side session_id captured from the streaming
+        # subprocess's first `system`/`init` event. Used by tripwire
+        # authoring (slice 2) to spawn a forked `claude -p --resume
+        # <id>` so authoring inherits Q&A conversation context without
+        # writing back into the running streaming session. Cleared on
+        # subprocess death / kill / shutdown so a respawn captures a
+        # fresh id rather than handing out a stale one.
+        # Same pattern as daemon._session_id.
+        self._session_id: Optional[str] = None
 
     async def start(self) -> None:
         """Spin up the worker loop. Idempotent — calling start twice
@@ -603,6 +636,213 @@ class Watchdog:
     def is_busy(self) -> bool:
         """True if a question is currently being processed."""
         return self._current is not None
+
+    async def author_tripwires(
+        self,
+        goal: str,
+        *,
+        classification: Optional[str] = None,
+        old_goal: Optional[str] = None,
+        brake_label: str = "default",
+        blacklist_summary: Optional[list[str]] = None,
+        timeout: float = 60.0,
+    ) -> "TripwireAuthoringResult":
+        """Run one LLM-authored tripwire pass for a freshly-set or
+        updated goal.
+
+        Substrate: a fresh `claude -p` one-shot subprocess. When the
+        watchdog has a captured streaming session_id (rung 1), the
+        one-shot is invoked with `--resume <id>` so it forks the
+        running Q&A session and inherits its conversation context —
+        the authoring model sees what the watchdog has already
+        observed. When no session id is captured (rung 2 — streaming
+        not yet warmed, or watchdog in one-shot mode), we spawn a
+        plain fresh subprocess; the authoring model still has the
+        goal + brake + defaults + blacklist context from the user
+        message, just no Q&A history.
+
+        Lifecycle: this method clears all prior LLM_AUTHORED tripwires
+        from the engine BEFORE registering the new ones. Defaults /
+        manual / blacklist-derived entries stay untouched. "Replace,
+        don't accumulate" — old-goal rules don't linger after a pivot.
+
+        Fire-and-forget at the call site is the expected pattern:
+        callers `asyncio.create_task(...)` this and render the result
+        in a callback, so goal-set / goal-update flow doesn't block
+        on subprocess startup. The method itself is a regular async
+        coroutine that returns when the pass completes (success or
+        failure); no callbacks here.
+
+        Returns a TripwireAuthoringResult so the caller can render an
+        accurate chatlog summary (registered count, rejected count
+        with reasons, used_resume label, error if the whole thing
+        failed).
+        """
+        from tripwires import (
+            TripwireAuthoringResult,
+            TRIPWIRE_AUTHORING_SYSTEM_PROMPT,
+            build_authoring_user_prompt,
+            parse_authoring_response,
+            DEFAULT_TRIPWIRES,
+            Origin,
+        )
+
+        started_at = time.time()
+        blacklist_summary = blacklist_summary or []
+
+        # Build the prompt. System block prepended to the user body
+        # because (1) rung-1 forks resume a session whose system prompt
+        # is already the Q&A one, and (2) --append-system-prompt with
+        # multi-line content has Windows argv-mangling issues. Single
+        # source of truth across both rungs.
+        user_body = build_authoring_user_prompt(
+            goal=goal,
+            classification=classification,
+            old_goal=old_goal,
+            brake_label=brake_label,
+            defaults_summary=list(DEFAULT_TRIPWIRES),
+            blacklist_summary=blacklist_summary,
+        )
+        full_prompt = (
+            TRIPWIRE_AUTHORING_SYSTEM_PROMPT
+            + "\n\n---\n\n"
+            + user_body
+        )
+
+        # Decide rung. Rung 1 needs a live streaming subprocess AND a
+        # captured session_id; either missing means we're rung 2.
+        # Streaming-mode-disabled watchdogs (one-shot Q&A) always go
+        # rung 2 since there's no session to fork.
+        use_resume = bool(
+            self.streaming_mode
+            and self._streaming_proc is not None
+            and self._streaming_proc.returncode is None
+            and self._session_id is not None
+        )
+        resume_id = self._session_id if use_resume else None
+
+        # Resolve binary, build command. bypassPermissions is the same
+        # setting Q&A uses — authoring is read-only reasoning, never
+        # executes tools, so the strictest non-blocking permission is
+        # appropriate.
+        bin_path = shutil.which(self.claude_bin) or self.claude_bin
+        cmd = [
+            bin_path,
+            "-p",
+            "--permission-mode", "bypassPermissions",
+        ]
+        if resume_id:
+            cmd += ["--resume", resume_id]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd,
+            )
+        except FileNotFoundError:
+            return TripwireAuthoringResult(
+                success=False, registered=[], rejected=[],
+                used_resume=use_resume,
+                error=f"claude binary not found: {self.claude_bin}",
+                elapsed_s=time.time() - started_at,
+            )
+        except Exception as e:
+            return TripwireAuthoringResult(
+                success=False, registered=[], rejected=[],
+                used_resume=use_resume,
+                error=f"subprocess spawn failed: {e}",
+                elapsed_s=time.time() - started_at,
+            )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=full_prompt.encode("utf-8")),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            return TripwireAuthoringResult(
+                success=False, registered=[], rejected=[],
+                used_resume=use_resume,
+                error=f"authoring timed out after {timeout:.0f}s",
+                elapsed_s=time.time() - started_at,
+            )
+
+        if proc.returncode != 0:
+            err_text = stderr.decode("utf-8", errors="replace").strip()
+            return TripwireAuthoringResult(
+                success=False, registered=[], rejected=[],
+                used_resume=use_resume,
+                error=(
+                    f"claude exited {proc.returncode}: "
+                    f"{err_text[:200] if err_text else '(no stderr)'}"
+                ),
+                elapsed_s=time.time() - started_at,
+            )
+
+        raw_output = stdout.decode("utf-8", errors="replace").strip()
+        if not raw_output:
+            return TripwireAuthoringResult(
+                success=False, registered=[], rejected=[],
+                used_resume=use_resume,
+                error="claude returned empty output",
+                elapsed_s=time.time() - started_at,
+            )
+
+        # Parse + validate the JSON response.
+        parsed_tws, rejected = parse_authoring_response(raw_output)
+
+        # Lifecycle: clear prior LLM_AUTHORED entries BEFORE registering
+        # the new ones. If the parse failed (parsed empty + a single
+        # "(response)" rejection entry), we still want to drop the old
+        # rules — the model's intent for THIS goal is "no rules apply"
+        # or "rules in unparseable form"; either way the old goal's
+        # rules shouldn't carry over.
+        cleared = self.tripwires.clear_by_origin(Origin.LLM_AUTHORED)
+
+        # Register survivors. The engine's `register` returns False on
+        # regex-compile failures — track those as additional rejections
+        # so the chatlog summary is accurate.
+        registered = []
+        for tw in parsed_tws:
+            if self.tripwires.register(tw):
+                registered.append(tw)
+            else:
+                rejected.append(
+                    (tw.name, "engine rejected (regex compile failed)")
+                )
+
+        # Treat the pass as successful if either we registered at least
+        # one tripwire OR the parse succeeded but legitimately returned
+        # an empty list (model decided no rules were warranted). The
+        # only "failure" shape at this layer is "couldn't parse the
+        # response at all" — and even then we've still cleared old
+        # rules, which is intentional (don't keep stale rules around
+        # when authoring goes sideways).
+        parse_failure = (
+            not registered
+            and rejected
+            and rejected[0][0] == "(response)"
+        )
+
+        return TripwireAuthoringResult(
+            success=not parse_failure,
+            registered=registered,
+            rejected=rejected,
+            used_resume=use_resume,
+            error=(
+                rejected[0][1] if parse_failure else None
+            ),
+            elapsed_s=time.time() - started_at,
+            raw_response=raw_output if parse_failure else "",
+        )
 
     async def _worker_loop(self) -> None:
         """Drain the queue, processing one question at a time."""
@@ -719,7 +959,11 @@ class Watchdog:
             wq.error = f"streaming stdin write failed: {e}"
             wq.answered_at = time.time()
             # Subprocess is dead — clear so the next ask respawns.
+            # Drop the captured session_id with it; the respawned
+            # subprocess will get a fresh one (and authoring shouldn't
+            # try to fork onto a dead session in the meantime).
             self._streaming_proc = None
+            self._session_id = None
             self._safe_callback(wq)
             return
 
@@ -764,6 +1008,7 @@ class Watchdog:
             wq.error = "streaming subprocess exited mid-question"
             wq.answered_at = time.time()
             self._streaming_proc = None  # respawn on next ask
+            self._session_id = None
             self._safe_callback(wq)
             return
 
@@ -816,6 +1061,7 @@ class Watchdog:
                         pass  # subprocess truly stuck; give up
         finally:
             self._streaming_proc = None
+            self._session_id = None
 
     async def _spawn_streaming(self) -> None:
         """Start the persistent streaming subprocess. Mirrors
@@ -887,6 +1133,20 @@ class Watchdog:
             except json.JSONDecodeError:
                 continue
 
+            # Capture session_id from the first `system`/`init` event.
+            # Slice 2 tripwire authoring forks the watchdog's session
+            # via `--resume <id>` for one-shot authoring calls; that
+            # requires knowing the id, which the streaming subprocess
+            # only surfaces here in the event stream. Same pattern as
+            # daemon.py's session capture (and we capture once — first
+            # id wins; the streaming subprocess holds one session for
+            # its lifetime).
+            if (raw.get("type") == "system"
+                    and raw.get("subtype") == "init"):
+                sid = raw.get("session_id")
+                if sid and self._session_id is None:
+                    self._session_id = sid
+
             # Capture assistant text as it streams in.
             if raw.get("type") == "assistant":
                 for block in raw.get("message", {}).get("content", []):
@@ -948,6 +1208,7 @@ class Watchdog:
             pass
         finally:
             self._streaming_proc = None
+            self._session_id = None
 
     async def _process_oneshot(self, wq: WatchdogQuestion) -> None:
         """Run one question through `claude -p` and fire the callback.

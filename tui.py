@@ -61,7 +61,7 @@ from watchdog import (
     WatchdogHistory,
     _fingerprint as _blacklist_fingerprint,
 )
-from tripwires import TripwireFire
+from tripwires import TripwireFire, TripwireAuthoringResult
 from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
@@ -3613,6 +3613,13 @@ class CyberdeckApp(App):
         if self._daemon_task is not None and not self._daemon_task.done():
             return  # already running
         self._daemon_task = asyncio.create_task(self._drive_daemon())
+        # Slice 2: kick off LLM-authored tripwire pass for this goal.
+        # Fire-and-forget — the daemon spins up immediately; authoring
+        # runs in parallel and surfaces in the chatlog when complete.
+        # First few construct events may stream in before authored
+        # rules land, which is fine — the two default deck-wide
+        # tripwires (credentials, destructive SQL) cover the baseline.
+        self._kick_off_tripwire_authoring()
 
     def _build_daemon_system_prompt(self) -> str:
         """Compose the daemon's system prompt with profile + brake awareness.
@@ -4287,36 +4294,29 @@ class CyberdeckApp(App):
 
         Buffer side-effect (`buffer_direct=True`, default): the line
         also lands in `_chatlog_event_buffer` under kind="direct" so
-        the magnified view (`z` ExpandModal) and the watchdog Q&A
-        context-builder can both see it. Without this push,
-        non-fleet/daemon markers (tripwire fires + authoring
-        announcements, brake transitions, blacklist additions,
-        goal-update markers, watchdog Q&A lines) are invisible to
-        both readers — the buffer was previously only fed by
-        FleetEvent / DaemonEvent routing. Verified real-deck:
+        the magnified view (`z` ExpandModal) can replay it. Without
+        this push, non-fleet/daemon markers (tripwire fires +
+        authoring announcements, brake transitions, blacklist
+        additions, goal-update markers, watchdog Q&A lines) are
+        invisible in the magnified view — the buffer used to be fed
+        only by FleetEvent / DaemonEvent routing. Verified real-deck:
         magnified-z showed only fleet/daemon lines while the small
-        chatlog had all the markers; sibling discovery was that the
-        watchdog Q&A context had the same blind spot, which made the
-        TRIPWIRE / BRAKE / BLACKLIST AWARENESS paragraphs in the
-        watchdog system prompt partially vestigial — the model was
-        instructed to read markers that never actually reached its
-        context.
+        chatlog had all the markers; netrunner couldn't tell what
+        actually happened.
 
         Why the opt-out parameter: the fleet/daemon dispatch paths
         (`_handle_event`, `_handle_daemon_event`) call this AND then
         explicitly push the original FleetEvent / DaemonEvent into
-        the buffer. The original-event push is what lets downstream
-        readers re-render with `untruncated=True` (richer content
-        than the truncated live line). Without `buffer_direct=False`
-        on those paths, every fleet/daemon event would land in the
+        the buffer. The original-event push is what lets the magnified
+        view re-render with `untruncated=True` (richer content than
+        the truncated live line). Without `buffer_direct=False` on
+        those paths, every fleet/daemon event would land in the
         buffer twice — once as a "direct" pre-rendered line, once as
         the original event object — and the magnified view would
         show duplicates with slightly different content. The default
         is True so future direct-write callers (tripwire, watchdog,
         brake, blacklist, goal-update markers, and anything new) are
-        covered automatically with no per-callsite opt-in. This is
-        a tactical fix; the strategic fix is the unified event
-        stream slice — see `cyberdeck-event-stream-design.md`.
+        covered automatically with no per-callsite opt-in.
         """
         try:
             chatlog = self.query_one("#chatlog_log", RichLog)
@@ -4333,11 +4333,10 @@ class CyberdeckApp(App):
         now = time.time()
         ts = time.strftime("%H:%M:%S", time.localtime(now))
         chatlog.write(f"[dim]{ts}[/dim]  {line}")
-        # Buffer for the magnified-view replay and watchdog Q&A
-        # context. Pre-rendered line is stashed as-is — no formatter
-        # to re-run since the caller already did the markup composition.
-        # Skipped for fleet/daemon paths that push the original event
-        # separately (see docstring).
+        # Buffer for the magnified-view replay. Pre-rendered line is
+        # stashed as-is — no formatter to re-run since the caller
+        # already did the markup composition. Skipped for fleet/daemon
+        # paths that push the original event separately (see docstring).
         if buffer_direct:
             self._chatlog_event_buffer.append((
                 "direct",
@@ -6030,6 +6029,177 @@ class CyberdeckApp(App):
         except Exception:
             pass
 
+    # ---- slice 2: LLM-authored tripwires --------------------------------
+    #
+    # Authoring trigger points are goal-start (handled inside
+    # _start_daemon_task so both --goal launch and idle→running submit
+    # share one path) and explicit non-clarification goal-update via
+    # `e` (handled in _handle_goal_submitted's mid-flight branch).
+    # Clarifications skip authoring — the model already authored for
+    # this goal direction and the netrunner is just adding detail.
+    # Pivots and scope-changes re-author from scratch (clear
+    # LLM_AUTHORED, register fresh).
+
+    def _kick_off_tripwire_authoring(
+        self,
+        *,
+        classification: Optional[str] = None,
+        old_goal: Optional[str] = None,
+    ) -> None:
+        """Fire-and-forget the watchdog's tripwire authoring pass for
+        the current goal. Goal-set / goal-update flow doesn't block on
+        the LLM call; the result lands in the chatlog when ready.
+
+        Skips if there's no goal or no watchdog. Defensive — neither
+        condition should hit in practice (callers gate before calling)
+        but the no-ops keep this safe to invoke from anywhere."""
+        if not self.goal:
+            return
+        if self.watchdog is None:
+            return
+        self.run_worker(
+            self._author_tripwires_wrapper(
+                goal=self.goal,
+                classification=classification,
+                old_goal=old_goal,
+            ),
+            name="tripwire-authoring",
+            exclusive=False,
+        )
+
+    async def _author_tripwires_wrapper(
+        self,
+        *,
+        goal: str,
+        classification: Optional[str],
+        old_goal: Optional[str],
+    ) -> None:
+        """Snapshot deck context, run the watchdog authoring pass, and
+        render the result. Spawned as a worker by
+        _kick_off_tripwire_authoring; never called directly from the
+        netrunner-facing flow.
+
+        Context snapshot includes brake state and active blacklist
+        entries — the prompt builder uses both to avoid duplicating
+        brake-hook coverage and to author sharper rules around the
+        netrunner's already-rejected task shapes."""
+        if self.watchdog is None:
+            return
+
+        # Snapshot context. Both reads are cheap and synchronous; we
+        # do them at task-spawn time rather than inside the watchdog
+        # so the authoring substrate stays ignorant of TUI globals.
+        brake_label = self.brake_state_store.state.value
+        blacklist_summary = [
+            entry.short_summary()
+            for entry in self.watchdog.blacklist.entries
+        ]
+
+        # Start announcement. Dim because authoring is a background
+        # event the netrunner doesn't need to attend to — they'll see
+        # the registered count when it finishes.
+        try:
+            self._chatlog_write(
+                "[dim]\\[watchdog] authoring tripwires for current goal…[/dim]"
+            )
+        except Exception:
+            pass
+
+        try:
+            result = await self.watchdog.author_tripwires(
+                goal,
+                classification=classification,
+                old_goal=old_goal,
+                brake_label=brake_label,
+                blacklist_summary=blacklist_summary,
+            )
+        except Exception as e:
+            try:
+                self._chatlog_write(
+                    f"[red]\\[watchdog] tripwire authoring crashed:[/red] "
+                    f"[dim]{e}[/dim]"
+                )
+            except Exception:
+                pass
+            return
+
+        self._render_tripwire_authoring_result(result)
+
+    def _render_tripwire_authoring_result(
+        self, result: "TripwireAuthoringResult",
+    ) -> None:
+        """Render the chatlog summary for one authoring pass.
+
+        Three shapes:
+          - failure: red line with reason; raw response preview if
+            parse-failure (so the netrunner can see what the model
+            actually said when it didn't output JSON).
+          - success, empty: dim line noting the model decided no rules
+            applied. Legitimate outcome — better than padding with
+            weak rules.
+          - success, non-empty: yellow line with registered count +
+            names. Rejected entries (validation failures, regex
+            compile failures) get one dim line each so the netrunner
+            can see what didn't make it and why.
+        """
+        rung = "fork" if result.used_resume else "fresh"
+        elapsed = f"{result.elapsed_s:.1f}s"
+
+        if not result.success:
+            try:
+                self._chatlog_write(
+                    f"[red]\\[watchdog] tripwire authoring failed[/red] "
+                    f"[dim]({rung}, {elapsed}):[/dim] {result.error}"
+                )
+                if result.raw_response:
+                    # Bracket-escape so any [foo] in the raw response
+                    # doesn't confuse Rich markup. Truncate to keep
+                    # the chatlog readable.
+                    preview = (
+                        result.raw_response[:200]
+                        .replace("[", r"\[")
+                        .replace("\n", " ")
+                    )
+                    self._chatlog_write(
+                        f"[dim]   raw preview: {preview}…[/dim]"
+                    )
+            except Exception:
+                pass
+            return
+
+        n_reg = len(result.registered)
+        n_rej = len(result.rejected)
+
+        if n_reg == 0 and n_rej == 0:
+            try:
+                self._chatlog_write(
+                    f"[dim]\\[watchdog] authored 0 tripwires "
+                    f"({rung}, {elapsed}) — no rules applied[/dim]"
+                )
+            except Exception:
+                pass
+            return
+
+        try:
+            names = ", ".join(tw.name for tw in result.registered) or "(none)"
+            line = (
+                f"[yellow]\\[watchdog] +{n_reg} tripwires authored[/yellow] "
+                f"[dim]({rung}, {elapsed}):[/dim] {names}"
+            )
+            if n_rej:
+                line += f" [dim](rejected {n_rej})[/dim]"
+            self._chatlog_write(line)
+            for label, reason in result.rejected:
+                # Names from the model could plausibly contain brackets
+                # in pathological cases; escape defensively.
+                label_safe = str(label).replace("[", r"\[")
+                reason_safe = str(reason).replace("[", r"\[")
+                self._chatlog_write(
+                    f"[dim]   rejected {label_safe}: {reason_safe}[/dim]"
+                )
+        except Exception:
+            pass
+
     def _handle_blacklist_event(self, event: dict) -> None:
         """Receive blacklist events from the Watchdog's Blacklist
         instance. Today only fires on `blacklist_added`; future
@@ -6819,6 +6989,19 @@ class CyberdeckApp(App):
                 f"{goal[:100]}{'...' if len(goal) > 100 else ''}"
             )
             self.session.set_pending_goal_update(goal, classification, old_goal)
+            # Slice 2: re-author tripwires on scope-change / pivot —
+            # the watch patterns for the new direction may differ from
+            # the old. Skip on clarification: the netrunner is adding
+            # detail to the existing goal, the model already authored
+            # for this direction, re-running burns tokens for no
+            # signal change. The clear-LLM_AUTHORED-then-register
+            # lifecycle inside author_tripwires drops yesterday's
+            # rules cleanly when we do re-author.
+            if classification != "clarification":
+                self._kick_off_tripwire_authoring(
+                    classification=classification,
+                    old_goal=old_goal,
+                )
             return
 
         # Idle branch: set or replace goal, start daemon. Same as
