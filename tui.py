@@ -2248,9 +2248,19 @@ class ExpandModal(ModalScreen[None]):
         snapshot_lines: list,
         source_widget_id: Optional[str] = None,
         provider: Optional["Callable[[], list]"] = None,
+        start_at_end: bool = False,
     ) -> None:
         super().__init__()
         self.title_text = title
+        # Chat-shaped sources (chatlog, daemon log, watchdog log,
+        # fleet log, construct pane logs) want the modal to open at
+        # the most recent content, not the oldest. Set start_at_end=
+        # True at the call site for those; defaults False so
+        # random-access list views (files, profiles, scripts) still
+        # open at the top. Only applied on initial mount — refresh
+        # preserves whatever scroll position the netrunner was at,
+        # so a mid-read refresh doesn't yank them away.
+        self.start_at_end = start_at_end
         # The snapshot is a list of pre-rendered lines. Each entry can
         # be either:
         #   - a markup string (from chatlog provider): RichLog parses
@@ -2302,6 +2312,14 @@ class ExpandModal(ModalScreen[None]):
 
     def on_mount(self) -> None:
         self._populate()
+        # QOL: chat-shaped views open at the most recent content. Only
+        # on initial mount — refresh keeps current scroll position so a
+        # mid-read refresh doesn't jump the netrunner away from what
+        # they were looking at.
+        if self.start_at_end:
+            b = self._body()
+            if b is not None:
+                b.scroll_end(animate=False)
 
     # ---- scroll actions -----------------------------------------------
     # All scroll actions target #expand_body (the inner RichLog).
@@ -5690,6 +5708,9 @@ class CyberdeckApp(App):
                 snapshot_lines=pane.render_buffer(untruncated=True),
                 source_widget_id=None,
                 provider=lambda p=pane: p.render_buffer(untruncated=True),
+                # Chronological pane log — open on the most recent
+                # event, not the oldest.
+                start_at_end=True,
             ))
             return
 
@@ -5704,6 +5725,8 @@ class CyberdeckApp(App):
                 snapshot_lines=self._render_chatlog_buffer(untruncated=True),
                 source_widget_id="chatlog_log",
                 provider=lambda: self._render_chatlog_buffer(untruncated=True),
+                # Chronological chatlog — open at most recent event.
+                start_at_end=True,
             ))
             return
 
@@ -5718,10 +5741,16 @@ class CyberdeckApp(App):
                 else None
             )
             snapshot = _snapshot_richlog(focused)
+            # Every entry in _EXPANDABLE_RICHLOGS today is chronological
+            # (fleet_log, daemon_log, watchdog_log) — open the modal at
+            # the most recent line. ListView paths and ad-hoc RichLogs
+            # outside the registry still default to top-of-document.
+            chat_shaped = focused.id in _EXPANDABLE_RICHLOGS
             self.push_screen(ExpandModal(
                 title=title,
                 snapshot_lines=snapshot,
                 source_widget_id=source_id,
+                start_at_end=chat_shaped,
             ))
             return
 
@@ -6655,6 +6684,16 @@ class CyberdeckApp(App):
         """
         if not question:
             return
+        # QOL: switch the bottom tab to Watchdog so the netrunner sees
+        # their question land + the eventual answer arrive without
+        # having to manually click over. The TabbedContent fires no
+        # extra side effects on .active set; safe to do regardless of
+        # what was previously visible. Best-effort guard for pre-mount
+        # races.
+        try:
+            self.query_one("#daemon_bar", TabbedContent).active = "watchdog_tab"
+        except Exception:
+            pass
         # Show the question in chatlog immediately. The netrunner's
         # focus may have moved on by the time the answer comes back;
         # this anchors the eventual answer to a visible asked-line so
@@ -6928,6 +6967,15 @@ class CyberdeckApp(App):
                 "Press 'e' to set a goal and start one."
             )
             return
+
+        # QOL: switch the bottom tab to Daemon so the netrunner sees
+        # the message register in the daemon pane + watches the
+        # response arrive without a manual tab click. Symmetric with
+        # the watchdog path. Best-effort guard for pre-mount races.
+        try:
+            self.query_one("#daemon_bar", TabbedContent).active = "daemon_tab"
+        except Exception:
+            pass
 
         # Stash for next outcome turn delivery
         self.session.set_pending_netrunner_message(message)
