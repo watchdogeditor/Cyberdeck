@@ -151,7 +151,6 @@ class Fleet:
         claude_bin: str = "claude",
         permission_mode: str = "bypassPermissions",
         log_path: Optional[Path] = None,
-        on_event: Optional[Callable[["FleetEvent"], None]] = None,
         quiet: bool = False,
         install_signal_handlers: bool = True,
         max_concurrent: int = 5,
@@ -220,22 +219,15 @@ class Fleet:
         # console runs without a TUI to host the monitor).
         self.connection_state_provider = connection_state_provider
 
-        # Phase 2 of the unified-event-stream slice. When the deck
-        # passes a bus, every FleetEvent dispatched through `_listeners`
-        # ALSO publishes a translated DeckEvent on the bus. Existing
-        # listener subscribers (e.g., the TUI's `_handle_event`) keep
-        # working unchanged — bus is purely additive during the
-        # migration. None when fleet.py runs standalone (the console
-        # entry point) without a TUI to host the bus. See
-        # `Design Files/cyberdeck-event-stream-design.md` for the
-        # phased migration plan.
+        # Bus is the only fan-out path. Phase 8 of the unified-event-
+        # stream slice retired the legacy `on_event=` kwarg + `_listeners`
+        # list + add_listener/remove_listener shims; every consumer now
+        # subscribes through bus.subscribe (bus filter `fleet.*`). bus
+        # may be None when fleet.py runs standalone (the `python fleet.py`
+        # console entry) — _render then publishes nothing and the
+        # console-print path (when not quiet) is the only output. See
+        # `Design Files/cyberdeck-event-stream-design.md`.
         self.bus = bus
-
-        # Listener list. The legacy `on_event` kwarg becomes the first
-        # listener for backward compat; new code should use add_listener().
-        self._listeners: list[Callable[[FleetEvent], None]] = []
-        if on_event is not None:
-            self._listeners.append(on_event)
 
         self._constructs: list[Construct] = []
         self._consumers: list[asyncio.Task] = []
@@ -266,19 +258,6 @@ class Fleet:
         self.total_cost_usd = 0.0
         self.total_tokens_in = 0
         self.total_tokens_out = 0
-
-    def add_listener(self, callback: Callable[["FleetEvent"], None]) -> None:
-        """Register an event listener. Listeners are called in registration
-        order for every event (both construct events and meta events).
-        Exceptions in one listener don't stop others."""
-        self._listeners.append(callback)
-
-    def remove_listener(self, callback: Callable[["FleetEvent"], None]) -> None:
-        """Unregister a previously-added listener. No-op if not registered."""
-        try:
-            self._listeners.remove(callback)
-        except ValueError:
-            pass
 
     # ---- external control ----------------------------------------------
 
@@ -356,20 +335,11 @@ class Fleet:
             "payload": fevent.payload,
         })
 
-        if self._listeners:
-            for listener in self._listeners:
-                try:
-                    listener(fevent)
-                except Exception as e:
-                    if not self.quiet:
-                        print(f"[fleet] listener {listener!r} raised: {e!r}")
-
-        # Phase 2: also publish to the unified bus when wired. This
-        # runs AFTER the legacy listener dispatch so existing
-        # subscribers are unaffected by any bus weirdness; the bus
-        # itself isolates per-callback exceptions independently.
-        # Translation: build a DeckEvent from the FleetEvent + payload
-        # type. See `_fleet_event_to_deck_event` for the kind mapping.
+        # Bus publish — the only fan-out path. Translation: build a
+        # DeckEvent from the FleetEvent + payload type. See
+        # `_fleet_event_to_deck_event` for the kind mapping. The bus
+        # itself isolates per-callback exceptions; the producer
+        # doesn't need its own try/except loop anymore.
         if self.bus is not None:
             deck_event = _fleet_event_to_deck_event(fevent)
             if deck_event is not None:

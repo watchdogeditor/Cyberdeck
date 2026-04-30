@@ -142,14 +142,34 @@ class DaemonSession:
         # its own thought worth surfacing.
         self._pending_netrunner_messages: list[str] = []
 
-        # Subscribe to fleet events so we can observe finalizes
-        self.fleet.add_listener(self._on_fleet_event)
+        # Subscribe to fleet events on the bus so we can observe
+        # finalizes. Phase 8 of the unified-event-stream slice
+        # replaced the legacy fleet.add_listener() shim with this
+        # bus subscription. The Subscription handle is held so we
+        # can unsubscribe in run()'s finally — same lifecycle as
+        # before, just routed through the canonical channel.
+        # Falls back to fleet.add_listener if no bus is wired (e.g.
+        # console runs of fleet.py without a TUI to host the bus) —
+        # but the legacy fan-out is gone too, so a no-bus DaemonSession
+        # never observes outcomes. That mode wasn't real (DaemonSession
+        # always runs alongside a TUI in practice); the guard is here
+        # so a future standalone caller doesn't silently break.
+        self._fleet_subscription = None
+        if self.bus is not None:
+            self._fleet_subscription = self.bus.subscribe(
+                self._on_fleet_event,
+                filter=["fleet.*"],
+                name="daemon_session.fleet_event",
+            )
 
     # ---- fleet event handling ------------------------------------------
 
-    def _on_fleet_event(self, fevent: FleetEvent) -> None:
-        """Called for every fleet event. We care about spawns (to track
-        task metadata) and finalizes (to feed outcomes back)."""
+    def _on_fleet_event(self, deck_event) -> None:
+        """Bus subscriber: fleet.* event arrived. We care about spawns
+        (to track task metadata) and finalizes (to feed outcomes back).
+
+        The DeckEvent's payload is the FleetEvent dataclass."""
+        fevent: FleetEvent = deck_event.payload
         if fevent.kind != "meta":
             return
         ptype = fevent.payload.get("type")
@@ -201,7 +221,12 @@ class DaemonSession:
                 self._pending_netrunner_messages = []  # consumed
                 await self._process_turn(message)
         finally:
-            self.fleet.remove_listener(self._on_fleet_event)
+            if self._fleet_subscription is not None:
+                try:
+                    self._fleet_subscription.unsubscribe()
+                except Exception:
+                    pass
+                self._fleet_subscription = None
 
     def set_pending_goal_update(
         self,

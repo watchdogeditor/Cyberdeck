@@ -87,19 +87,18 @@ class BrakeStateStore:
         self,
         state_path: Path,
         *,
-        on_change: Optional[BrakeListener] = None,
         bus: Optional[object] = None,
     ) -> None:
         self.state_path = Path(state_path)
         self._state: BrakeState = self.DEFAULT_STATE
-        self._listeners: list[BrakeListener] = []
-        if on_change is not None:
-            self._listeners.append(on_change)
-        # Phase 5 of the unified-event-stream slice. When wired,
-        # `set()` ALSO publishes a `brake.change` DeckEvent on the
-        # bus alongside the existing listener fan-out. Object type
-        # rather than EventBus to avoid a circular import — same
-        # reason as Phase 4's TripwireEngine / Blacklist.
+        # Bus is now the only fan-out path (Phase 8 of the
+        # unified-event-stream slice retired the legacy `on_change=`
+        # callback + `_listeners` list + add_listener/remove_listener
+        # shims). Object type rather than EventBus to avoid a circular
+        # import — bus-as-duck-type is the standing pattern across
+        # producers. None when running standalone (e.g. console tests
+        # without a TUI to host the bus); set() silently no-ops the
+        # publish in that case.
         self.bus = bus
 
     # ---- read API ----------------------------------------------------------
@@ -108,21 +107,6 @@ class BrakeStateStore:
     def state(self) -> BrakeState:
         """Current brake state. Read-only property; mutate via set()."""
         return self._state
-
-    # ---- listener wiring ---------------------------------------------------
-
-    def add_listener(self, listener: BrakeListener) -> None:
-        """Register a listener. Called synchronously on every transition,
-        in registration order. Listener errors are caught and logged
-        so one bad listener can't break others."""
-        self._listeners.append(listener)
-
-    def remove_listener(self, listener: BrakeListener) -> None:
-        """Unregister a listener. No-op if not registered."""
-        try:
-            self._listeners.remove(listener)
-        except ValueError:
-            pass
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -169,10 +153,11 @@ class BrakeStateStore:
         netrunner submits the brake modal without actually changing
         the value.
 
-        Persistence happens BEFORE listener fan-out so any listener
-        that re-reads from disk (unlikely but possible) sees the new
-        value. Listener errors are caught individually so one failure
-        doesn't cascade.
+        Persistence happens BEFORE bus publish so any subscriber that
+        re-reads from disk (unlikely but possible) sees the new value.
+        The bus's per-callback exception isolation handles subscriber
+        errors — the producer doesn't need its own catch-and-log loop
+        anymore (Phase 8 retired that legacy fan-out).
         """
         old_state = self._state
         if new_state == old_state:
@@ -184,24 +169,10 @@ class BrakeStateStore:
             new_state=new_state,
             reason=reason,
         )
-        for listener in list(self._listeners):
-            try:
-                listener(event)
-            except Exception as exc:
-                # Same posture as ConnectionMonitor and ProfileRegistry:
-                # listener errors surface to stderr but never break
-                # the broadcast loop. The deck's own listeners should
-                # be defensive enough that this doesn't fire in
-                # practice; this is the safety net.
-                print(
-                    f"brake_state: listener error: {exc!r}",
-                    file=sys.stderr,
-                )
-        # Phase 5: also publish on the bus when wired. Severity
-        # escalates with destination tier — yolo gets warning so
-        # subscribers can react to "constructs are now unrestricted"
-        # without inspecting payload state names. paranoid and
-        # default stay info; both are tightening or staying-baseline
+        # Severity escalates with destination tier — yolo gets warning
+        # so subscribers can react to "constructs are now unrestricted"
+        # without inspecting payload state names. paranoid and default
+        # stay info; both are tightening or staying-baseline
         # transitions.
         if self.bus is not None:
             try:

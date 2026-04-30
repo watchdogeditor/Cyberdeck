@@ -114,7 +114,8 @@ class ProfileRegistry:
     """Live view of the profiles directory.
 
     Lifecycle:
-      reg = ProfileRegistry(path, on_event=cb)
+      reg = ProfileRegistry(path, bus=bus)
+      bus.subscribe(cb, filter=["profile.*"])
       await reg.start()    # initial scan + start watcher
       ...                  # registry maintains itself in the background
       await reg.shutdown() # cancel watcher, idempotent
@@ -134,18 +135,16 @@ class ProfileRegistry:
         self,
         profiles_dir: Path,
         *,
-        on_event: Optional[ProfileEventListener] = None,
         poll_interval: float = 1.0,
         bus: Optional[object] = None,
     ) -> None:
         self.profiles_dir = Path(profiles_dir)
         self.poll_interval = poll_interval
-        self._listeners: list[ProfileEventListener] = []
-        if on_event is not None:
-            self._listeners.append(on_event)
-        # Phase 5 of the unified-event-stream slice. When wired,
-        # `_emit` ALSO publishes a `profile.<kind>` DeckEvent on the
-        # bus alongside the legacy listener fan-out.
+        # Bus is the only fan-out path (Phase 8 of the unified-event-
+        # stream slice retired the legacy `on_event=` callback +
+        # `_listeners` list + add_listener/remove_listener shims). bus
+        # may be None when running standalone without a TUI to host
+        # the bus; _emit then silently drops events.
         self.bus = bus
 
         # Authoritative state
@@ -161,34 +160,14 @@ class ProfileRegistry:
         self._task: Optional[asyncio.Task] = None
         self._started = False
 
-    # ---- listener wiring ---------------------------------------------------
-
-    def add_listener(self, listener: ProfileEventListener) -> None:
-        """Register a listener. Listener is called for every event,
-        synchronously, on the asyncio event loop thread."""
-        self._listeners.append(listener)
-
-    def remove_listener(self, listener: ProfileEventListener) -> None:
-        try:
-            self._listeners.remove(listener)
-        except ValueError:
-            pass
+    # ---- emission ----------------------------------------------------------
 
     def _emit(self, event: ProfileEvent) -> None:
-        for listener in list(self._listeners):
-            try:
-                listener(event)
-            except Exception as e:
-                # Listener errors must never break the watcher loop.
-                # Surface to stderr so the netrunner sees it, then
-                # carry on.
-                print(
-                    f"profile_registry: listener error: {e!r}",
-                    file=sys.stderr,
-                )
-        # Phase 5: also publish on the bus when wired. ProfileEvent
-        # already has a `kind` field that maps cleanly to dotted-
-        # namespace; scan_error escalates to warning severity.
+        # ProfileEvent already has a `kind` field that maps cleanly
+        # to the bus's dotted-namespace; scan_error escalates to
+        # warning severity. Per-callback exception isolation lives
+        # on the bus itself, so the producer doesn't need its own
+        # catch-and-log loop anymore.
         if self.bus is not None:
             try:
                 from event_bus import DeckEvent

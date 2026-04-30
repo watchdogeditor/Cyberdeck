@@ -3130,8 +3130,17 @@ class CyberdeckApp(App):
         # Tools tab can stay in sync.
         self.profile_registry = ProfileRegistry(
             self.profiles_dir,
-            on_event=self._handle_profile_event,
             bus=self.bus,
+        )
+        # Phase 8: subscribe via the bus instead of the legacy
+        # `on_event=` callback. Filter `profile.*` matches every
+        # ProfileEvent kind (added, changed, removed, scan_complete,
+        # scan_error). Handler receives DeckEvent whose payload is
+        # the ProfileEvent.
+        self.bus.subscribe(
+            self._handle_profile_event,
+            filter=["profile.*"],
+            name="tui.profile_event",
         )
         # Plugins directory: defaults next to profiles. Plugins are
         # capability bundles (manifest + README + entry script) that
@@ -3142,8 +3151,13 @@ class CyberdeckApp(App):
         self.plugins_dir = self.home_dir / "plugins"
         self.plugin_registry = PluginRegistry(
             self.plugins_dir,
-            on_event=self._handle_plugin_event,
             bus=self.bus,
+        )
+        # Phase 8: bus subscription (same pattern as profile_registry).
+        self.bus.subscribe(
+            self._handle_plugin_event,
+            filter=["plugin.*"],
+            name="tui.plugin_event",
         )
         # Watchdog Q&A oracle. Async question→answer pipe backed by
         # one-shot `claude -p` invocations. The simpler half of the
@@ -3188,8 +3202,16 @@ class CyberdeckApp(App):
         # parking, recovery flow. This monitor exposes the state +
         # events that those consumers will subscribe to.
         self.connection_monitor = ConnectionMonitor(
-            on_state_change=self._handle_connection_change,
             bus=self.bus,
+        )
+        # Phase 8: bus subscription replaces the legacy
+        # `on_state_change=` callback. Filter `connection.transition`
+        # is the single kind connection_monitor publishes; handler
+        # receives DeckEvent whose payload is the StateChangeEvent.
+        self.bus.subscribe(
+            self._handle_connection_change,
+            filter=["connection.transition"],
+            name="tui.connection_change",
         )
         # Brake state — deck-global enum (paranoid/default/yolo) that
         # gates what constructs are permitted to do at runtime. The
@@ -3201,13 +3223,20 @@ class CyberdeckApp(App):
         # (vendored at startup) for the actual enforcement layer.
         self.brake_state_store = BrakeStateStore(
             state_path=self.home_dir / ".cyberdeck" / "state.json",
-            on_change=self._handle_brake_change,
             bus=self.bus,
         )
         # Loaded synchronously in __init__ rather than on_mount so
         # any spawn (including the initial pool warm-up) sees the
         # netrunner's last-set brake from disk, not the cold default.
         self.brake_state_store.load()
+        # Phase 8 of the unified-event-stream slice: subscribe via the
+        # bus instead of the legacy `on_change=` callback. The handler
+        # receives a DeckEvent whose payload is the BrakeChangeEvent.
+        self.bus.subscribe(
+            self._handle_brake_change,
+            filter=["brake.change"],
+            name="tui.brake_change",
+        )
 
         # Phase 7 — instantiate the file logger now that brake_state has
         # loaded from disk so the header records the real value. Built
@@ -3595,12 +3624,18 @@ class CyberdeckApp(App):
                     ScriptListItem(path, category, name)
                 )
 
-    def _handle_profile_event(self, event: ProfileEvent) -> None:
-        """Receive a registry event. We coalesce display updates by
-        only re-rendering on 'scan_complete' (which fires after a batch
-        of changes settles); individual added/changed/removed events
-        are no-ops here. scan_error gets surfaced in the chatlog so
-        the netrunner sees their broken TOML quickly."""
+    def _handle_profile_event(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber: profile.<kind> event arrived.
+
+        The DeckEvent's payload is the ProfileEvent dataclass.
+        Coalesces display updates by only re-rendering on
+        'scan_complete' (fires after a batch of changes settles);
+        individual added/changed/removed events are no-ops here.
+        scan_error gets surfaced in the chatlog so the netrunner
+        sees their broken TOML quickly. Phase 8 of the unified-
+        event-stream slice migrated this from the legacy `on_event=`
+        callback to a bus subscriber."""
+        event: ProfileEvent = deck_event.payload
         if event.kind == "scan_error":
             # Show the error inline in the chatlog. Keep it short —
             # the full path + reason is in stderr already (and in the
@@ -3621,14 +3656,19 @@ class CyberdeckApp(App):
                 f"[yellow]profiles updated[/yellow] [dim]({count} loaded)[/dim]"
             )
 
-    def _handle_plugin_event(self, event: PluginEvent) -> None:
-        """Receive a plugin registry event. Mirrors
+    def _handle_plugin_event(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber: plugin.<kind> event arrived.
+
+        The DeckEvent's payload is the PluginEvent dataclass. Mirrors
         _handle_profile_event in shape: errors get surfaced in the
         chatlog, scan_complete triggers a Tools-panel re-render.
         Difference is that there's only one scan ever (no hot
         reload), so this fires at most once during deck startup
         plus any time the netrunner manually triggers a re-scan
-        (deferred — no UI for that yet)."""
+        (deferred — no UI for that yet). Phase 8 of the unified-
+        event-stream slice migrated this from the legacy `on_event=`
+        callback to a bus subscriber."""
+        event: PluginEvent = deck_event.payload
         if event.kind == "scan_error":
             err = (event.error or "?").replace("\n", " ")
             if len(err) > 120:
@@ -3814,23 +3854,34 @@ class CyberdeckApp(App):
             # attribute is read at every spawn; DEGRADED or OFFLINE
             # blocks the spawn cleanly with a fleet-log entry.
             connection_state_provider=lambda: self.connection_monitor.state,
-            # Phase 2 of the unified-event-stream slice: pass the
-            # deck's bus to Fleet so every FleetEvent ALSO publishes
-            # as a DeckEvent. Existing _handle_event listener path
-            # below stays unchanged — the bus is purely additive
-            # during the migration. Subscribers (none in this phase;
-            # phases 3+ add them) read from the bus instead of
-            # registering through add_listener. See
-            # `Design Files/cyberdeck-event-stream-design.md`.
+            # Bus is the canonical event channel; Fleet publishes
+            # every FleetEvent through it (Phase 2 of the unified-
+            # event-stream slice; Phase 8 retired the legacy
+            # `add_listener` shim and made bus the only fan-out).
+            # See `Design Files/cyberdeck-event-stream-design.md`.
             bus=self.bus,
         )
-        self.fleet.add_listener(self._handle_event)
-        # Tripwire scanner listener — feeds construct events into the
-        # watchdog's TripwireEngine. Registered separately from the
-        # main event handler so the engine can be wrapped/replaced
+        # Phase 8: subscribe via the bus instead of fleet.add_listener.
+        # `fleet.*` matches every dotted-namespace fleet kind
+        # (fleet.spawn, fleet.finalize, fleet.event, fleet.run_start,
+        # fleet.run_end, fleet.spawn_blocked, fleet.spawn_failed).
+        # Both handlers receive a DeckEvent whose payload is the
+        # FleetEvent.
+        self.bus.subscribe(
+            self._handle_event,
+            filter=["fleet.*"],
+            name="tui.fleet_event",
+        )
+        # Tripwire scanner subscription — feeds construct events into
+        # the watchdog's TripwireEngine. Registered separately from
+        # the main event handler so the engine can be wrapped/replaced
         # without touching chatlog rendering. Per spec, the watchdog
         # owns the engine; Fleet stays ignorant of tripwires.
-        self.fleet.add_listener(self._scan_for_tripwires)
+        self.bus.subscribe(
+            self._scan_for_tripwires,
+            filter=["fleet.*"],
+            name="tui.fleet_tripwire_scan",
+        )
         fleet_log = self.query_one("#fleet_log", RichLog)
         async with self.fleet as fleet:
             self._refresh_sidebar_info()
@@ -3981,10 +4032,13 @@ class CyberdeckApp(App):
             except Exception:
                 pass
 
-    def _handle_connection_change(self, event: StateChangeEvent) -> None:
-        """ConnectionMonitor callback: state transitioned. Updates the
-        sidebar indicator + announces in chatlog so the netrunner
-        sees the moment the deck went degraded/offline (or recovered).
+    def _handle_connection_change(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber: connection.transition event arrived.
+
+        The DeckEvent's payload is the StateChangeEvent dataclass.
+        Updates the sidebar indicator + announces in chatlog so the
+        netrunner sees the moment the deck went degraded/offline (or
+        recovered).
 
         Color coding:
           green ●  online    — normal operation
@@ -3994,7 +4048,10 @@ class CyberdeckApp(App):
         Filled vs partial-filled glyphs (●/◐) reinforce the meaning
         for color-blind netrunners — degraded is visually distinct
         from both online and offline regardless of color rendering.
+        Phase 8 of the unified-event-stream slice migrated this from
+        the legacy `on_state_change=` callback to a bus subscriber.
         """
+        event: StateChangeEvent = deck_event.payload
         glyph_color = {
             ConnectionState.ONLINE:   ("●", "green"),
             ConnectionState.DEGRADED: ("◐", "yellow"),
@@ -4046,18 +4103,21 @@ class CyberdeckApp(App):
         glyph, color = glyph_color
         return f"[{color}]{glyph}[/{color}] {state.value}"
 
-    def _handle_brake_change(self, event: BrakeChangeEvent) -> None:
-        """BrakeStateStore callback: state transitioned.
+    def _handle_brake_change(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber: brake.change event arrived.
 
-        Updates the sidebar indicator and announces in the chatlog so
-        the netrunner has a timeline anchor. New spawns will pick up
-        the new state at spawn time; in-flight constructs continue
-        under the brake they spawned with — that's by design (Claude
-        Code can't have its --permission-mode or --settings mutated
-        post-spawn).
+        The DeckEvent's payload is the BrakeChangeEvent dataclass with
+        old_state / new_state / reason. Updates the sidebar indicator
+        and announces in the chatlog so the netrunner has a timeline
+        anchor. New spawns will pick up the new state at spawn time;
+        in-flight constructs continue under the brake they spawned
+        with — that's by design (Claude Code can't have its
+        --permission-mode or --settings mutated post-spawn).
 
-        Mirrors _handle_connection_change in shape — it's the same
-        pattern."""
+        Mirrors _handle_connection_change in shape — same pattern.
+        Phase 8 of the unified-event-stream slice migrated this from
+        the legacy `on_change=` callback to a bus subscriber."""
+        event: BrakeChangeEvent = deck_event.payload
         try:
             indicator = self.query_one("#brake_status", Label)
             indicator.update(self._brake_indicator_text(event.new_state))
@@ -4361,8 +4421,15 @@ class CyberdeckApp(App):
             # re-render, one from the pre-rendered direct line).
             self._chatlog_write(line, publish_direct=False)
 
-    def _handle_event(self, fevent: FleetEvent) -> None:
-        """Called from Fleet on the same event loop; safe to touch widgets."""
+    def _handle_event(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber: fleet.* event arrived. Same loop as Fleet's
+        own publish (Textual single-loop everywhere) so it's safe to
+        touch widgets.
+
+        The DeckEvent's payload is the FleetEvent dataclass. Phase 8
+        of the unified-event-stream slice migrated this from the
+        legacy `fleet.add_listener(...)` shim to a bus subscriber."""
+        fevent: FleetEvent = deck_event.payload
         # Deck-protocol markers: scan tool_result text for cyberdeck
         # dispatcher emissions BEFORE formatters render anything, so
         # the markers get cleaned out of the displayed text. This
@@ -6659,19 +6726,24 @@ class CyberdeckApp(App):
             name=f"hard-kill-{cid}",
         )
 
-    def _scan_for_tripwires(self, fevent: "FleetEvent") -> None:
-        """Fleet listener that feeds construct events into the
+    def _scan_for_tripwires(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber that feeds construct events into the
         watchdog's TripwireEngine.
 
-        Only construct events (kind="event") are scanned; meta events
-        (spawn, finalize, etc.) carry control-plane metadata that
-        tripwires don't need to match against today. The engine's
-        scope/event-kind gating decides what actually gets compared.
+        The DeckEvent's payload is the FleetEvent dataclass. Only
+        construct events (FleetEvent.kind == "event") are scanned;
+        meta events (spawn, finalize, etc.) carry control-plane
+        metadata that tripwires don't need to match against today.
+        The engine's scope/event-kind gating decides what actually
+        gets compared.
 
         Best-effort: a scan failure must not break the chatlog
-        listener path. The engine itself is defensive (catches per-
+        subscriber path. The engine itself is defensive (catches per-
         listener exceptions in on_fire dispatch); we wrap one more
-        layer here in case the event payload is malformed."""
+        layer here in case the event payload is malformed. Phase 8
+        of the unified-event-stream slice migrated this from the
+        legacy `fleet.add_listener(...)` shim to a bus subscriber."""
+        fevent: FleetEvent = deck_event.payload
         if fevent.kind != "event":
             return
         if self.watchdog is None or self.watchdog.tripwires is None:

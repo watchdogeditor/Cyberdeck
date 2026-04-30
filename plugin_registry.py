@@ -53,7 +53,8 @@ class PluginRegistry:
     """Disk-backed plugin map.
 
     Lifecycle:
-        reg = PluginRegistry(path, on_event=cb)
+        reg = PluginRegistry(path, bus=bus)
+        bus.subscribe(cb, filter=["plugin.*"])
         reg.scan()   # synchronous; populates the registry
         ...
         reg.all()    # -> list[Plugin], sorted by name
@@ -75,44 +76,24 @@ class PluginRegistry:
         self,
         plugins_dir: Path,
         *,
-        on_event: Optional[PluginEventListener] = None,
         bus: Optional[object] = None,
     ) -> None:
         self.plugins_dir = Path(plugins_dir)
-        self._listeners: list[PluginEventListener] = []
-        if on_event is not None:
-            self._listeners.append(on_event)
-        # Phase 5 of the unified-event-stream slice. When wired,
-        # `_emit` ALSO publishes a `plugin.<kind>` DeckEvent on the
-        # bus alongside the legacy listener fan-out.
+        # Bus is the only fan-out path (Phase 8 of the unified-event-
+        # stream slice retired the legacy `on_event=` callback +
+        # `_listeners` list + add_listener/remove_listener shims). bus
+        # may be None in standalone runs.
         self.bus = bus
 
         # Authoritative state
         self._by_name: dict[str, Plugin] = {}
 
-    # ---- listener wiring ---------------------------------------------------
-
-    def add_listener(self, listener: PluginEventListener) -> None:
-        self._listeners.append(listener)
-
-    def remove_listener(self, listener: PluginEventListener) -> None:
-        try:
-            self._listeners.remove(listener)
-        except ValueError:
-            pass
+    # ---- emission ----------------------------------------------------------
 
     def _emit(self, event: PluginEvent) -> None:
-        for listener in list(self._listeners):
-            try:
-                listener(event)
-            except Exception as exc:
-                print(
-                    f"plugin_registry: listener error: {exc!r}",
-                    file=sys.stderr,
-                )
-        # Phase 5: also publish on the bus when wired. PluginEvent's
-        # `kind` field maps to dotted-namespace; scan_error escalates
-        # to warning severity.
+        # PluginEvent's `kind` field maps to the bus's dotted-namespace;
+        # scan_error escalates to warning severity. Per-callback
+        # exception isolation lives on the bus itself.
         if self.bus is not None:
             try:
                 from event_bus import DeckEvent

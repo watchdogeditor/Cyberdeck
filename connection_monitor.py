@@ -57,7 +57,8 @@ class ConnectionMonitor:
     """Periodic heartbeat + state machine.
 
     Lifecycle:
-        cm = ConnectionMonitor(on_state_change=cb)
+        cm = ConnectionMonitor(bus=bus)
+        bus.subscribe(cb, filter=["connection.transition"])
         await cm.start()
         ...
         await cm.shutdown()
@@ -99,7 +100,6 @@ class ConnectionMonitor:
         timeout: float = DEFAULT_TIMEOUT,
         degrade_threshold: int = DEFAULT_DEGRADE_THRESHOLD,
         recover_threshold: int = DEFAULT_RECOVER_THRESHOLD,
-        on_state_change: Optional[Callable[[StateChangeEvent], None]] = None,
         # Optional injection for tests — replaces the live socket
         # heartbeat with a stub that returns ("ok"|"timeout"|"refused"
         # |"dns_failure"). Real deck always uses the live socket.
@@ -112,11 +112,11 @@ class ConnectionMonitor:
         self.timeout = timeout
         self.degrade_threshold = degrade_threshold
         self.recover_threshold = recover_threshold
-        self.on_state_change = on_state_change
         self.heartbeat_fn = heartbeat_fn
-        # Phase 5 of the unified-event-stream slice. When wired,
-        # state transitions ALSO publish a `connection.transition`
-        # DeckEvent on the bus alongside on_state_change.
+        # Bus is now the only fan-out path (Phase 8 of the unified-
+        # event-stream slice retired the legacy `on_state_change=`
+        # callback). bus may be None for standalone tests; transitions
+        # still update internal state but no events surface.
         self.bus = bus
 
         # State. Start ONLINE on the optimistic assumption that the
@@ -309,16 +309,10 @@ class ConnectionMonitor:
             new_state=new_state,
             reason=reason,
         )
-        if self.on_state_change is not None:
-            try:
-                self.on_state_change(evt)
-            except Exception:
-                # Listener errors don't kill the monitor.
-                pass
-        # Phase 5: also publish on the bus when wired. Severity
-        # reflects the destination state — anything other than
-        # ONLINE escalates to warning so subscribers can react to
-        # "we lost network" without inspecting payload state names.
+        # Severity reflects the destination state — anything other
+        # than ONLINE escalates to warning so subscribers can react
+        # to "we lost network" without inspecting payload state
+        # names. Per-callback exception isolation lives on the bus.
         if self.bus is not None:
             try:
                 from event_bus import DeckEvent
