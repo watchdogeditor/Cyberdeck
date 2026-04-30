@@ -62,6 +62,7 @@ from watchdog import (
 )
 from tripwires import TripwireFire, TripwireAuthoringResult
 from event_bus import EventBus, DeckEvent
+from logger import DeckLogger
 from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
@@ -2631,7 +2632,8 @@ class CyberdeckApp(App):
         tasks: list[str],
         claude_bin: str,
         permission_mode: str,
-        log_path: Optional[Path],
+        log_dir: Optional[Path] = None,
+        log_level: str = "info",
         goal: Optional[str] = None,
         daemon_bin: Optional[str] = None,
         max_concurrent: int = 5,
@@ -2699,12 +2701,25 @@ class CyberdeckApp(App):
         self._default_profile_name = default_profile_name or "default"
         self._default_profile_explicit = default_profile_name is not None
         self.default_profile: Optional[Profile] = None
-        # Log path defaults to <home>/cyberdeck.log when not explicitly
-        # set. Explicit --log overrides home placement.
-        self.log_path = (
-            log_path if log_path is not None
-            else self.home_dir / "cyberdeck.log"
-        )
+        # Phase 7 of the unified-event-stream slice: per-launch log
+        # files in `<deck source>/logs/` (operational artifacts, not
+        # deck-content). Defaults to a `logs/` directory next to the
+        # .py source files. Explicit --log-dir / CYBERDECK_LOG_DIR
+        # overrides for testing or external mount points. The level
+        # is the minimum severity that gets persisted; CRITICAL is
+        # always written regardless. DeckLogger instance is built
+        # AFTER self.bus and attaches itself as a subscriber.
+        if log_dir is None:
+            # _deck_source_dir() — the directory tui.py lives in.
+            # Same logic as brake_hook.deck_source_dir() but local
+            # to keep tui.py from depending on brake_hook for path
+            # resolution. The hook's resolution is the canonical
+            # one; this matches it deliberately.
+            self.log_dir = Path(__file__).resolve().parent / "logs"
+        else:
+            self.log_dir = Path(log_dir)
+        self.log_level = log_level.lower()
+        self.deck_logger: Optional[DeckLogger] = None  # built in __init__ below
         self.goal = goal
         # Daemon binary can differ from construct binary (for mocking)
         self.daemon_bin = daemon_bin or claude_bin
@@ -2731,6 +2746,11 @@ class CyberdeckApp(App):
         # not observers. See `Design Files/cyberdeck-event-stream-
         # design.md` for the full migration plan.
         self.bus = EventBus()
+        # Phase 7 file logger gets instantiated at the end of __init__
+        # (after brake_state_store has loaded from disk) so the header
+        # captures the real brake state, not a placeholder. We
+        # initialize the field here for type-clarity; the actual
+        # DeckLogger construction lives down past brake_state_store.
         # Set of (construct_id, action) pairs we've already warned
         # about for unknown deck-protocol markers. A misbehaving
         # construct emitting the same unknown action in a tight loop
@@ -2822,6 +2842,37 @@ class CyberdeckApp(App):
         # any spawn (including the initial pool warm-up) sees the
         # netrunner's last-set brake from disk, not the cold default.
         self.brake_state_store.load()
+
+        # Phase 7 — instantiate the file logger now that brake_state has
+        # loaded from disk so the header records the real value. Built
+        # best-effort: a disk-write failure (read-only fs, no
+        # permissions) shouldn't break startup; any exception here
+        # degrades to "no file logger" without crashing the deck. The
+        # logger subscribes to the bus with no kind filter — every
+        # event meeting the severity threshold gets written. Header
+        # carries argv + env + brake + home + python/OS so any single
+        # shared file is self-describing.
+        try:
+            self.deck_logger = DeckLogger(
+                log_dir=self.log_dir,
+                level=self.log_level,
+                argv=list(sys.argv),
+                env_snapshot={
+                    k: v for k, v in os.environ.items()
+                    if k.startswith("CYBERDECK_") or k.startswith("CLAUDE_")
+                },
+                deck_version="cyberdeck-spine-phase-7",
+                brake_label=self.brake_state_store.state.value,
+                home_dir=self.home_dir,
+            )
+            self.deck_logger.attach_to_bus(self.bus)
+        except Exception as exc:
+            print(
+                f"DeckLogger init failed: {exc!r} — running without file log",
+                file=sys.stderr,
+            )
+            self.deck_logger = None
+
         self.panes: dict[str, ConstructPane] = {}
         self.goal_pane: Optional[GoalPane] = None
         self.daemon_pane: Optional[DaemonPane] = None
@@ -3372,7 +3423,13 @@ class CyberdeckApp(App):
         self.fleet = Fleet(
             claude_bin=self.claude_bin,
             permission_mode=self.permission_mode,
-            log_path=self.log_path,
+            # Phase 7: don't ask Fleet to write its own NDJSON log —
+            # DeckLogger subscribes to the bus and captures fleet
+            # events along with everything else in one per-launch
+            # file. Fleet's standalone `python fleet.py` console mode
+            # still uses log_path for backward compat (see fleet.py
+            # __main__), so the parameter stays on the Fleet API.
+            log_path=None,
             install_signal_handlers=False,  # Textual owns SIGINT
             quiet=True,  # no console print; TUI renders instead
             max_concurrent=self.max_concurrent,
@@ -3527,6 +3584,13 @@ class CyberdeckApp(App):
 
             # Stop the connection monitor heartbeat loop.
             await self.connection_monitor.shutdown()
+
+            # Phase 7: close the file logger. Writes a footer event
+            # with reason="shutdown" — heartbeat sensor + maintbot use
+            # this marker to distinguish clean exit from unclean
+            # crash. Idempotent; safe to call multiple times.
+            if self.deck_logger is not None:
+                self.deck_logger.close(reason="shutdown")
 
             fleet_log.write("[b]complete[/b]")
 
@@ -4847,6 +4911,15 @@ class CyberdeckApp(App):
         except Exception:
             pass
 
+        # Phase 7: write a footer with reason="eject" so the heartbeat
+        # sensor + future maintbot can distinguish a deliberate halt
+        # (snapshot is the autopsy artifact, no triage needed) from an
+        # unclean crash. The logger keeps subscribed up to this point
+        # so any in-flight events from the kill cascade still get
+        # written to the file.
+        if self.deck_logger is not None:
+            self.deck_logger.close(reason="eject")
+
         # Show post-eject modal with snapshot path + return-or-quit.
         # By now: constructs killed, daemon cancelled, pool stopped.
         self.push_screen(
@@ -4896,8 +4969,16 @@ class CyberdeckApp(App):
         path on success, raises on failure (caller handles the log)."""
         if self.fleet is None:
             return None
-        # File alongside the run log (same parent dir as cyberdeck.log).
-        log_dir = self.log_path.parent if self.log_path else Path(".")
+        # File alongside the per-launch log file. Phase 7's DeckLogger
+        # owns the canonical log directory; eject snapshots live next
+        # to it so the morgue / maintbot can find both via one path.
+        # Falls back to cwd if the logger never came up (rare:
+        # disk-write failure during init).
+        log_dir = (
+            self.deck_logger.log_dir
+            if self.deck_logger is not None
+            else self.log_dir
+        )
         snapshot_path = log_dir / f"ejected-{self.fleet.run_id}.json"
 
         # Build the snapshot. Be defensive about every field — eject
@@ -7428,10 +7509,25 @@ if __name__ == "__main__":
              "with deck-side consent UI.",
     )
     parser.add_argument(
-        "--log",
+        "--log-dir",
         type=str,
-        default=os.environ.get("CYBERDECK_LOG"),
-        help="NDJSON log file path. Default: <home>/cyberdeck.log.",
+        default=os.environ.get("CYBERDECK_LOG_DIR"),
+        help="Directory for per-launch NDJSON log files. Each launch "
+             "creates a new file `cyberdeck-YYYY-MM-DD-HHMMSS.log` "
+             "with a `latest.log` pointer alongside (Phase 7 of the "
+             "unified-event-stream slice — replaces the prior "
+             "single-file CYBERDECK_LOG). Default: "
+             "`<deck source>/logs/`. Logs live next to the .py "
+             "files (operational artifacts, not deck-content) so the "
+             "brake hook protects them from constructs by default.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=os.environ.get("CYBERDECK_LOG_LEVEL", "info"),
+        help="Minimum severity for log file writes: debug / info / "
+             "warning / error / critical. CRITICAL events are always "
+             "written regardless of threshold. Default: info.",
     )
     parser.add_argument(
         "--home",
@@ -7509,17 +7605,21 @@ if __name__ == "__main__":
     # --goal nor positional tasks are provided; netrunner sets a goal
     # via 'e' once running.
 
-    # Resolve the home dir first — log_path may default to live inside
-    # it. _resolve_home_dir creates the dir if missing so subsequent
-    # writes can assume it's there.
+    # Resolve the home dir first — _resolve_home_dir creates the dir
+    # if missing so subsequent writes can assume it's there.
     home_dir = _resolve_home_dir(args.home)
-    log_path = Path(args.log) if args.log else None
+    # Phase 7: log directory defaults to <deck source>/logs/ inside
+    # CyberdeckApp.__init__ when log_dir is None. Explicit
+    # --log-dir / CYBERDECK_LOG_DIR overrides for testing or
+    # external mount points.
+    log_dir = Path(args.log_dir).expanduser() if args.log_dir else None
 
     app = CyberdeckApp(
         tasks=args.tasks,
         claude_bin=args.claude_bin,
         permission_mode=args.mode,
-        log_path=log_path,
+        log_dir=log_dir,
+        log_level=args.log_level,
         goal=args.goal,
         daemon_bin=args.daemon_bin,
         max_concurrent=args.max_concurrent,

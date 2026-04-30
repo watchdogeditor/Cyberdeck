@@ -26,6 +26,15 @@ cyberdeck-home/*
 !cyberdeck-home/profiles/
 !cyberdeck-home/plugins/
 
+# Per-launch NDJSON log files (Phase 7 of the unified-event-stream
+# slice). Operational artifacts; live next to the .py source so the
+# brake hook protects them from constructs by default. Each launch
+# creates `cyberdeck-YYYY-MM-DD-HHMMSS.log` plus a `latest.log`
+# pointer. Local-only — keeping them out of git.
+logs/
+cyberdeck.log
+ejected-*.json
+
 # Milestone snapshots — history, not source.
 Previous Versions/
 
