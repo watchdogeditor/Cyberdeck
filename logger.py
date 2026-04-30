@@ -72,6 +72,13 @@ def _serialize_payload(payload: Any, *, depth: int = 0) -> Any:
     Common shapes seen on the bus:
       - None: passes through
       - dict / list / primitive: passes through
+      - pathlib.Path: stringified (the OS-native path form). Caught
+        on real-deck via the `Y` JSON yank — Profile.source_path and
+        Plugin.source_dir are Path objects on dataclasses, and
+        without this branch they hit the repr() fallback and got
+        baked as `"WindowsPath('C:/...')"` strings into both the
+        clipboard JSON and the per-launch .log files. Plain strings
+        compose with downstream tools (jq, json.parse, etc.).
       - dataclass-shaped object (FleetEvent, DaemonEvent,
         BlacklistEntry, etc.): converts via __dict__ recursively
       - everything else: repr() fallback
@@ -87,6 +94,12 @@ def _serialize_payload(payload: Any, *, depth: int = 0) -> Any:
         return None
     if isinstance(payload, (str, int, float, bool)):
         return payload
+    # pathlib.Path → str. Avoids `WindowsPath('...')` / `PosixPath('...')`
+    # repr leaking into JSON output. Checked before dict/list since
+    # Path doesn't match those, but ahead of the __dict__ probe because
+    # Path subclasses do have a __dict__ on some Python versions.
+    if isinstance(payload, Path):
+        return str(payload)
     if isinstance(payload, dict):
         return {
             str(k): _serialize_payload(v, depth=depth + 1)

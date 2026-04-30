@@ -67,6 +67,9 @@ from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
 from brake_state import BrakeState, BrakeStateStore, BrakeChangeEvent
+from logger import _serialize_payload
+import clipboard
+import json
 
 
 STATE_STYLES = {
@@ -1973,6 +1976,12 @@ class KeybindsScreen(ModalScreen[None]):
                       "list-item launch)."),
             ("z", "Zoom focused widget — fullscreen reader with "
                    "un-truncated content."),
+            ("y", "Yank focused widget's content to the OS "
+                  "clipboard. Inside a Zoom modal, yanks the full "
+                  "snapshot."),
+            ("Y", "Yank focused widget's structured data as JSON "
+                  "(raw events, bus snapshot, list-item record). "
+                  "Companion to y."),
             ("Enter", "Submit / accept (universal in modals)."),
         ]),
         ("CONSTRUCTS", [
@@ -2229,6 +2238,19 @@ class ExpandModal(ModalScreen[None]):
         # the App), pressing again closes. Mirrors the muscle memory.
         Binding("z", "dismiss", "Close", show=False),
         Binding("r", "refresh", "Refresh", show=True),
+        # `y` — yank the modal's full content to the clipboard.
+        # The magnified view is the prime target surface for copy
+        # because it's where the netrunner reads things worth
+        # sharing (long thinking blocks, tool_results, file
+        # contents). Modal scope; the App-level `y` doesn't reach
+        # here because modal screens are exclusive.
+        Binding("y", "copy", "Copy", show=True),
+        # `Y` — yank structured JSON of the modal's source. When the
+        # modal carries a source_widget_id, resolves it to the live
+        # widget and dispatches to _extract_json_for_copy (so a
+        # magnified chatlog yields the full bus snapshot, etc.).
+        # Falls back to lines-as-JSON when there's no source id.
+        Binding("Y", "copy_json", "Copy JSON", show=True),
         # Scroll inside the body. The App's own w/s bindings don't
         # reach here because modal screens are exclusive — keys go
         # to the modal's BINDINGS first. Without these, the modal
@@ -2306,8 +2328,8 @@ class ExpandModal(ModalScreen[None]):
                 auto_scroll=False,
             )
             yield Label(
-                "[dim]Esc / z close · r refresh · w/s scroll · "
-                "PgUp/PgDn page[/dim]",
+                "[dim]Esc / z close · r refresh · y copy · "
+                "Y copy-json · w/s scroll · PgUp/PgDn page[/dim]",
                 id="expand_hint",
             )
 
@@ -2363,6 +2385,96 @@ class ExpandModal(ModalScreen[None]):
         b = self._body()
         if b is not None:
             b.scroll_end(animate=False)
+
+    def action_copy(self) -> None:
+        """y inside the modal: yank the full snapshot to the clipboard.
+
+        Copies the same untruncated content the modal is rendering, not
+        just what's visible on screen. The whole point of the magnified
+        view is reading the full thing; the copy keybind matches that
+        scope.
+        """
+        text = _snapshot_lines_to_plain_text(self.snapshot_lines)
+        if not text:
+            # Modal is open but the snapshot is empty (rare but
+            # possible — a freshly-spawned construct's pane log
+            # before any events arrived, etc.). Don't write a toast
+            # to the fleet log; the modal covers it. Bail silently.
+            return
+        ok, err = clipboard.copy(text)
+        # Toast lands on fleet_log behind the modal — the netrunner
+        # sees it after dismissing. Failure path is more important
+        # than success path here (the success is invisible-but-
+        # working; the failure is invisible-and-broken).
+        try:
+            app = self.app
+            if isinstance(app, CyberdeckApp):
+                if ok:
+                    app._toast(
+                        f"copy: yanked {len(text)} chars to clipboard"
+                    )
+                else:
+                    app._toast(f"copy: failed — {err}")
+        except Exception:
+            pass
+
+    def action_copy_json(self) -> None:
+        """Y inside the modal: yank structured JSON of the source.
+
+        Resolves source_widget_id back to the live widget and
+        dispatches to _extract_json_for_copy — so the magnified
+        chatlog yields the full bus snapshot, the magnified fleet
+        log yields its lines, etc. When there's no source id
+        (file viewer, text view), falls back to a JSON array of
+        the rendered lines so the keybind never silently no-ops.
+        """
+        text: Optional[str] = None
+        if self.source_widget_id is not None:
+            try:
+                source = self.app.query_one(
+                    f"#{self.source_widget_id}",
+                )
+                text = _extract_json_for_copy(source)
+            except Exception:
+                text = None
+
+        if text is None:
+            # Fallback: JSON array of the modal's rendered lines.
+            # Useful for file viewers and the like where there's no
+            # structured backing widget. Lossy vs. the source path
+            # but better than no-op.
+            lines: list[str] = []
+            for entry in self.snapshot_lines:
+                if isinstance(entry, Text):
+                    lines.append(entry.plain)
+                elif isinstance(entry, str):
+                    try:
+                        lines.append(Text.from_markup(entry).plain)
+                    except Exception:
+                        lines.append(entry)
+                else:
+                    lines.append(str(entry))
+            text = json.dumps(
+                {
+                    "surface": "modal",
+                    "title": self.title_text,
+                    "lines": lines,
+                },
+                indent=2, default=str, ensure_ascii=False,
+            )
+
+        ok, err = clipboard.copy(text)
+        try:
+            app = self.app
+            if isinstance(app, CyberdeckApp):
+                if ok:
+                    app._toast(
+                        f"copy-json: yanked {len(text)} chars to clipboard"
+                    )
+                else:
+                    app._toast(f"copy-json: failed — {err}")
+        except Exception:
+            pass
 
     def action_refresh(self) -> None:
         """Re-fetch content. Uses the provider if registered (re-renders
@@ -2440,6 +2552,220 @@ def _snapshot_richlog(widget) -> list:
         text_obj.rstrip()
         out.append(text_obj)
     return out
+
+
+def _snapshot_lines_to_plain_text(snapshot: list) -> str:
+    """Flatten a list of snapshot entries (markup strings or rich.text.Text
+    objects, the same shapes ExpandModal accepts) into one plain-text
+    blob suitable for the OS clipboard.
+
+    Markup tags get stripped (`Text.from_markup(s).plain`), Text objects
+    contribute their .plain. Joined with newlines so the netrunner gets
+    the same line structure they were reading.
+    """
+    parts: list[str] = []
+    for entry in snapshot:
+        if isinstance(entry, Text):
+            parts.append(entry.plain)
+        elif isinstance(entry, str):
+            try:
+                parts.append(Text.from_markup(entry).plain)
+            except Exception:
+                # Bad markup (unbalanced bracket etc.) — fall back to
+                # the raw string. Worse than parsed but better than
+                # losing the line entirely.
+                parts.append(entry)
+        else:
+            # Unexpected shape; coerce defensively.
+            parts.append(str(entry))
+    return "\n".join(parts)
+
+
+def _extract_text_for_copy(widget) -> Optional[str]:
+    """Pull plain-text content from a focused widget for the `y` copy
+    keybind. Duck-typed dispatch matches the surface map of `action_expand`
+    — every widget the netrunner can magnify is also one they can copy
+    from.
+
+    Returns None when the widget has no meaningful text payload (focus
+    is on a layout container, an unmapped surface, etc.). Caller toasts
+    that case rather than copying an empty string."""
+    # ConstructPane → re-render the raw event buffer untruncated. Same
+    # provider the magnified view uses, so what the netrunner sees in
+    # `z` is what they get on the clipboard via `y`.
+    if isinstance(widget, ConstructPane):
+        lines = widget.render_buffer(untruncated=True)
+        return "\n".join(line.plain for line in lines if isinstance(line, Text))
+
+    # Chatlog gets its untruncated provider (re-renders from the bus
+    # snapshot). Same untruncated text the magnified view shows.
+    if isinstance(widget, RichLog) and widget.id == "chatlog_log":
+        try:
+            app = widget.app
+            if isinstance(app, CyberdeckApp):
+                snapshot = app._render_chatlog_buffer(untruncated=True)
+                return _snapshot_lines_to_plain_text(snapshot)
+        except Exception:
+            pass
+        # Fall through to the generic RichLog path on any failure.
+
+    # Generic RichLog / Log — snapshot the live widget. fleet_log,
+    # daemon_log, watchdog_log, files_list, tools_list all hit this.
+    if isinstance(widget, (RichLog, Log)):
+        snapshot = _snapshot_richlog(widget)
+        return _snapshot_lines_to_plain_text(snapshot)
+
+    # ListView: copy whatever the highlighted item represents. Path for
+    # files, profile/script files (their on-disk path); the netrunner
+    # most often wants to paste a path into another shell or editor.
+    if isinstance(widget, ListView):
+        highlighted = widget.highlighted_child
+        if isinstance(highlighted, FileListItem):
+            return highlighted.file_path
+        if isinstance(highlighted, ProfileListItem):
+            return str(highlighted.profile.source_path)
+        if isinstance(highlighted, ScriptListItem):
+            return str(highlighted.script_path)
+        return None
+
+    # Plain Static / Label — best-effort renderable text extraction.
+    # Won't always produce something useful, but better than failing
+    # silently on the goal pane / sidebar info.
+    try:
+        renderable = getattr(widget, "renderable", None)
+        if renderable is None:
+            return None
+        if isinstance(renderable, Text):
+            return renderable.plain
+        return Text.from_markup(str(renderable)).plain
+    except Exception:
+        return None
+
+
+def _extract_json_for_copy(widget) -> Optional[str]:
+    """Pull structured (JSON) content from a focused widget for the `Y`
+    copy keybind. Companion to `_extract_text_for_copy`: same surface
+    map, but each surface returns its underlying data shape instead of
+    rendered text.
+
+    Returns a pretty-printed JSON string ready for the clipboard, or
+    None when the widget has no meaningful structured payload.
+
+    The shapes:
+      - ConstructPane: raw event buffer (list of stream-json events)
+      - Chatlog: bus snapshot (DeckEvents serialized via the same
+        path the file logger uses, so the JSON shape matches what
+        Mechanic / external tools already parse)
+      - Generic RichLog/Log: rendered lines as a JSON array (no
+        structured backing — fleet_log, daemon_log etc. could be
+        filtered bus snapshots in a future pass; for now treat them
+        like any other log surface)
+      - ListView item: dict of the item's structured fields
+    """
+    # ConstructPane — dump the raw event buffer. Each entry already
+    # carries the original stream-json dict alongside the kind + summary;
+    # repackage as a list of typed records so a downstream consumer
+    # (another Claude session, a debugger, jq, etc.) can iterate without
+    # touching the deck's display formatting.
+    if isinstance(widget, ConstructPane):
+        events = []
+        for kind, summary, raw in widget._raw_event_buffer:
+            events.append({
+                "kind": kind,
+                "summary": summary,
+                "raw": _serialize_payload(raw),
+            })
+        record = {
+            "surface": "construct_pane",
+            "construct_id": widget.construct_id,
+            "state": getattr(widget, "state", None),
+            "events": events,
+        }
+        return json.dumps(record, indent=2, default=str, ensure_ascii=False)
+
+    # Chatlog — full bus snapshot, same record shape DeckLogger writes
+    # to the per-launch file logs. Reuses _serialize_payload so dataclass
+    # payloads (FleetEvent / DaemonEvent / BlacklistEntry / etc.) come
+    # out as plain dicts.
+    if isinstance(widget, RichLog) and widget.id == "chatlog_log":
+        try:
+            app = widget.app
+            if isinstance(app, CyberdeckApp):
+                events = []
+                for event in app.bus.snapshot():
+                    events.append({
+                        "ts": getattr(event, "timestamp", None),
+                        "kind": getattr(event, "kind", "unknown"),
+                        "source": getattr(event, "source", ""),
+                        "construct_id": getattr(
+                            event, "construct_id", None,
+                        ),
+                        "severity": getattr(event, "severity", "info"),
+                        "text": getattr(event, "text", None),
+                        "payload": _serialize_payload(
+                            getattr(event, "payload", None),
+                        ),
+                    })
+                return json.dumps(
+                    {"surface": "chatlog", "events": events},
+                    indent=2, default=str, ensure_ascii=False,
+                )
+        except Exception:
+            pass
+        # Fall through to generic-RichLog path on any failure.
+
+    # Generic RichLog / Log — no structured backing per line. Best we
+    # can do: dump the rendered lines as a JSON array. Useful for
+    # fleet_log / daemon_log / watchdog_log when the netrunner wants
+    # the visible text in a structured form (e.g. "split by line, send
+    # to a script").
+    if isinstance(widget, (RichLog, Log)):
+        snapshot = _snapshot_richlog(widget)
+        lines = []
+        for line in snapshot:
+            if isinstance(line, Text):
+                lines.append(line.plain)
+            else:
+                lines.append(str(line))
+        return json.dumps(
+            {
+                "surface": "log",
+                "widget_id": getattr(widget, "id", None),
+                "lines": lines,
+            },
+            indent=2, default=str, ensure_ascii=False,
+        )
+
+    # ListView highlighted items — emit the item's underlying fields
+    # as JSON. Useful for piping a profile / file path / script entry
+    # into another tool.
+    if isinstance(widget, ListView):
+        highlighted = widget.highlighted_child
+        if isinstance(highlighted, FileListItem):
+            return json.dumps({
+                "surface": "list_item",
+                "kind": "file",
+                "path": highlighted.file_path,
+                "display_path": getattr(highlighted, "display_path", None),
+            }, indent=2, default=str, ensure_ascii=False)
+        if isinstance(highlighted, ProfileListItem):
+            p = highlighted.profile
+            return json.dumps({
+                "surface": "list_item",
+                "kind": "profile",
+                "data": _serialize_payload(p),
+            }, indent=2, default=str, ensure_ascii=False)
+        if isinstance(highlighted, ScriptListItem):
+            return json.dumps({
+                "surface": "list_item",
+                "kind": "script",
+                "category": getattr(highlighted, "category", None),
+                "name": getattr(highlighted, "script_name", None),
+                "path": str(getattr(highlighted, "script_path", "")),
+            }, indent=2, default=str, ensure_ascii=False)
+        return None
+
+    return None
 
 
 class CyberdeckApp(App):
@@ -2595,6 +2921,22 @@ class CyberdeckApp(App):
         Binding("space", "primary", "Primary"),
         Binding("enter", "primary", "", show=False),
         Binding("z", "expand", "Zoom", show=False),
+        # `y` — yank focused widget's content to the OS clipboard.
+        # Sidesteps Ctrl+C-as-copy on Windows, which dropped a SIGINT
+        # into every child claude subprocess (2026-04-30 autopsy
+        # filed in cyberdeck-state.md → Filed gotchas). Single
+        # keycode for the hardware story; vim-yank semantic. The
+        # only collision is `y` for YOLO inside BrakeScreen, which
+        # is modal-scoped (modals don't inherit App BINDINGS) — no
+        # conflict in practice.
+        Binding("y", "copy_focused", "Copy", show=False),
+        # `Y` (shift+y) — yank structured JSON of the focused widget.
+        # Companion to lowercase y. Same surface map; each surface
+        # produces its underlying data shape instead of rendered text.
+        # Use case: pasting fleet activity into another tool (jq,
+        # another Claude session, a debugger) where the rendered text
+        # has already lost the structure we want to operate on.
+        Binding("Y", "copy_focused_json", "Copy JSON", show=False),
         Binding("escape", "unfocus", "Unfocus", show=False),
 
         # Construct interaction (soft/loud pairs)
@@ -5935,6 +6277,59 @@ class CyberdeckApp(App):
                 )
                 return
             return  # ListView with non-viewable item → no-op
+
+    def action_copy_focused(self) -> None:
+        """y: yank focused widget's content to the OS clipboard.
+
+        Sidesteps the Ctrl+C-as-copy issue on Windows where the
+        SIGINT propagated to child claude subprocesses (filed in
+        cyberdeck-state.md → Filed gotchas, 2026-04-30). The set of
+        copyable surfaces matches `action_expand` — anything you can
+        zoom, you can yank.
+        """
+        focused = self.focused
+        if focused is None:
+            self._toast("copy: nothing focused")
+            return
+        text = _extract_text_for_copy(focused)
+        if text is None:
+            self._toast("copy: nothing to yank from this widget")
+            return
+        if not text:
+            self._toast("copy: empty content")
+            return
+        ok, err = clipboard.copy(text)
+        if ok:
+            char_count = len(text)
+            self._toast(f"copy: yanked {char_count} chars to clipboard")
+        else:
+            # Stash the reason so the netrunner can grep their fleet
+            # log later if the message scrolls off. err is a short
+            # human-readable phrase from clipboard.py.
+            self._toast(f"copy: failed — {err}")
+
+    def action_copy_focused_json(self) -> None:
+        """Y: yank focused widget's structured data as JSON.
+
+        Same surface map as `action_copy_focused`, different shape:
+        the underlying record (raw events, bus snapshot, list-item
+        fields) instead of the rendered text. The netrunner's escape
+        hatch when rendered output has already lost the structure
+        they need downstream.
+        """
+        focused = self.focused
+        if focused is None:
+            self._toast("copy-json: nothing focused")
+            return
+        text = _extract_json_for_copy(focused)
+        if text is None:
+            self._toast("copy-json: no structured data on this widget")
+            return
+        ok, err = clipboard.copy(text)
+        if ok:
+            self._toast(f"copy-json: yanked {len(text)} chars to clipboard")
+        else:
+            self._toast(f"copy-json: failed — {err}")
 
     def _open_file_view(
         self,
