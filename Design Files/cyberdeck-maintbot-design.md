@@ -1,4 +1,4 @@
-# Cyberdeck — Maintbot Design
+# Cyberdeck — Maintbot / Mechanic Design
 
 *Architecture for the deck's supervisor / repair process. Separate
 from the deck itself; outlives crashes; hooks into the deck's UI
@@ -9,6 +9,21 @@ eventual implementation has a starting point.*
 `cyberdeck-philosophy.md` (separation-of-concerns reasoning),
 `cyberdeck-state.md` (current status), and
 `cyberdeck-build-plan.md` (where this slots in the priority order).*
+
+**Naming note (2026-04-30):** netrunner has been calling this "the
+Mechanic" in conversation; "maintbot" was the original placeholder.
+File name keeps `maintbot` for now to avoid a touch-storm rename;
+new content uses "Mechanic" as the canonical name. Resolve fully at
+implementation time.
+
+**Architectural shift (2026-04-30):** the design originally framed
+this as a single LLM-backed process that fires on demand. Real-deck
+testing of Phase 7's file logger surfaced a concrete need —
+subprocess cleanup when the deck dies — that pointed at a
+two-tier structure where a lightweight always-on **supervisor**
+half does PID tracking + heartbeat + cleanup-on-death, and a
+heavy on-demand **LLM session** half handles diagnosis. See "Two-tier
+structure" below.
 
 ---
 
@@ -35,6 +50,107 @@ It is **not a deck role**. It is a separate process. The deck has no
 idea it exists unless the deck itself launched it. This matters
 because when the deck dies, the maintbot is unaffected — it is the
 *outside* of the deck, by design.
+
+---
+
+## Two-tier structure: supervisor + LLM session
+
+The Mechanic is one process with two responsibilities at very
+different cost profiles. The architectural insight (filed
+2026-04-30 from real-deck Ctrl+C debugging): split them and the
+process can be always-on without burning context.
+
+### Supervisor half — always-on, no LLM, ~no cost
+
+Lightweight Python: watches the deck's PID, maintains a list of
+the deck's child subprocess PIDs, performs cleanup when the deck
+dies. Doesn't talk to claude. Doesn't read logs (yet). Memory
+footprint is the Python interpreter's own ~30MB resident; CPU is
+near-zero between heartbeat ticks.
+
+Concrete responsibilities:
+
+- **PID tracking.** The deck publishes its child claude subprocess
+  PIDs (constructs, daemon, watchdog Q&A subprocess, watchdog
+  authoring one-shots, pool warming subprocesses) to a place the
+  supervisor can read. See "PID publish channel" below.
+- **Heartbeat.** Polls the deck's PID at a slow cadence (every few
+  seconds is plenty). When the PID disappears or its exit code is
+  non-zero / missing, the supervisor knows the deck is dead.
+- **Cleanup.** On detected deck death, kills every tracked
+  subprocess via cross-platform Python (`os.kill(pid, signal.SIGTERM)`
+  with a short grace, then `signal.SIGKILL`; or `psutil.Process(pid).
+  kill()` if psutil is on hand). Any platform that runs Python runs
+  this. No CREATE_NEW_PROCESS_GROUP, no Job Objects, no
+  PR_SET_PDEATHSIG — just "read PIDs, send signals, walk away."
+- **Optional auto-relaunch (v3+).** Deferred indefinitely; the
+  supervisor does NOT relaunch the deck in v0/v1/v2. It cleans up
+  and either stays running (interactive: waiting for the next
+  manual deck launch) or fires the LLM session for triage
+  (heartbeat-fired path).
+
+Why this is the right shape: the netrunner's earlier framing —
+"when idle, the bot's not running or spun up — it only creates a
+session on demand" — was specifically about the **LLM session**,
+not the supervisor process. The supervisor is what's always-on; the
+LLM session is the lazy half.
+
+### LLM session half — on-demand, claude-backed, real cost per fire
+
+Spins up only on:
+- **Heartbeat-fired triage**: deck died uncleanly → supervisor
+  cleaned up subprocesses → LLM session reads the log file +
+  Python traceback, summarizes what happened, surfaces it in a new
+  wt window
+- **Deliberate summon**: netrunner opened the Mechanic from the
+  deck's UI to ask "what's going on" or "clean up old logs"
+
+Same tooling profile as before (read deck source, read logs, no
+write to the world). Cost profile: a few thousand tokens per fire
+on cloud Claude; potentially free on D1 substrate. Once the session
+ends, the supervisor half stays running and the LLM context closes.
+
+### Why this matters for cross-platform reach
+
+The OS-level mechanisms for "clean up child processes when parent
+dies" are platform-specific:
+
+- Windows: Job Objects with KILL_ON_JOB_CLOSE flag, ~80 LOC ctypes
+- Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` per child, OR process
+  group leader pattern with signal forwarding
+- macOS: similar to Linux
+
+Routing this through the **supervisor** instead of the OS kernel
+means one Python implementation works on every platform Python
+runs on. The deck's spawn sites need only one tiny change:
+publish the spawned PID to the supervisor's tracking channel.
+No platform-conditional `creationflags` parameter, no `pywin32`
+dependency, no `prctl` ctypes calls.
+
+This composes cleanly with the "Pi-class deployment" eventual
+target: the supervisor's Python binary runs unchanged from
+Windows-laptop to ARM-Linux-board.
+
+### PID publish channel
+
+The deck has to communicate "here's a new child PID" / "this PID
+finalized" to the supervisor. Two reasonable options:
+
+- **Option A: enrich the file log.** Add a `pid` field to the
+  `fleet.spawn` event payload (one-line change at each spawn
+  site). The supervisor reads `<deck>/logs/latest.log` (or tails
+  it), walks forward, builds a list of "spawned but not finalized"
+  PIDs. No new infrastructure — the file logger already exists
+  (Phase 7a) and the supervisor will read it for triage anyway.
+- **Option B: dedicated pidfile.** Deck writes
+  `<deck>/.cyberdeck/active-pids-<deck_pid>.json` listing live
+  child PIDs, updates on every spawn/finalize. Smaller surface,
+  no log parsing required.
+
+Lean toward Option A — the file logger is the canonical "what's
+happening on the deck" surface; deriving live PIDs from spawn-
+without-matching-finalize keeps everything in one place. Adding
+the `pid` field to FleetEvent is small and additive.
 
 ---
 
@@ -70,44 +186,53 @@ maintbot is still running and can:
 ### Interactive / desk mode
 
 Deck is the top-level process (current behavior, what `launch.bat`
-runs today). Maintbot is **optional**:
+runs today). The Mechanic supervisor runs alongside as a separate
+sibling process — replaces the original "heartbeat sensor sidecar"
+framing. Same single process throughout the deck's lifetime:
 
 ```
 deck (TUI, top level)
-  ├── claude subprocesses
-  └── heartbeat sensor (sidecar, ~50 LOC PID watcher)
-        │
-        └── on unclean deck exit: spawns maintbot in new wt window
+  ├── claude subprocesses (constructs / daemon / watchdog)
+  └── (siblings — launched by launch.bat or supervisor itself)
+
+mechanic (sibling supervisor process — always on)
+  ├── PID tracking + heartbeat (always running)
+  └── LLM session (spawned on-demand: heartbeat-fired or summoned)
 ```
 
-The heartbeat sensor is a tiny separate process launched alongside
-the deck (probably from `launch.bat`). It does one thing: watch the
-deck's PID + final exit code. When the deck dies cleanly (exit 0,
-EJECT-flagged-snapshot present), the heartbeat exits silently. When
-the deck dies uncleanly, the heartbeat spawns the maintbot in a new
-Windows Terminal window with a "deck died, here's what we know"
-context payload.
+Note the heartbeat sensor isn't a separate process anymore — it's
+the supervisor half doing its always-on job. When the supervisor
+detects deck death, it cleans up subprocesses synchronously (no
+LLM call) and then optionally fires the LLM session in a new wt
+window for triage. When the netrunner deliberately summons the
+Mechanic for "what's going on" / "clean up old logs," the
+supervisor's LLM session activates against the same process.
 
-The maintbot can also be summoned **deliberately** — a menu entry
-in the deck (or a future keybind) that asks "open the maintbot?"
-This path is for when the deck is healthy but the netrunner wants
-to clean up old logs, audit the brake hook's pattern list, or
-investigate something in the deck's recent operational history.
+Launch sequence options:
 
-### Three activation paths
+- **Side-by-side**: `launch.bat` starts the deck and the Mechanic
+  supervisor as parallel processes. Simplest; both die / both
+  restart together.
+- **Supervisor-first**: the Mechanic supervisor launches the deck
+  as its child. Closer to headless mode but interactive deck has
+  a TUI so the supervisor doesn't own the terminal — it would have
+  to spawn the deck detached. Deferred; side-by-side is simpler.
 
-Summarized:
+### Activation paths
 
-| Path | Trigger | Maintbot UI | Deck state |
+Three paths, but only the **LLM session** has an "activation" — the
+supervisor process is always running:
+
+| Path | Trigger | Activates | Deck state |
 |---|---|---|---|
-| **Headless** | Maintbot launches deck | Maintbot's existing terminal | Wrapped subprocess |
-| **Heartbeat-fired** | Deck unclean exit | New `wt` window | Already dead |
-| **Deliberate** | Netrunner menu / keybind | New `wt` window | Healthy, may keep running |
+| **Headless** | Mechanic launches deck | Supervisor + LLM both up | Wrapped subprocess |
+| **Heartbeat-fired** | Deck unclean exit | Supervisor cleans up, fires LLM in new wt window | Already dead, subprocesses killed |
+| **Deliberate summon** | Netrunner menu / keybind | LLM only | Healthy, may keep running |
 
-In all three, the maintbot is **lazy by default**. The process may
-be running but its claude session is not spun up until a
-diagnose / chat request actually fires. Holding open an LLM session
-on the off chance of a crash is wasted context budget.
+In all three, the **supervisor** is always running (or always
+running once the supervisor first comes up). Cleanup happens
+synchronously without any LLM cost. The LLM session is the
+expensive part and stays lazy.
 
 ---
 
@@ -142,10 +267,41 @@ the death point — all *before* spending tokens on the LLM call.
 
 ## What the maintbot can do
 
-### v1 — diagnose-only
+### v0 — supervisor only (no LLM session yet)
 
-The first version is read-only. Given a crashed deck (or a healthy
-one, when summoned deliberately), it can:
+Concrete, narrow, ships first. The Mechanic process exists, runs
+the supervisor half, does no LLM work at all. Specifically:
+
+- Reads `<deck>/logs/latest.log` (or polls a small `active-pids`
+  file — see PID publish channel above) to track live subprocess
+  PIDs
+- Polls the deck's PID at low cadence
+- On deck death (any cause: clean exit, EJECT, crash, OOM, kill -9
+  from Task Manager, blue screen): kills every tracked subprocess
+  via cross-platform Python signals
+- That's it. No diagnostics, no LLM, no UI. Headless, reliable,
+  fast.
+
+This v0 alone solves the concrete problem real-deck testing
+surfaced: when the deck dies, claude subprocesses currently orphan
+on Windows. The supervisor cleans them up. Cross-platform from
+day one, no Job Object plumbing in the deck itself.
+
+Implementation cost: ~150 LOC of Python (PID tracking, signal
+loop, cross-platform signal dispatch). No claude dependency. Can
+ship without D1, without the file logger being feature-complete,
+without anything else queued.
+
+**This is the right v0 because the netrunner-immediate value is
+real (no orphaned claude subprocesses → no zombie Anthropic
+sessions → no surprise quota burn) and the implementation is
+small + isolated + testable. The LLM-backed half can land later
+when the cost profile is better understood.**
+
+### v1 — diagnose-only LLM session
+
+The first LLM-backed version is read-only. Given a crashed deck
+(or a healthy one, when summoned deliberately), it can:
 
 - Summarize the crash: what was the deck doing, what blew up,
   what's the Python traceback or exit code
@@ -254,8 +410,11 @@ Naming non-goals so they don't creep:
   goals. The maintbot does not plan world-work; it diagnoses deck
   state. If the netrunner wants something done in the world, that's
   a daemon goal, not a maintbot ask.
-- **Not always-on.** Sessions spin up on demand and tear down when
-  closed. Cost discipline.
+- **Not always-on (LLM session).** The supervisor process is
+  always-on by design (cheap, no LLM cost) but the LLM session is
+  lazy: spins up on heartbeat-fired triage or netrunner summon,
+  tears down when closed. Cost discipline applies to the LLM half;
+  the supervisor half is essentially free.
 - **Not autonomous in v1.** All actions land via netrunner approval.
   Relaunching after crash is a v3 feature once v1 + v2 have built
   trust.
@@ -270,25 +429,47 @@ When the time comes to build:
 
 ### Pieces
 
-- **`maintbot.py`** (or `maintbot/` package) — the bot itself.
-  Argparse entry: `python maintbot.py [--summoned-by heartbeat | --interactive | --headless --launch-deck]`.
-  Has a small "preprocessor" that reads `latest.log`, parses the
-  header, extracts the post-mortem context before any LLM call.
-- **`heartbeat.py`** — the PID watcher. Tiny. Argparse: `python heartbeat.py <deck_pid>`. Polls
-  the PID, reads exit code on death, classifies clean vs unclean,
-  spawns maintbot if unclean.
-- **`launch.bat`** updates: spawn the heartbeat alongside the deck.
-  Something like `start /B python heartbeat.py %!%` after the deck
-  launch. Or — cleaner — let the deck spawn the heartbeat itself
-  before going into TUI mode, with the heartbeat inheriting the
-  deck's PID via env.
-- **Maintbot system prompt** — analogous to the Watchdog's, but
-  oriented around deck infrastructure rather than fleet observation.
-  Knows about gotchas, knows the file layout, knows the spec doc
-  exists and can be read.
-- **A "summon maintbot" surface in the deck UI** — menu entry or
-  keybind. Spawns the maintbot in a new wt window. Doesn't kill the
-  deck.
+- **`mechanic.py`** (or `mechanic/` package) — the supervisor +
+  LLM-session combined process. Argparse entry:
+  `python mechanic.py [--watch-deck-pid <pid>] [--summoned] [--launch-deck]`.
+  v0 ships with the supervisor half only; --summoned activates the
+  LLM session in v1+.
+- **Supervisor half** (v0):
+  - Polls `<deck_pid>` at low cadence (every 2-5s)
+  - Reads `<deck>/logs/latest.log` to track live subprocess PIDs
+    via spawn-without-matching-finalize derivation, OR reads a
+    dedicated `<deck>/.cyberdeck/active-pids-<deck_pid>.json` file
+  - On deck death: kills every tracked subprocess via
+    cross-platform Python (`os.kill` with SIGTERM, short grace,
+    then SIGKILL; `psutil` if we eventually add it as a dep)
+  - Synchronous; no LLM call at this stage
+- **LLM session half** (v1+):
+  - Has the "preprocessor" that reads `latest.log`, parses the
+    header, extracts the post-mortem context before any LLM call
+  - Mechanic system prompt — analogous to the Watchdog's, but
+    oriented around deck infrastructure rather than fleet
+    observation. Knows about gotchas, knows the file layout, knows
+    the spec doc exists and can be read.
+- **`launch.bat` updates**: spawn the Mechanic supervisor as a
+  sibling alongside the deck. Something like:
+  ```
+  start /B python mechanic.py --watch-deck-pid %DECK_PID%
+  wt --fullscreen python tui.py
+  ```
+  When the deck dies, the supervisor stays running (Mechanic
+  process is independent) and either: cleans up subprocesses
+  silently then exits, or fires the LLM session into a new wt
+  window for triage.
+- **A "summon mechanic" surface in the deck UI** (v1+) — menu
+  entry or keybind. Sends a request to the already-running
+  supervisor process to activate the LLM session. Spawns the LLM
+  session UI in a new wt window. Doesn't kill the deck.
+- **Deck-side change**: `fleet.spawn` event payload grows a `pid`
+  field so the supervisor can derive live PIDs from
+  `<deck>/logs/latest.log` (Option A from PID publish channel
+  above). One-line change at each spawn site in `fleet.py`. The
+  bus already carries the event; the file logger already writes
+  it; no new infrastructure.
 
 ### Cost, in rough hours
 
@@ -314,12 +495,13 @@ When the time comes to build:
 
 Captured for when we're closer to building, not for solving now:
 
-1. **Naming.** "Maintbot" is the working name and it's fine for
-   internal use. Cyberpunk-pro options: *mechanic* (verb-aligned
-   with diagnose-and-fix), *sysop* (BBS-era authority over
-   infrastructure), *custodian* (bureaucratic; not great), *surgeon*
-   (in-flight correction implication; v2-shaped). My current lean
-   is **mechanic**. Resolve when the doc gets canonized.
+1. **Naming.** "Maintbot" was the original placeholder; netrunner
+   has been calling it "the Mechanic" in conversation since
+   2026-04-30 and that's stuck. Open question is just whether the
+   file name and code symbols should rename now (touch-storm
+   across this doc, state.md, build-plan, eventual `mechanic.py`)
+   or land at implementation time as one focused commit. Lean
+   toward the latter.
 
 2. **EJECT-then-summon gesture.** EJECT writes a snapshot but
    doesn't fire the maintbot — it's a deliberate halt with autopsy
@@ -361,6 +543,27 @@ Captured for when we're closer to building, not for solving now:
    maintbot is allowed to read and what it isn't. Not blocking; the
    maintbot can carry the messy boundary in v1 and we tighten the
    layout when we're ready.
+
+7. **Clean-vs-unclean exit signaling for the supervisor.** The
+   supervisor needs to distinguish "deck shut down deliberately"
+   (subprocess cleanup may be redundant — the deck already killed
+   them) from "deck crashed" (subprocesses likely orphaned, kill
+   them now). Two signals available:
+   - File logger writes a `log_footer` with `reason: "shutdown"` /
+     `"eject"` on clean exit. Supervisor reads that to confirm
+     deliberate halt.
+   - Deck PID disappears with non-zero exit code or no exit code
+     at all → unclean.
+   Combine: if footer present AND PID gone → clean (still walk
+   active-PIDs and kill any stragglers, but no triage). If no
+   footer → unclean (kill everything + fire LLM session). Probably
+   the right shape, but the timing is fiddly — footer write happens
+   before the Python process actually exits, so there's a small
+   window where the footer is in the file but the deck is still
+   technically alive. Defer until implementation time; the
+   tolerable failure mode is "supervisor occasionally fires LLM
+   session for a clean exit," which costs a few thousand tokens
+   one time.
 
 ---
 

@@ -27,46 +27,54 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** **the spine — unified event stream** (full design at
-`cyberdeck-event-stream-design.md`). One canonical event bus that
-every event source on the deck publishes to; every observer
-subscribes via a role-derived filter. Replaces the current sprawl
-of 11 independent callback chains the TUI manually glues together —
-that pattern decays silently as new event types land (caught
-2026-04-29 when slice 2 testing surfaced two sibling bugs: the
-magnified chatlog view and the watchdog Q&A context were both
-blind to direct-write markers, despite the watchdog system prompt
-explicitly instructing the model to read those markers from the
-chatlog). Tactical fix shipped with slice 2 (push direct writes
-into `_chatlog_event_buffer` under `kind="direct"`, teach both
-readers about the new kind). The unified spine is the strategic
-fix — single source of truth, role-derived filters, introspectable
-visibility ("what does the watchdog see?" → check its filter; no
-more tracing through middleware). Absorbs the previously-planned
-logger + quit discipline slice — the file logger becomes a bus
-subscriber, lifecycle events including SIGINT-swallow / smart
-Ctrl+Q / EJECT-responsiveness publish through the same stream.
-Maintbot becomes another bus consumer once the stream is in.
-Migration is 8 phased mini-slices, each shippable independently.
-Then D1 (local model substrate) for the long-term Watchdog/
-synthesizer/maintbot story. Plugin scaffolding, brake-as-deck-state,
-connection spawn-blocking, brake-denial visual, watchdog blacklist,
-watchdog Q&A persistence, tripwires slice 1, and tripwires slice 2
-(LLM authoring) all shipped in the post-migration wave.
+**Up next:** **Mechanic v0 — supervisor only** (subprocess janitor +
+deck heartbeat in one process; no LLM session yet). Lands as a
+small new sibling process to the deck, running always-on,
+cross-platform Python, no claude dependency. Concrete v0 value:
+when the deck dies (any cause, any platform), the supervisor kills
+every tracked claude subprocess so nothing orphans. Solves the
+real-deck Ctrl+C subprocess-disruption pain (autopsied 2026-04-30)
+WITHOUT needing platform-specific OS plumbing (Windows Job
+Objects, Linux PR_SET_PDEATHSIG, etc.) in the deck itself —
+"observe + kill via ordinary signals" is one Python implementation.
+Full design at `cyberdeck-maintbot-design.md` (Mechanic /
+maintbot — netrunner has been calling it Mechanic since
+2026-04-30; file rename deferred to implementation time). The
+LLM-backed half (v1+) is queued behind v0 and ships when the
+preprocessor + cost-model story is clearer.
 
-**Filed mid-design (2026-04-29):** **maintbot architecture** — a
-separate-process supervisor / repair entity that operates on **deck
-infrastructure** rather than on the world (different domain from
-daemon/construct/watchdog, no role collision). Two activation modes
-(headless: maintbot wraps deck as supervisor; interactive: deck top
-level + tiny heartbeat sensor sidecar that fires the maintbot on
-unclean exit). v1 is diagnose-only, cloud Claude substrate; v2 adds
-guided correction; v3 auto-relaunch is deferred indefinitely. Full
-design at `cyberdeck-maintbot-design.md`. Blocked on the unified
-event stream slice (maintbot reads the bus's tail + the file log,
-both are stream-derived) and ideally on D1 (cost profile becomes
-unsustainable on cloud for headless 24/7 use). Either constraint
-satisfied + a free session = v1 is buildable.
+**Spine progress (2026-04-30):** 7/8 phases shipped this push —
+event_bus.py primitives, Fleet → bus, Daemon → bus, Tripwires +
+Blacklist + authoring lifecycle → bus, Brake + Connection +
+Profiles + Plugins → bus, direct chatlog writes → bus
+(`_chatlog_event_buffer` retired, bus.snapshot() is the single
+source of truth for chatlog readers), file logger as bus
+subscriber writing per-launch NDJSON files at `<deck source>/logs/`
+with header + footer + severity filter + reason-on-close, quit
+discipline (silent SIGINT swallow + smart Ctrl+Q with running-state
+toast). Phase 8 (cleanup — retire deprecated `add_listener` /
+`on_event` / `on_change` shims now that everyone publishes through
+the bus) is the last spine slice, queued behind Mechanic v0.
+
+**Then**: D1 (local model substrate) for the long-term Watchdog /
+synthesizer / Mechanic-LLM-half story. Plugin scaffolding,
+brake-as-deck-state, connection spawn-blocking, brake-denial
+visual, watchdog blacklist, watchdog Q&A persistence, tripwires
+slice 1, and tripwires slice 2 (LLM authoring) all shipped in the
+post-migration wave.
+
+**Filed (2026-04-30):** Mechanic two-tier architecture — supervisor
+half (always-on, no LLM, cross-platform Python; PID tracking +
+heartbeat + subprocess cleanup on deck death) + LLM session half
+(on-demand, claude-backed; spawned only on heartbeat-fired triage
+or netrunner summon). Architectural shift from the original
+"single LLM-backed process" framing landed during 2026-04-30's
+Ctrl+C autopsy when the netrunner asked whether the orphan-
+subprocess problem was naturally a Mechanic responsibility.
+Answer: yes, and giving the Mechanic a concrete always-on v0 job
+(subprocess janitor) is materially better than starting it as
+"diagnose-only when summoned." Full design at
+`cyberdeck-maintbot-design.md`.
 
 **Filed 2026-04-29:** **unified event stream / spine** — see
 `cyberdeck-event-stream-design.md`. Captures the architectural
@@ -658,6 +666,40 @@ and 10.
   (`proc.communicate(input=...)`).
 - **Rapid heartbeat tests are racy.** Use `wait_for(predicate)` with
   timeout, not fixed sleeps.
+- **Windows console Ctrl+C reaches every process in the console
+  group, not just the Python parent.** Installing a Python-level
+  SIGINT swallow (`signal.signal(SIGINT, lambda: None)`) protects the
+  parent process from terminating, but child claude subprocesses
+  still receive the Ctrl+C event independently from the Windows
+  Console subsystem. Symptoms when the netrunner hits Ctrl+C while
+  the deck is running:
+  - claude's CLI interprets the signal against in-flight tool use as
+    "user rejected the tool," producing a `tool_result` with content
+    "The user doesn't want to proceed with this tool use" and
+    `terminal_reason: "aborted_tools"`. The construct usually still
+    finalizes with `state: "done"` and a useless `final_output`.
+  - On Windows, `claude` is typically a cmd.exe batch wrapper around
+    the actual node CLI (npm-style). cmd.exe catches the Ctrl+C, the
+    wrapped process exits, and cmd.exe writes its standard "Terminate
+    batch job (Y/N)?" prompt to stdout before exiting. Subprocess
+    callers that read stdout (e.g. tripwire authoring's `claude -p`)
+    see the prompt fragment as the model's response, parse fails.
+    Real-deck symptom (2026-04-30): `tripwire.author_failed` with
+    `raw_response: "Execution errorTerminate batch job (Y/N)?"`.
+  - The streaming daemon / watchdog Q&A subprocess can wedge under
+    the same disruption (writes succeed, reads hang) — recovers via
+    the existing 60s drain timeout but loses the in-flight turn.
+  Path forward: **don't fix at the OS level.** Job Object with
+  KILL_ON_JOB_CLOSE was considered + rejected as Windows-specific
+  baggage. The right fix is the Mechanic's supervisor half (cross-
+  platform Python-level subprocess janitor — see
+  `cyberdeck-maintbot-design.md`) PLUS an in-deck copy keybind that
+  sidesteps Ctrl+C entirely (filed as a small QOL slice in the build
+  plan). Workaround until those land: don't press Ctrl+C with no
+  selection; use Windows Terminal's copy-on-select if configured.
+  The deck survives the disruption gracefully (constructs finalize,
+  daemon recovers via timeout, watchdog Q&A still answers
+  post-mortem accurately), so the bug is annoying but not blocking.
 
 ### File paths
 - **String equality on file paths is wrong on Windows.** Forward vs
