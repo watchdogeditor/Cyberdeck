@@ -158,8 +158,16 @@ Roughly ordered by likely appeal:
 3. **Connection consequences** — spawn-blocking on Degraded, daemon
    parking, recovery flow. Detection is shipped; consequences need
    hooks into spawn path + daemon lifecycle. Smallest M5+ slice.
-4. **Watchdog tripwires + blacklist** — DSL, deterministic matcher,
-   alert routing. Where `Shift+K` hard-kill-and-blacklist lands.
+4. **Watchdog tripwires + blacklist** — slices 1 + 2 shipped (DSL,
+   deterministic matcher engine, default tripwires, fleet→engine→
+   chatlog pipeline, LLM authoring at goal-start / non-clarification
+   goal-update). Blacklist primitive (`Shift+K`) shipped earlier.
+   Remaining slices: severity-aware rendering (3), persistent
+   tripwire library at `<home>/tripwires/` with TOML authoring (4),
+   daemon-side severity hints (5), blacklist-derived tripwires that
+   fire on event content rather than just task fingerprints (6).
+   Per-outcome adaptive re-authoring still blocked on a "daemon
+   signals plan shift" event.
 5. **Script manifests** — declarative `(name, category, args, expected
    output shape)` per spec. Currently raw filenames only.
 6. **Construct script-launch wiring** — ScriptListItem space lands
@@ -304,28 +312,64 @@ natively, doesn't suffer chat context truncation.
 - ✓ Connection consequences — spawn-blocking on Degraded/Offline
 - ✓ Plugin scaffolding v1 — stateless plugins, screenshot as first
 
+**Post-migration shipped (continued):**
+- ✓ Watchdog tripwires slice 1 (2026-04-29) — deterministic matcher
+  engine (`tripwires.py`), small DSL (regex + event_kinds + field
+  selectors), severity tiers declared, two default deck-wide
+  tripwires, full Watchdog → Fleet listener → chatlog chain.
+- ✓ Watchdog tripwires slice 2 (2026-04-29) — LLM-authored tripwires
+  at goal-start and non-clarification goal-update. Two-rung
+  substrate: rung 1 forks the watchdog Q&A session via `claude -p
+  --resume <session_id>` so authoring inherits Q&A context without
+  polluting the live session; rung 2 falls back to fresh one-shot
+  when no session_id is captured. Lifecycle is "clear LLM_AUTHORED,
+  then register" so old-goal rules don't linger after pivots.
+  Pending real-deck smoke: confirm rung-1 fork composes cleanly
+  against a live streaming session.
+
 **Next priorities:**
-1. **Watchdog tripwires — slice 2: LLM authoring.** Slice 1 shipped
-   2026-04-29: deterministic matcher engine (`tripwires.py`), small
-   DSL (regex + event_kinds + field selectors), severity tiers
-   declared, two default deck-wide tripwires (credentials keyword +
-   destructive SQL), wiring through Watchdog → Fleet listener →
-   chatlog rendering. Slice 2 authors tripwires from the LLM at
-   goal-start and explicit goal-update (netrunner `e`); per-outcome
-   re-authoring is the spec'd "intent-shift detection" but blocked
-   on a "daemon signals plan shift" event we don't have yet. Slice
-   3 splits per-severity rendering (critical pulls focus). Engine
-   architecture (deterministic enforces, sub-millisecond per event)
-   sidesteps the substrate concern from the original framing —
-   authoring is bounded (one LLM call per intent boundary, not per
-   event), so cloud Claude is fine for cost.
-2. Log-readability overhaul — fleet/chatlog/watchdog/daemon scattered
-   across windows is hard to follow at a glance; needs structural
-   thinking, not just CSS.
-3. Connection consequences round 2: daemon parking on connection-
+1. **The spine — unified event stream.** Full design at
+   `cyberdeck-event-stream-design.md`. One canonical event bus that
+   every event source publishes to; every observer subscribes via a
+   role-derived filter. Replaces the current 11-callback-chain sprawl
+   that decays silently as new event types land (the magnified-view
+   and watchdog-Q&A-context bugs from slice 2 testing both fall out
+   of that decay). Single source of truth + introspectable visibility
+   ("what does the watchdog see?" → check its filter). Absorbs the
+   prior logger + quit discipline slice — the file logger becomes a
+   bus subscriber, lifecycle events including SIGINT-swallow /
+   smart-Ctrl+Q / EJECT-responsiveness publish through the same
+   stream. 8 phased mini-slices, each shippable independently:
+   (1) bus + DeckEvent primitives, (2) Fleet → bus, (3) Daemon → bus,
+   (4) Tripwires + Blacklist → bus, (5) Brake + Connection +
+   Profiles + Plugins → bus, (6) direct chatlog writes → bus
+   (replaces the tactical buffer fix), (7) file logger as bus
+   subscriber + quit discipline, (8) cleanup + remove deprecated
+   `add_listener`/`on_*` shims. Substrate for maintbot, morgue,
+   list-names, tripwires slice 3, B2 synthesizer.
+2. **Maintbot v1 (diagnose-only).** Filed 2026-04-29; full design
+   at `cyberdeck-maintbot-design.md`. Separate process; outlives
+   the deck. Two activation paths: heartbeat-fired on unclean exit
+   (new `wt` window, auto-triages) and deliberate-summon (menu /
+   keybind from the deck). Reads `<deck source>/logs/`, deck source
+   tree, deck state files; cannot touch the world. Cloud Claude
+   substrate for v1; D1 eventual. Blocked on the unified event
+   stream slice (maintbot is one of the bus's designed consumers).
+3. **Log-readability overhaul** — fleet/chatlog/watchdog/daemon
+   scattered across windows is hard to follow at a glance; needs
+   structural thinking, not just CSS. Distinct from the file-log
+   work in the spine slice (this is in-deck UI composition, not
+   file shape). Probably composes better post-spine — display
+   surfaces become "subscriber + filter + formatter" units, easier
+   to rearrange.
+4. Connection consequences round 2: daemon parking on connection-
    blocked spawns + recovery flow.
-4. Tools-research chat (from `cyberdeck-tools-research-seed.md`).
-5. Plugin sub-features: airgap `p`, quickfire `c`, picker `Shift+C`.
+5. Tripwires slice 3 — severity-aware rendering (critical pulls
+   focus, warning badges, low logs only). Severity tiers are
+   already in the DSL; just need the visual routing. Trivial under
+   the spine — one filter predicate per severity-bucket.
+6. Tools-research chat (from `cyberdeck-tools-research-seed.md`).
+7. Plugin sub-features: airgap `p`, quickfire `c`, picker `Shift+C`.
 
 (Keymap revision pass was tee'd up here on 2026-04-27 but moved to
 deferred mid-design — needs more brain cells to do well than were

@@ -224,29 +224,52 @@ grep for existing similar work — the pattern is almost always there.
 - Owns the `TripwireEngine` (constructed at __init__, default
   tripwires installed automatically) — the deterministic-enforces
   half of the spec's tripwire architecture. See `tripwires.py`.
+- **`Watchdog.author_tripwires(...)` (slice 2)** — orchestrates one
+  LLM-authored tripwire pass. Spawns a fresh `claude -p` one-shot;
+  uses `--resume <session_id>` (rung 1) when a session has been
+  captured from the streaming Q&A subprocess, fresh otherwise (rung
+  2). Clears prior `Origin.LLM_AUTHORED` entries before registering
+  new ones. Returns `TripwireAuthoringResult` for the TUI to render
+  to the chatlog. Fire-and-forget at the call site
+  (`run_worker(...)`); never blocks goal-set/update flow.
+- **`_session_id`** captured from the streaming subprocess's first
+  `system`/`init` event in `_drain_streaming_question`. Cleared on
+  any subprocess-death path so a respawned subprocess captures a
+  fresh id rather than handing out a stale one.
 
-### `tripwires.py` (452 LOC) — slice 1 shipped 2026-04-29
+### `tripwires.py` — slices 1 + 2 shipped 2026-04-29
 - `Tripwire` dataclass — small DSL: pattern_type (regex today),
   pattern, event_kinds (which EventKinds to scan), field selector
   (`tool_use_command`, `tool_result_content`, `thinking_text`,
   `assistant_text`, `tool_use_input`, `user_text`, `any`), severity,
   scope (deck_global / per_construct), origin, authored_at.
-- `TripwireEngine` — register/unregister/scan registry. Compiles
-  regexes eagerly at register time (errors surface on registration,
-  not at first match). scan() does scope + event_kind gating before
-  text extraction, then regex match. Fires dispatch via on_fire
-  callback after the scan loop completes (so listeners can mutate
-  the registry without iterator invalidation).
+- `TripwireEngine` — register/unregister/scan registry plus
+  `clear_by_origin(origin)` for slice 2's "drop all LLM_AUTHORED
+  before re-author" lifecycle. `register` returns `bool` (True on
+  success, False on bad regex / unknown pattern_type) so authoring
+  can tell which entries actually landed. scan() does scope +
+  event_kind gating before text extraction; fires dispatch after
+  the scan loop completes (listeners can mutate the registry without
+  iterator invalidation).
 - Field-extractor functions — pull text out of stream-json events
-  by structural type (assistant text blocks, thinking blocks,
-  tool_use input/command, tool_result content). The field selector
-  is what makes tripwires precise — won't false-fire on incidental
-  text mentions of dangerous-looking tokens.
+  by structural type. The field selector is what makes tripwires
+  precise — won't false-fire on incidental text mentions of
+  dangerous-looking tokens.
 - `DEFAULT_TRIPWIRES` — two ship-with-the-deck patterns
-  (keyword_credentials at low severity, keyword_destructive_sql at
-  warning). `install_default_tripwires(engine)` is idempotent.
+  (keyword_credentials low, keyword_destructive_sql warning).
+  `install_default_tripwires(engine)` is idempotent.
+- **Slice 2 authoring layer:** `TRIPWIRE_AUTHORING_SYSTEM_PROMPT`
+  (separate from Q&A), `build_authoring_user_prompt(...)` (formats
+  goal + brake + defaults + blacklist for the LLM), and
+  `parse_authoring_response(raw)` (tolerant: strict JSON →
+  markdown-fence extract → balanced-brace fallback → giveup;
+  per-entry validation with rejection reasons).
+  `TripwireAuthoringResult` dataclass carries the outcome to the
+  caller (success, registered, rejected, used_resume, error,
+  elapsed_s, raw_response). The orchestration that ties prompt +
+  subprocess + engine mutation lives on the Watchdog.
 - Severity / Field / Origin / Scope class-as-namespace constants
-  (Pythonic — same pattern as construct.EventKind).
+  (same pattern as construct.EventKind).
 
 ### `daemon.py` (685 LOC)
 - `Daemon` class with both backends
@@ -480,7 +503,7 @@ substantive change is still useful. Keep it.
 | Plugin awareness in prompts | `tui.py` `_build_daemon_system_prompt` + `_build_deck_addendum` |
 | Watchdog Blacklist | `watchdog.py` `Blacklist` / `BlacklistEntry` (data) + `tui.py` `action_hard_kill_focused` (populate) + `tui.py` `_handle_blacklist_event` (render + flag) + `daemon_session.py` `_execute_action` spawn branch (refusal) + `daemon_session._format_outcomes` (daemon-facing surface) |
 | Watchdog Q&A persistence | `watchdog.py` `WatchdogHistory` / `WatchdogHistoryEntry` (data + replay) + `Watchdog._safe_callback` (write on resolve) + `tui.py` `_replay_watchdog_history` (mount-time read) + `WatchdogPane.write_history_separator` / `write_live_session_marker` (visual chrome) |
-| Tripwires (slice 1) | `tripwires.py` (`Tripwire` data + `TripwireEngine` + field extractors + `DEFAULT_TRIPWIRES`) + `Watchdog.__init__` (engine ownership + default install) + `tui._scan_for_tripwires` (Fleet listener feeding events into engine) + `tui._handle_tripwire_fire` (chatlog rendering with severity-colored markup) |
+| Tripwires (slices 1 + 2) | `tripwires.py` (`Tripwire` data + `TripwireEngine` + field extractors + `DEFAULT_TRIPWIRES` + `TRIPWIRE_AUTHORING_SYSTEM_PROMPT` + `build_authoring_user_prompt` + `parse_authoring_response` + `TripwireAuthoringResult`) + `Watchdog.__init__` (engine ownership + default install + `_session_id` capture) + `Watchdog.author_tripwires` (slice 2 orchestrator: subprocess + parse + engine mutation) + `tui._scan_for_tripwires` (Fleet listener feeding events into engine) + `tui._handle_tripwire_fire` (chatlog rendering with severity-colored markup) + `tui._kick_off_tripwire_authoring` / `_author_tripwires_wrapper` / `_render_tripwire_authoring_result` (slice 2 trigger + worker + chatlog announcement) — trigger sites are `_start_daemon_task` (goal-start) and the mid-flight branch of `_handle_goal_submitted` (goal-update, gated on classification != "clarification") |
 
 ---
 

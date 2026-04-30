@@ -27,18 +27,52 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** **watchdog tripwires slice 2 — LLM authoring** (slice 1
-shipped 2026-04-29: deterministic matcher engine, small DSL with
-field selectors, two default deck-wide tripwires, full Watchdog →
-Fleet listener → chatlog rendering chain). Slice 2 authors
-tripwires from the LLM at goal-start and explicit goal-update
-(netrunner `e`); per-outcome adaptive re-authoring is blocked on a
-"daemon signals plan shift" event we don't have yet. Then
-log-readability overhaul, then D1 (local model substrate) for the
-long-term Watchdog/synthesizer/arbiter story. Plugin scaffolding,
-brake-as-deck-state, connection spawn-blocking, brake-denial
-visual, watchdog blacklist, watchdog Q&A persistence, and tripwires
-slice 1 all shipped in the post-migration wave.
+**Up next:** **the spine — unified event stream** (full design at
+`cyberdeck-event-stream-design.md`). One canonical event bus that
+every event source on the deck publishes to; every observer
+subscribes via a role-derived filter. Replaces the current sprawl
+of 11 independent callback chains the TUI manually glues together —
+that pattern decays silently as new event types land (caught
+2026-04-29 when slice 2 testing surfaced two sibling bugs: the
+magnified chatlog view and the watchdog Q&A context were both
+blind to direct-write markers, despite the watchdog system prompt
+explicitly instructing the model to read those markers from the
+chatlog). Tactical fix shipped with slice 2 (push direct writes
+into `_chatlog_event_buffer` under `kind="direct"`, teach both
+readers about the new kind). The unified spine is the strategic
+fix — single source of truth, role-derived filters, introspectable
+visibility ("what does the watchdog see?" → check its filter; no
+more tracing through middleware). Absorbs the previously-planned
+logger + quit discipline slice — the file logger becomes a bus
+subscriber, lifecycle events including SIGINT-swallow / smart
+Ctrl+Q / EJECT-responsiveness publish through the same stream.
+Maintbot becomes another bus consumer once the stream is in.
+Migration is 8 phased mini-slices, each shippable independently.
+Then D1 (local model substrate) for the long-term Watchdog/
+synthesizer/maintbot story. Plugin scaffolding, brake-as-deck-state,
+connection spawn-blocking, brake-denial visual, watchdog blacklist,
+watchdog Q&A persistence, tripwires slice 1, and tripwires slice 2
+(LLM authoring) all shipped in the post-migration wave.
+
+**Filed mid-design (2026-04-29):** **maintbot architecture** — a
+separate-process supervisor / repair entity that operates on **deck
+infrastructure** rather than on the world (different domain from
+daemon/construct/watchdog, no role collision). Two activation modes
+(headless: maintbot wraps deck as supervisor; interactive: deck top
+level + tiny heartbeat sensor sidecar that fires the maintbot on
+unclean exit). v1 is diagnose-only, cloud Claude substrate; v2 adds
+guided correction; v3 auto-relaunch is deferred indefinitely. Full
+design at `cyberdeck-maintbot-design.md`. Blocked on the unified
+event stream slice (maintbot reads the bus's tail + the file log,
+both are stream-derived) and ideally on D1 (cost profile becomes
+unsustainable on cloud for headless 24/7 use). Either constraint
+satisfied + a free session = v1 is buildable.
+
+**Filed 2026-04-29:** **unified event stream / spine** — see
+`cyberdeck-event-stream-design.md`. Captures the architectural
+generalization that the slice 2 buffer-decay bug pattern made
+inevitable. New top priority for implementation; absorbs the prior
+"logger + quit discipline" slice as Phase 7 of the migration.
 
 **Deferred mid-design (2026-04-27):** keymap revision pass and
 daemon planning mode + pause/unpause. Both started this session,
@@ -62,6 +96,13 @@ and 10.
 - `/mnt/project/cyberdeck-arbiter-addendum.md` — arbiter + wearable variant
 - `/mnt/project/cyberdeck-compliance-future.md` — engagement-grade
   ingress filtering. *Deferred indefinitely.*
+- `cyberdeck-maintbot-design.md` — supervisor / repair process
+  architecture. Filed 2026-04-29; implementation deferred until
+  the unified event stream lands (the maintbot reads from it).
+- `cyberdeck-event-stream-design.md` — unified event bus / "spine"
+  architecture. Filed 2026-04-29; new top priority for implementation.
+  Absorbs the prior logger + quit discipline slice; substrate for
+  maintbot, morgue, list-names, B2 synthesizer, tripwires slice 3.
 
 ### Outputs (working files; sync targets for chat artifacts)
 - `cyberdeck-spec.md` (sync of canon)
@@ -320,20 +361,104 @@ and 10.
   scoping, bad-regex graceful skip, unregister, ANY-field
   aggregation, re-register replacement, and Fleet→Engine→TUI
   rendered output shape with severity styling differentiation.
-- **Slice 2 next**: LLM-authored tripwires. Watchdog runs an
-  authoring pass at goal-start (and explicit goal-update via `e`)
-  asking "given this goal, what patterns should we watch for?";
-  registers the returned tripwires per-construct or globally for
-  the session. Per-outcome re-authoring (construct→daemon callback
-  triggering a re-author) is a real concern but needs a "daemon
-  signals plan shift" event we don't have yet — defer until that
-  signal exists.
+- **Slice 2 shipped 2026-04-29 (LLM authoring).** Pulled out into
+  its own section below for readability. Per-outcome adaptive
+  re-authoring remains deferred — needs a "daemon signals plan
+  shift" event we don't have yet.
 - **Other future slices**: severity-aware routing (slice 3 — critical
   pulls focus); persistent tripwire library at `<home>/tripwires/`
   with TOML authoring (slice 4); daemon-side severity hints (slice
   5); blacklist-derived tripwires that catch in-flight matches by
   scanning event content rather than just task fingerprints
   (slice 6 — pairs with the existing in-flight match scan).
+
+### Watchdog Tripwires (LLM authoring, slice 2)
+- **`Watchdog.author_tripwires(goal, *, classification, old_goal,
+  brake_label, blacklist_summary, timeout)`** runs one authoring pass
+  via a fresh `claude -p` one-shot subprocess. Returns
+  `TripwireAuthoringResult` (success / registered / rejected /
+  used_resume / error / elapsed_s / raw_response).
+- **Two-rung substrate.** Rung 1: when the watchdog's streaming Q&A
+  subprocess has captured a session_id (from the `system`/`init`
+  event), authoring spawns its one-shot with `--resume <id>` to
+  **fork** the running Q&A session — the authoring model inherits
+  the conversation context (knows what the watchdog has been asked
+  about so far, what's happening in the fleet) without writing back
+  into the live Q&A subprocess. Rung 2: no session captured (cold
+  start, streaming disabled, post-wedge) → fresh one-shot, no
+  conversation history but the same goal/brake/defaults/blacklist
+  context via the user message body. The chatlog labels each pass
+  `(fork, …s)` or `(fresh, …s)` so the netrunner can spot when fork
+  is silently failing and falling back. No auto-fallback today —
+  the choice is deterministic per-call based on whether
+  `_session_id` is set.
+- **Trigger sites in TUI:** `_start_daemon_task` covers both
+  `--goal` launch and idle→running submit (one path serves both).
+  `_handle_goal_submitted`'s mid-flight branch covers explicit `e`
+  edits, gated on `classification != "clarification"` —
+  clarifications add detail without changing direction so re-running
+  authoring would burn tokens for no signal change. Pivots and
+  scope-changes re-author from scratch.
+- **Lifecycle: clear, then register.** Each authoring pass calls
+  `engine.clear_by_origin(Origin.LLM_AUTHORED)` BEFORE registering
+  the new entries. Defaults / manual / blacklist-derived entries
+  stay untouched. "Replace, don't accumulate" — old-goal rules don't
+  linger after a pivot. Even authoring failures (subprocess error,
+  timeout, unparseable JSON) clear the prior LLM-authored set
+  before bailing — old rules shouldn't survive intent shifts just
+  because the substrate failed.
+- **Authoring system prompt** is a separate constant
+  (`TRIPWIRE_AUTHORING_SYSTEM_PROMPT` in `tripwires.py`) embedded in
+  the user message body rather than passed via
+  `--append-system-prompt`. Two reasons: (1) rung-1 forks resume
+  sessions whose system prompt is already the Q&A one — we
+  mode-switch via in-body instructions rather than layering, which
+  composes more predictably, and (2) multi-line argv content with
+  `--append-system-prompt` has Windows mangling issues per the
+  watchdog one-shot path's existing comment. Single source across
+  both rungs.
+- **JSON parser is tolerant.** Strict parse first, then markdown
+  fence extract (claude regularly wraps despite "no fences"
+  instructions), then balanced-brace fallback. Per-entry validation
+  rejects bad fields/severities/scopes/duplicates with reason. The
+  engine's `register` was changed from returning `None` to returning
+  `bool` so regex-compile failures get added to the rejected list
+  too — slice-1 callers that ignore the return value still work
+  unchanged.
+- **Fire-and-forget at the call site.** TUI's
+  `_kick_off_tripwire_authoring` spawns the worker via
+  `self.run_worker(...)`; goal-set / goal-update flow continues
+  immediately. The first few construct events may stream in before
+  authored rules land — that's fine, the two default deck-wide
+  tripwires (credentials, destructive SQL) cover the baseline. The
+  authoring task self-announces start (`[dim][watchdog] authoring
+  tripwires for current goal…[/dim]`) and renders one of three
+  completion shapes:
+  - Success with rules: `[yellow][watchdog] +N tripwires authored
+    (fork|fresh, Xs):[/yellow] name1, name2, …` + one dim line per
+    rejected entry with reason
+  - Success with no rules: `[dim][watchdog] authored 0 tripwires
+    (…) — no rules applied[/dim]` (legitimate outcome — model
+    decided no patterns warranted, better than padding)
+  - Failure: `[red][watchdog] tripwire authoring failed[/red]
+    (…)` + raw-response preview if it was a parse failure
+- **Watchdog Q&A system prompt** grew an updated TRIPWIRE AWARENESS
+  paragraph: distinguishes default vs LLM-authored tripwires,
+  explains the new chatlog markers (`[watchdog] +N authored`,
+  `authoring failed`, etc.), tells Q&A how to answer "what
+  tripwires are active?" against the chatlog markers (no live
+  registry plumbing — slice 2's Q&A view is still chatlog-derived).
+- **Verified inline:** parser shape (strict / fenced / brace / mixed
+  valid+invalid / empty / garbage), engine `clear_by_origin`
+  lifecycle, `register` bool return, prompt-builder shape for both
+  goal-start and goal-update inputs. Real-deck smoke pending —
+  the rung-1 `--resume` fork against a live streaming session is
+  the one piece that can't be confidently mock-tested. Behavior to
+  watch on first real-deck run: does `--resume <id>` against a
+  session whose original streaming subprocess is still alive
+  produce a clean fork, or does the server reject / mangle? If the
+  latter, fall back to forcing rung 2 (delete the session_id
+  capture) until we can dig into the server-side semantics.
 
 ### Watchdog Blacklist (session-scoped, populated by Shift+K)
 - `Blacklist` + `BlacklistEntry` in `watchdog.py`. Lives on the
@@ -457,6 +582,33 @@ and 10.
     payload carries who spawned each construct.
 20. **z-modal:** bracket escape on plain text, syntax highlighting
     on known languages, github-dark theme, no line numbers.
+21. **Tripwire authoring forks the watchdog's Q&A session via
+    `--resume <id>` rather than running on a fresh isolated subprocess.**
+    The authoring model gets the same situational awareness the Q&A
+    side has accumulated (recent fleet activity, prior questions
+    answered) without writing back into the live Q&A conversation.
+    Falls back to a fresh one-shot when no session_id is captured
+    (cold start, streaming disabled, post-wedge). Server-side
+    semantics of concurrent `--resume` against a live streaming
+    session aren't fully proven — slice 2 ships the design and trusts
+    real-deck testing to confirm. If `--resume` misbehaves under
+    concurrency, dropping `_session_id` capture flips the whole thing
+    to rung 2 with no other code change.
+22. **LLM_AUTHORED tripwires use clear-and-replace, not accumulate
+    -and-update.** Each authoring pass drops prior LLM-authored
+    entries before registering new ones; defaults / manual /
+    blacklist-derived entries stay untouched. Rejected alternative
+    "register-by-name updates in place" because old-goal rules linger
+    forever otherwise — pivot to unrelated work, yesterday's
+    credentials-hunting rule still fires. Even authoring failures
+    clear the prior set, so a substrate hiccup doesn't preserve
+    rules whose original goal context is gone.
+23. **Authoring skips on clarification-class goal updates.** The
+    `_classify_goal_diff` heuristic is repurposed as a re-author
+    gate: pivots and scope-changes get a new authoring pass; pure
+    clarifications (old goal is a strict subset of new) skip — the
+    netrunner is adding detail to existing direction, the model
+    already authored for it, re-running burns tokens for no signal.
 
 ---
 

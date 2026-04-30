@@ -1,0 +1,1 @@
+wt --fullscreen python tui.py
