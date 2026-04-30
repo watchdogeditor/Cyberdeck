@@ -63,6 +63,20 @@ visual, watchdog blacklist, watchdog Q&A persistence, tripwires
 slice 1, and tripwires slice 2 (LLM authoring) all shipped in the
 post-migration wave.
 
+**Filed (2026-04-30, late):** **Caliber selection** — per-spawn
+model + effort + fast-mode bundle the daemon picks based on task
+needs and remaining quota; the daemon's own caliber is markable and
+netrunner-overridable. Anthropic's effort surface (`output_config.
+effort` API / `--effort` CLI / `/effort` slash command / settings
+`effortLevel`) maps cleanly onto the deck's existing per-spawn
+settings JSON plumbing. Pool stays single-caliber (sonnet+high
+default); non-matching daemon-picked spawns fall through to fresh
+— same shape as the existing "non-default profile spawns fresh"
+pattern. Five phases filed; phases 1-3 + 5 ship without quota
+awareness, phase 4 hard-blocks on build-plan item 12 (quota-aware
+throttling). Implementation deferred behind Mechanic v0. Full
+design at `cyberdeck-model-effort-design.md`.
+
 **Filed (2026-04-30):** Mechanic two-tier architecture — supervisor
 half (always-on, no LLM, cross-platform Python; PID tracking +
 heartbeat + subprocess cleanup on deck death) + LLM session half
@@ -111,6 +125,10 @@ and 10.
   architecture. Filed 2026-04-29; new top priority for implementation.
   Absorbs the prior logger + quit discipline slice; substrate for
   maintbot, morgue, list-names, B2 synthesizer, tripwires slice 3.
+- `cyberdeck-model-effort-design.md` — caliber (per-spawn model +
+  effort + fast-mode) selection. Filed 2026-04-30; implementation
+  queued behind Mechanic v0. Phase 4 (quota-aware fallback)
+  hard-blocks on build-plan item 12.
 
 ### Outputs (working files; sync targets for chat artifacts)
 - `cyberdeck-spec.md` (sync of canon)

@@ -24,7 +24,7 @@ Then the four other canon docs, in this order:
   - `cyberdeck-spec.md` — canonical architecture (the *what*)
   - `cyberdeck-philosophy.md` — convictions that resolve ambiguity (the *why*)
 
-Two architecture docs for the major in-flight initiatives:
+Three architecture docs for the major in-flight initiatives:
   - `cyberdeck-event-stream-design.md` — the spine (one canonical
     event bus, role-derived filters). Phases 1-7 shipped 2026-04-30;
     Phase 8 cleanup is the last remaining slice.
@@ -32,6 +32,12 @@ Two architecture docs for the major in-flight initiatives:
     supervisor + on-demand LLM session). Two-tier architecture
     landed 2026-04-30; v0 (supervisor only — subprocess janitor) is
     the next implementation slice.
+  - `cyberdeck-model-effort-design.md` — caliber (per-spawn model +
+    effort + fast-mode). Daemon picks per construct based on task
+    + remaining quota; netrunner overrides via Limits modal or
+    daemon chat. Filed 2026-04-30; implementation queued behind
+    Mechanic v0. Phase 4 (quota-aware fallback) hard-blocks on
+    build-plan item 12.
 
 Two more for specific moments: `cyberdeck-project-instructions.md`
 (collaboration norms), `cyberdeck-tools-research-seed.md` (seed for a

@@ -327,6 +327,25 @@ natively, doesn't suffer chat context truncation.
   Real-deck verified 2026-04-30 — rung-1 fork at 4.2s elapsed
   (vs 19.7s fresh on the same session) with no Q&A session
   collision.
+- ✓ y/Y copy keybind (2026-04-30) — yank focused widget to OS
+  clipboard. y = rendered text (vim-yank semantic, surface map
+  matches `z` zoom); Y = structured JSON (raw events for panes,
+  full bus snapshot for chatlog, dataclass dicts for list items).
+  New `clipboard.py` module: ctypes Win32 / pbcopy / xclip-wl-copy
+  cascade, stdlib-only. Sidesteps the Ctrl+C-as-copy
+  SIGINT-into-subprocesses pain at the UX layer. Two diagnosis
+  detours filed as gotchas: (1) `text=True` cp1252 default encoder
+  silently exploding on Unicode then timing out, and (2) clip.exe
+  preserving the UTF-16-LE BOM into clipboard contents. Also fixes
+  `_serialize_payload` Path → repr leak that affected both the
+  yank JSON and the per-launch .log files.
+- ✓ Limits modal rework (2026-04-30) — uncapped construct counts
+  (max_concurrent ceiling of 9 retired; pool_size now adjustable
+  in the modal; defaults bumped to 10/30/5). Pool refill gate
+  added to `_spawn_warming_task` so a lowered target stops
+  oversubscribing on subsequent pulls. Latent
+  `max_total_spawns == 0 → "no cap"` daemon-session guard
+  finally honors what the modal has long advertised.
 
 **Spine progress (2026-04-30): 7/8 phases shipped** — see
 `cyberdeck-event-stream-design.md`. Producer migration (Phase 1-5)
@@ -360,16 +379,20 @@ queued behind Mechanic v0.
    / `on_event` / `on_change` callback shims now that everyone
    publishes through the bus. Last spine slice. ~30 LOC across the
    producer modules + tui.py wiring. Low-risk, mechanical.
-3. **QOL: in-deck copy keybind.** Sidesteps the Ctrl+C-subprocess
-   issue at the UX layer entirely. Bind a new key (e.g., `y`,
-   `Ctrl+Y`, or `Ctrl+Shift+C`) that reads the focused widget's
-   content and writes to clipboard via stdlib subprocess (`clip` on
-   Windows, `xclip`/`wl-copy` on Linux, `pbcopy` on macOS). ~50 LOC
-   total, no new dependency, cross-platform. Most useful site is
-   the magnified view (`z`) where the netrunner reads things worth
-   sharing. Composes with future "copy this construct's output" /
-   "copy the watchdog's last answer" features as a clipboard-write
-   primitive.
+3. **Model + effort selection — "caliber" per spawn.** The daemon
+   picks `--model` and `--effort` per construct based on task
+   needs and remaining quota; the daemon's own caliber is markable
+   and netrunner-overridable (CLI flags, Limits modal, daemon
+   chat). Three independent axes (model, effort, fast-mode)
+   bundled as a `Caliber` dataclass. Pool stays single-caliber
+   (default sonnet+high); non-matching daemon-picked spawns fall
+   through to fresh — same pattern as non-default profile spawns.
+   Five phases: phase 1 (caliber primitive + per-spawn plumbing),
+   phase 2 (pool caliber + reuse), phase 3 (daemon caliber +
+   override), phase 4 (quota-aware fallback — HARD-BLOCKED on
+   item 12 below), phase 5 (UI polish + introspection). Phases
+   1-3 + 5 are shippable independently of quota awareness. Full
+   design at `cyberdeck-model-effort-design.md`.
 4. **Log-readability overhaul** — fleet/chatlog/watchdog/daemon
    scattered across windows is hard to follow at a glance; needs
    structural thinking, not just CSS. Distinct from the file-log
