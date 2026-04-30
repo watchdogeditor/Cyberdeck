@@ -73,7 +73,7 @@ settings JSON plumbing. Pool stays single-caliber (sonnet+high
 default); non-matching daemon-picked spawns fall through to fresh
 — same shape as the existing "non-default profile spawns fresh"
 pattern. Five phases filed; phases 1-3 + 5 ship without quota
-awareness, phase 4 hard-blocks on build-plan item 12 (quota-aware
+awareness, phase 4 hard-blocks on build-plan item 13 (quota-aware
 throttling). Implementation deferred behind Mechanic v0. Full
 design at `cyberdeck-model-effort-design.md`.
 
@@ -106,8 +106,8 @@ derive UI → derive keymap) is the new approach. Planning mode
 revised intent: it's a **modal** the netrunner opens (not a
 daemon state), used for goals too complex for a single-message
 goal-set, post-confirm produces a persistent tracking panel akin
-to Claude Code's "tasks" panel. Full notes in build plan items 8
-and 10.
+to Claude Code's "tasks" panel. Full notes in build plan items 9
+and 11.
 
 ---
 
@@ -128,7 +128,7 @@ and 10.
 - `cyberdeck-model-effort-design.md` — caliber (per-spawn model +
   effort + fast-mode) selection. Filed 2026-04-30; implementation
   queued behind Mechanic v0. Phase 4 (quota-aware fallback)
-  hard-blocks on build-plan item 12.
+  hard-blocks on build-plan item 13.
 
 ### Outputs (working files; sync targets for chat artifacts)
 - `cyberdeck-spec.md` (sync of canon)
@@ -909,6 +909,24 @@ and 10.
 - **Plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`)**
 - **Daemon pause/unpause (`E`)**
 - **Goal-edit force-push** — apply-now interrupt
+- **Per-run workspace compartmentalization** — netrunner
+  direction (2026-04-30). Default spawn cwd graduates from bare
+  `<home>/` to `<home>/runs/<run_id>/`; all constructs in a run
+  share the run's folder. Fixes the file-browser-mess problem
+  where many runs over time pile their working files flat in
+  `<home>/`. Concrete value: a research → synthesis pipeline
+  (one construct researches into N files, another assembles
+  the report from those files) gets a clean shared cwd by
+  default. Profiles, plugins, `.cyberdeck/` state, and the
+  dispatcher script stay where they are — only spawn cwd
+  changes. Composes with universal list-names (folder name
+  becomes `run-{run_id}-{list_name}/` once that lands), the
+  morgue (each session record gains a `cwd` field for
+  one-click pivot to that run's folder in a file browser),
+  and the existing files-panel dedupe (no logic change). Not
+  blocking anything, not blocked by anything; ~50-80 LOC
+  implementation, shippable in a focused session post-Mechanic
+  v0. Full notes in build plan item 8.
 - **B2 fleet synthesizer** — substrate-blocked on D1
 - **D1/D2/D3** — local-model runtime, arbiter, B2 on local
 - **Compliance mode (Phase E)**

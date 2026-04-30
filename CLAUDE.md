@@ -37,7 +37,7 @@ Three architecture docs for the major in-flight initiatives:
     + remaining quota; netrunner overrides via Limits modal or
     daemon chat. Filed 2026-04-30; implementation queued behind
     Mechanic v0. Phase 4 (quota-aware fallback) hard-blocks on
-    build-plan item 12.
+    build-plan item 13.
 
 Two more for specific moments: `cyberdeck-project-instructions.md`
 (collaboration norms), `cyberdeck-tools-research-seed.md` (seed for a

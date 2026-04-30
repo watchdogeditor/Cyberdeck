@@ -229,13 +229,13 @@ exhaustive policy" principle.
 ## Quota awareness — the dependency
 
 The "ratchet down on low quota" leg requires quota signal the deck
-doesn't have today. Build plan item 12 ("quota-aware throttling")
+doesn't have today. Build plan item 13 ("quota-aware throttling")
 covers this: a Claude Code status-line script reads
 `rate_limits.{five_hour,seven_day}.used_percentage` and writes them
 to `<deck>/.cyberdeck/quota.json`; the deck reads that file when
 making spawn decisions.
 
-This design *requires* item 12 to land first or alongside. Without
+This design *requires* item 13 to land first or alongside. Without
 quota signal, the daemon can pick model+effort by task properties
 but can't optimize for "we're running out." That's still useful —
 the speed/complexity axis alone is most of the value — but the
@@ -244,7 +244,7 @@ behavior.
 
 Phasing: ship model+effort selection without quota awareness first
 (daemon picks based on task only); wire quota in as a second slice
-once item 12's signal exists. The first slice is shippable on its
+once item 13's signal exists. The first slice is shippable on its
 own.
 
 ---
@@ -385,9 +385,9 @@ core; 4 and 5 are quota-dependent and UX polish respectively.
 - Help modal (`?`) grows a CALIBER section listing the model
   aliases and effort levels.
 
-### Phase 4: Quota-aware fallback (BLOCKED on build-plan item 12)
+### Phase 4: Quota-aware fallback (BLOCKED on build-plan item 13)
 
-- Read `<deck>/.cyberdeck/quota.json` (per item 12's design).
+- Read `<deck>/.cyberdeck/quota.json` (per item 13's design).
 - Add a quota-aware band to the daemon system prompt: at
   >75% used, prefer one tier down; at >90%, refuse non-essential
   spawns with the reason surfaced in the outcome turn.
@@ -423,7 +423,7 @@ diagnose-only work; cheap and fast).
 **Independent.** Caliber events flow through the bus from day one;
 no changes needed when add_listener shims retire.
 
-### Quota-aware throttling (build plan item 12)
+### Quota-aware throttling (build plan item 13)
 
 **Hard prerequisite for phase 4.** Without quota signal, the
 daemon's "ratchet down on low budget" leg has no input. Phase 1-3
@@ -603,4 +603,4 @@ Caliber is the next routing decision in line.
 build-plan priority order. When picking this up, start with phase
 1 (caliber primitive + per-spawn plumbing) — it's small, isolated,
 and the rest depend on it. Phase 4 unlocks once quota awareness
-(build plan item 12) lands; phases 1-3 + 5 are independent.*
+(build plan item 13) lands; phases 1-3 + 5 are independent.*

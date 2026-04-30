@@ -7,7 +7,7 @@
 > (frequency, tags, capability gaps) → AI does Layer 2 synthesis →
 > joint Layer 3 keymap proposal → spec/orientation/CLAUDE.md/tui.py
 > updates per the spec-impact checklist at the bottom. See build plan
-> item 10 for context.
+> item 11 for context.
 
 *Filed 2026-04-27. Working document for revising the keymap based on
 real-deck usage. Methodology shifted (also 2026-04-27) from

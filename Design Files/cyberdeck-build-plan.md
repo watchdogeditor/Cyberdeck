@@ -173,7 +173,60 @@ Roughly ordered by likely appeal:
 6. **Construct script-launch wiring** — ScriptListItem space lands
    here once manifests exist.
 7. **Goal-edit force-push** — apply-now interrupt of in-flight turn.
-8. **Daemon planning mode + pause/unpause (`E`).** Originally framed
+8. **Per-run workspace compartmentalization.** Default spawn cwd
+   becomes `<home>/runs/<run_id>/` instead of bare `<home>/`. All
+   constructs in a run share the run folder; created on first
+   spawn, kept across the run's lifetime. Profiles, plugins,
+   `.cyberdeck/` state, and the dispatcher script
+   (`<home>/tools/deck/cyberdeck.py`) stay where they are — only
+   *spawn cwd* changes. Concrete value the netrunner called out:
+   when one construct does research and writes findings to a few
+   files, then a synthesis construct assembles a report from
+   those files, the synthesis construct's cwd already contains
+   exactly the source material. Today everything piles up flat in
+   `<home>/`, run after run, and a file browser is a mess.
+
+   Natural intersections:
+   - **Universal list-names.** Folder name graduates from
+     `run-29a3fd08/` to `run-29a3fd08-{list_name}/` once that
+     lands ("run-29a3fd08-recon-supplychain-vuln" beats the bare
+     hex slug). The folder is the obvious place for the
+     run-level list_name to live.
+   - **The morgue.** Each finalized session record gains a
+     `cwd` field naming its run folder. Morgue UI → file browser
+     becomes one click.
+   - **Files panel.** Already tracks absolute paths with
+     `normcase + normpath` dedupe; per-run folders just make
+     paths longer, no dedupe-logic change.
+   - **Brake hook.** Already exempts `cyberdeck-home/` from the
+     deck-source-dir guard; per-run subdirs are inside that
+     exemption automatically.
+   - **Cross-run reuse.** Constructs in a new run can't see the
+     old run's outputs at default cwd. Two patterns work:
+     (a) absolute paths via the new `y/Y` yank ("here's the
+     file I want this construct to read"); (b) a future
+     "promote to home" affordance that links a run-folder file
+     out to `<home>/` for cross-run reuse. (b) is post-MVP.
+
+   Decisions to make at implementation time:
+   - **Folder name shape** before list_names exist:
+     `run-{run_id}/`, `run-{timestamp}/`, or
+     `run-{timestamp}-{run_id}/`. Lean toward run_id-only for
+     compactness; sortability is a `git log`-style concern, not
+     a directory-listing one.
+   - **Cleanup policy.** Empty folders on shutdown? Stale
+     folders after N days? Or leave to the netrunner. Default
+     to "leave alone" — let the morgue grow this when it lands.
+   - **Ad-hoc-constructs case.** `python tui.py "task A"`
+     without a goal still gets a `run_id`; same path applies
+     cleanly.
+
+   Implementation cost: ~50-80 LOC (Fleet computes run-folder
+   path from `run_id`, creates on first spawn, threads through
+   to Construct cwd default; LimitsScreen / sidebar untouched).
+   Not blocking anything, not blocked by anything. Could ship
+   in a focused session post-Mechanic v0.
+9. **Daemon planning mode + pause/unpause (`E`).** Originally framed
    as the next milestone post-migration; deferred behind the keymap
    revision because (a) it'd add new bindings to a keymap that's about
    to shift, and (b) the design needs more thought than the first
@@ -211,8 +264,8 @@ Roughly ordered by likely appeal:
      side-task; visible (woven into plan) is rare. Soft/loud framing
      may be upside-down here. Worth examining as part of the keymap
      revision when that thread re-opens.
-9. **Plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`).**
-10. **Keymap revision pass.** Real-deck use surfaced that the keymap
+10. **Plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`).**
+11. **Keymap revision pass.** Real-deck use surfaced that the keymap
     is starting to feel obtuse — too many global verbs to memorize,
     semantic-amplifier convention only actually applies cleanly to
     `q/Q` and `k/K` (the rest are arbitrary modal switches), some keys
@@ -226,8 +279,8 @@ Roughly ordered by likely appeal:
     Pickup next time: netrunner marks up Layer 1 (frequency, tags,
     capability gaps), AI does Layer 2 synthesis, Layer 3 keymap
     proposal lands jointly. Blocks new bindings until done — so
-    planning mode (item 8) sits behind this when both unblock.
-11. **Retrospective observability — the morgue + watchdog log.**
+    planning mode (item 9) sits behind this when both unblock.
+12. **Retrospective observability — the morgue + watchdog log.**
     Two paired ideas from a netrunner brainstorm: (a) a "morgue"
     persistent session log + UI that lets the netrunner browse and
     *resuscitate* past construct sessions via `--resume`, turning
@@ -244,7 +297,7 @@ Roughly ordered by likely appeal:
     in state.md) — wiring resuscitates by *piping* output into a
     new construct; the morgue resuscitates by *resuming* the same
     session_id. Different recovery paths, complementary.
-12. **Quota-aware throttling.** Daemon gates spawns on remaining Max
+13. **Quota-aware throttling.** Daemon gates spawns on remaining Max
     quota — warn or hold when the 5h or weekly window is near full.
     Mechanism: Claude Code's status-line script receives
     `rate_limits.five_hour.used_percentage` and `seven_day.used_percentage`
@@ -390,7 +443,7 @@ queued behind Mechanic v0.
    Five phases: phase 1 (caliber primitive + per-spawn plumbing),
    phase 2 (pool caliber + reuse), phase 3 (daemon caliber +
    override), phase 4 (quota-aware fallback — HARD-BLOCKED on
-   item 12 below), phase 5 (UI polish + introspection). Phases
+   item 13 below), phase 5 (UI polish + introspection). Phases
    1-3 + 5 are shippable independently of quota awareness. Full
    design at `cyberdeck-model-effort-design.md`.
 4. **Log-readability overhaul** — fleet/chatlog/watchdog/daemon
