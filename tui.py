@@ -22,6 +22,7 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from rich.text import Text
@@ -3860,7 +3861,11 @@ class CyberdeckApp(App):
         # from the receiving end, and we'd rather not double-log.
         line = chatlog_format_daemon(event)
         if line is not None:
-            self._chatlog_write(line)
+            # buffer_direct=False: we push the original DaemonEvent
+            # below for re-render with untruncated=True in the
+            # magnified view. Letting _chatlog_write also push the
+            # pre-rendered line would produce duplicates.
+            self._chatlog_write(line, buffer_direct=False)
             self._chatlog_event_buffer.append(("daemon", event))
 
     def _handle_event(self, fevent: FleetEvent) -> None:
@@ -3885,7 +3890,11 @@ class CyberdeckApp(App):
         # re-render in untruncated mode.
         line = chatlog_format_fleet(fevent)
         if line is not None:
-            self._chatlog_write(line)
+            # buffer_direct=False: same reasoning as the daemon path —
+            # the explicit FleetEvent push below is what enables the
+            # magnified view's untruncated re-render. Auto-buffering
+            # the pre-rendered line here would duplicate the entry.
+            self._chatlog_write(line, buffer_direct=False)
             self._chatlog_event_buffer.append(("fleet", fevent))
         # Keep sidebar counters / cost live. Cheap enough to do per event;
         # Textual only repaints when the Label's content actually changes.
@@ -4265,7 +4274,7 @@ class CyberdeckApp(App):
             files_lv.append(FileListItem(construct_id, fp, display_path=display))
             existing_keys.add(key)
 
-    def _chatlog_write(self, line: str) -> None:
+    def _chatlog_write(self, line: str, *, buffer_direct: bool = True) -> None:
         """Append a single chatlog line with an HH:MM:SS dim-prefix.
 
         The line is expected to already include color/markup from the
@@ -4274,7 +4283,41 @@ class CyberdeckApp(App):
 
         No-op if the chatlog widget isn't mounted (m3/keyboard-only mode,
         or pre-mount race). Mechanical extraction is best-effort by
-        design — dropping a line never breaks anything else."""
+        design — dropping a line never breaks anything else.
+
+        Buffer side-effect (`buffer_direct=True`, default): the line
+        also lands in `_chatlog_event_buffer` under kind="direct" so
+        the magnified view (`z` ExpandModal) and the watchdog Q&A
+        context-builder can both see it. Without this push,
+        non-fleet/daemon markers (tripwire fires + authoring
+        announcements, brake transitions, blacklist additions,
+        goal-update markers, watchdog Q&A lines) are invisible to
+        both readers — the buffer was previously only fed by
+        FleetEvent / DaemonEvent routing. Verified real-deck:
+        magnified-z showed only fleet/daemon lines while the small
+        chatlog had all the markers; sibling discovery was that the
+        watchdog Q&A context had the same blind spot, which made the
+        TRIPWIRE / BRAKE / BLACKLIST AWARENESS paragraphs in the
+        watchdog system prompt partially vestigial — the model was
+        instructed to read markers that never actually reached its
+        context.
+
+        Why the opt-out parameter: the fleet/daemon dispatch paths
+        (`_handle_event`, `_handle_daemon_event`) call this AND then
+        explicitly push the original FleetEvent / DaemonEvent into
+        the buffer. The original-event push is what lets downstream
+        readers re-render with `untruncated=True` (richer content
+        than the truncated live line). Without `buffer_direct=False`
+        on those paths, every fleet/daemon event would land in the
+        buffer twice — once as a "direct" pre-rendered line, once as
+        the original event object — and the magnified view would
+        show duplicates with slightly different content. The default
+        is True so future direct-write callers (tripwire, watchdog,
+        brake, blacklist, goal-update markers, and anything new) are
+        covered automatically with no per-callsite opt-in. This is
+        a tactical fix; the strategic fix is the unified event
+        stream slice — see `cyberdeck-event-stream-design.md`.
+        """
         try:
             chatlog = self.query_one("#chatlog_log", RichLog)
         except Exception:
@@ -4287,8 +4330,19 @@ class CyberdeckApp(App):
         # the panel is narrow.
         if "\n" in line or "\r" in line:
             line = line.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-        ts = time.strftime("%H:%M:%S", time.localtime())
+        now = time.time()
+        ts = time.strftime("%H:%M:%S", time.localtime(now))
         chatlog.write(f"[dim]{ts}[/dim]  {line}")
+        # Buffer for the magnified-view replay and watchdog Q&A
+        # context. Pre-rendered line is stashed as-is — no formatter
+        # to re-run since the caller already did the markup composition.
+        # Skipped for fleet/daemon paths that push the original event
+        # separately (see docstring).
+        if buffer_direct:
+            self._chatlog_event_buffer.append((
+                "direct",
+                SimpleNamespace(timestamp=now, line=line),
+            ))
 
     def _render_chatlog_buffer(self, *, untruncated: bool = False) -> list[str]:
         """Re-render the chatlog event buffer to a list of formatted
@@ -4311,6 +4365,11 @@ class CyberdeckApp(App):
                     line = chatlog_format_fleet(event, untruncated=untruncated)
                 elif kind == "daemon":
                     line = chatlog_format_daemon(event, untruncated=untruncated)
+                elif kind == "direct":
+                    # Pre-rendered at write-time (tripwire fires,
+                    # watchdog markers, brake transitions, etc.) — no
+                    # formatter to call, just emit the stashed line.
+                    line = event.line
                 else:
                     line = None
             except Exception:
@@ -5824,10 +5883,10 @@ class CyberdeckApp(App):
         return None
 
     # ---- construct interaction -----------------------------------------
-
-    def _focused_pane(self) -> Optional[ConstructPane]:
-        f = self.focused
-        return f if isinstance(f, ConstructPane) else None
+    # (_focused_pane is defined once in the navigation section; this
+    # section consumes it. An identical paste-duplicate used to live
+    # here too, silently overriding the original — caught by slice 2's
+    # in-deck code review against the codebase. Removed 2026-04-29.)
 
     def action_kill_focused(self) -> None:
         """Soft kill: terminate the focused construct. No-op if the
@@ -6397,6 +6456,18 @@ class CyberdeckApp(App):
                     line = chatlog_format_fleet(event, untruncated=True)
                 elif kind == "daemon":
                     line = chatlog_format_daemon(event, untruncated=True)
+                elif kind == "direct":
+                    # Pre-rendered markers (tripwire fires, brake
+                    # transitions, blacklist additions, watchdog
+                    # authoring announcements, goal-update markers).
+                    # The watchdog system prompt explicitly tells the
+                    # model to read these from the chatlog — without
+                    # this branch, those markers were filtered out of
+                    # the Q&A context even though the system prompt
+                    # invoked them. Silent half-instruction. Caught
+                    # 2026-04-29 alongside the parallel magnified-view
+                    # bug; same root cause.
+                    line = event.line
                 else:
                     line = None
             except Exception:
