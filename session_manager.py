@@ -378,7 +378,7 @@ class SessionPool:
     fresh the old way. The pool is an optimization, not a requirement.
 
     Lifecycle:
-        pool = SessionPool(manager, target_size=3, claude_bin="claude")
+        pool = SessionPool(manager, target_size=5, claude_bin="claude")
         await pool.start()
         ...
         entry = await pool.pull()  # marks warm session in_use
@@ -387,7 +387,11 @@ class SessionPool:
     """
 
     DEFAULT_WARM_MESSAGE = "Acknowledge ready."
-    DEFAULT_TARGET_SIZE = 3
+    # Bumped 3 → 5 on 2026-04-30 alongside the deck's max_concurrent
+    # bump (5 → 10). Per netrunner direction: snappier spawns are
+    # worth the modest extra startup token cost. Configurable
+    # in-deck via the `l` Limits modal.
+    DEFAULT_TARGET_SIZE = 5
 
     def __init__(
         self,
@@ -468,8 +472,30 @@ class SessionPool:
         return entry
 
     def _spawn_warming_task(self) -> None:
-        """Schedule a new warming task. No-op if pool is shutting down."""
+        """Schedule a new warming task. No-op if:
+          - pool is shutting down, or
+          - warm + in-flight warming already meets target_size.
+
+        The target-size gate matters when target_size has been lowered
+        mid-session (via the `l` Limits modal). Without it, every
+        pull() unconditionally spawns one refill task, so the pool
+        kept regenerating to the *old* (higher) target as constructs
+        consumed warm sessions — caught real-deck on 2026-04-30 with
+        target lowered 10 → 5 still refilling toward 10. Gating here
+        rather than in pull() means every caller (pull, start,
+        future ones) is bounded automatically; start() pre-computes
+        the right `needed` already, so the check is harmless redundancy
+        for that path and fixes the pull() path.
+
+        warm_count + warming_count is the right denominator: an
+        in-flight warming task will land in the warm pool soon, so
+        counting both prevents pull-pull-pull from oversubscribing
+        when the pool has headroom but not enough completed warmings
+        yet.
+        """
         if self._stopped:
+            return
+        if self.warm_count + len(self._warming_tasks) >= self.target_size:
             return
         task = asyncio.create_task(self._warm_one())
         self._warming_tasks.add(task)

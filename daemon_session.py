@@ -332,7 +332,14 @@ class DaemonSession:
                     self._outcome_event.set()
                     return  # do not increment _total_spawns or call fleet.spawn
 
-            if self._total_spawns >= self.max_total_spawns:
+            # max_total_spawns == 0 is "no cap" per the LimitsScreen
+            # contract (and the --max-spawns CLI help). The check needs
+            # to skip in that case — without this guard the very first
+            # spawn at cap=0 trips wood-chipper-shutoff because
+            # `0 >= 0` is True. Latent bug from before the modal
+            # surfaced this option; caught when the limits-modal
+            # rework on 2026-04-30 made the option reachable in the UI.
+            if self.max_total_spawns > 0 and self._total_spawns >= self.max_total_spawns:
                 # Wood-chipper shutoff. Stop the session cleanly and
                 # surface the reason via the on_daemon_event channel so
                 # the TUI can show it.

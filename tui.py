@@ -1610,6 +1610,7 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         self,
         max_concurrent: int,
         max_total_spawns: int,
+        pool_size: int,
         current_live: int,
         current_spawned: int,
         cost_so_far: float,
@@ -1618,6 +1619,7 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         super().__init__(**kwargs)
         self.initial_max_concurrent = max_concurrent
         self.initial_max_total_spawns = max_total_spawns
+        self.initial_pool_size = pool_size
         self.current_live = current_live
         self.current_spawned = current_spawned
         self.cost_so_far = cost_so_far
@@ -1653,11 +1655,22 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                     id="input_max_total_spawns",
                     type="integer",
                 )
+            with Horizontal(classes="limits_row"):
+                yield Label("pre-warmed session pool size:")
+                yield Input(
+                    value=str(self.initial_pool_size),
+                    id="input_pool_size",
+                    type="integer",
+                )
             yield Label(
-                "[dim]Hard ceiling on max_concurrent is 9 (matches "
-                "the keymap's number-key real estate). Setting "
-                "max_total_spawns to 0 means 'no spawn cap' — "
-                "use with caution.[/dim]"
+                "[dim]No hard ceilings. max_concurrent and "
+                "max_total_spawns each accept 0 = 'no cap' (use with "
+                "caution — burst spawn + cloud quota is a real cost). "
+                "pool_size is the number of pre-warmed claude "
+                "subprocesses kept hot for snappy spawns; 0 disables "
+                "the pool. Raising pool_size mid-session tops up to "
+                "the new target; lowering leaves existing warm sessions "
+                "intact (they'll be consumed naturally).[/dim]"
             )
 
     def on_mount(self) -> None:
@@ -1679,28 +1692,39 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         try:
             mc_str = self.query_one("#input_max_concurrent", Input).value.strip()
             mts_str = self.query_one("#input_max_total_spawns", Input).value.strip()
+            ps_str = self.query_one("#input_pool_size", Input).value.strip()
             mc = int(mc_str)
             mts = int(mts_str)
+            ps = int(ps_str)
         except (ValueError, AttributeError):
             # Bad input — toast back via dismissal of None. Caller
             # will treat as cancel; user can re-open if desired.
             self.dismiss(None)
             return
 
-        # Apply hard ceiling on max_concurrent (spec: 9 max).
-        # Below 1 makes no sense either.
+        # Lower-bound clamps only. The previous "max_concurrent <= 9"
+        # ceiling came from the number-key construct-jump real estate
+        # (Ctrl+1-9); netrunner doesn't actually use those bindings,
+        # and the upcoming UI rework removes the rationale entirely.
+        # Uncapped from 2026-04-30 onward.
+        #
+        # Semantics:
+        #   max_concurrent: must be >= 1 (0 concurrent makes no sense;
+        #     0 spawns is what max_total_spawns=0-and-no-spawns gets you)
+        #   max_total_spawns: 0 = "no cap"; otherwise must be >= 0
+        #   pool_size: 0 = "no warming" (pool effectively disabled);
+        #     otherwise the target count of hot pre-warmed sessions
         if mc < 1:
             mc = 1
-        if mc > 9:
-            mc = 9
-        # max_total_spawns: 0 means "no cap" (a legitimate choice);
-        # negatives are nonsense.
         if mts < 0:
             mts = 0
+        if ps < 0:
+            ps = 0
 
         self.dismiss({
             "max_concurrent": mc,
             "max_total_spawns": mts,
+            "pool_size": ps,
         })
 
     def action_cancel(self) -> None:
@@ -2978,11 +3002,11 @@ class CyberdeckApp(App):
         log_level: str = "info",
         goal: Optional[str] = None,
         daemon_bin: Optional[str] = None,
-        max_concurrent: int = 5,
-        max_total_spawns: int = 20,
+        max_concurrent: int = 10,
+        max_total_spawns: int = 30,
         streaming_mode: bool = True,
         use_pool: bool = True,
-        pool_size: int = 3,
+        pool_size: int = 5,
         home_dir: Optional[Path] = None,
         profiles_dir: Optional[Path] = None,
         default_profile_name: Optional[str] = None,
@@ -4503,10 +4527,19 @@ class CyberdeckApp(App):
         # Format tokens compactly: 1,234,567 → "1.2M", 12345 → "12k"
         tin = _humanize_tokens(self.fleet.total_tokens_in)
         tout = _humanize_tokens(self.fleet.total_tokens_out)
+        # max_total_spawns == 0 means "no cap" per the new uncapped
+        # semantics — render as ∞ rather than the literal 0 (which
+        # would read as "you're already over cap"). max_concurrent
+        # always >= 1 (LimitsScreen clamps), so it doesn't need the
+        # same treatment.
+        spawn_cap_str = (
+            "∞" if self.max_total_spawns == 0
+            else str(self.max_total_spawns)
+        )
         lines = [
             f"run:  [b]{self.fleet.run_id}[/b]",
             f"bin:  {self.claude_bin}",
-            f"spawn: {self.fleet.total_spawned}/{self.max_total_spawns}  "
+            f"spawn: {self.fleet.total_spawned}/{spawn_cap_str}  "
             f"live: {active}/{self.max_concurrent}",
             f"cost: [b]${cost:.2f}[/b]  tok: {tin}→{tout}",
         ]
@@ -7751,6 +7784,7 @@ class CyberdeckApp(App):
             LimitsScreen(
                 max_concurrent=self.max_concurrent,
                 max_total_spawns=self.max_total_spawns,
+                pool_size=self.pool_size,
                 current_live=live,
                 current_spawned=spawned,
                 cost_so_far=cost,
@@ -7772,12 +7806,18 @@ class CyberdeckApp(App):
         - If raising max_total_spawns above the prior cap-hit value
           and the daemon has already halted, this does NOT auto-resume
           the session — that's deferred until the daemon grows a
-          paused state. User would need to set a new goal."""
+          paused state. User would need to set a new goal.
+        - pool_size raised mid-flight tops up the pool to the new
+          target on the spot (start() is idempotent — needed = target
+          - already_warm). Lowering doesn't actively shrink — existing
+          warm sessions stay until consumed; topping up just stops.
+          Acceptable: shrink-on-demand isn't worth the complexity."""
         if result is None:
             return
 
         new_mc = result.get("max_concurrent", self.max_concurrent)
         new_mts = result.get("max_total_spawns", self.max_total_spawns)
+        new_ps = result.get("pool_size", self.pool_size)
 
         changes: list[str] = []
         if new_mc != self.max_concurrent:
@@ -7808,6 +7848,31 @@ class CyberdeckApp(App):
                         changes.append(
                             "[yellow]cap_hit cleared; daemon may need "
                             "a new goal to resume work[/yellow]"
+                        )
+                except Exception:
+                    pass
+        if new_ps != self.pool_size:
+            changes.append(
+                f"pool_size: {self.pool_size} → {new_ps}"
+            )
+            self.pool_size = new_ps
+            # Live pool exists only when use_pool is enabled and the
+            # session has been started. Update target_size + nudge
+            # start() to top up to the new target. start() is
+            # idempotent — it computes needed = target - already_warm
+            # and only spawns the difference. Lowering target leaves
+            # existing warm sessions intact (they'll be pulled
+            # naturally; the pool just stops topping up).
+            if self.session_pool is not None:
+                try:
+                    self.session_pool.target_size = new_ps
+                    # Schedule a top-up. Fire-and-forget — the pool
+                    # warms in the background and emits PoolEvents
+                    # the sidebar already listens for.
+                    if new_ps > 0:
+                        self.run_worker(
+                            self.session_pool.start(),
+                            exclusive=False,
                         )
                 except Exception:
                     pass
@@ -8036,17 +8101,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-concurrent",
         type=int,
-        default=5,
-        help="Maximum simultaneously-running constructs (default: 5). "
-             "Spawns beyond this wait in a queue until slots free up.",
+        default=10,
+        help="Maximum simultaneously-running constructs (default: 10). "
+             "Spawns beyond this wait in a queue until slots free up. "
+             "Adjustable mid-session via the `l` Limits modal; the "
+             "previous 9-construct ceiling (legacy of the number-key "
+             "construct-jump bindings) was retired 2026-04-30.",
     )
     parser.add_argument(
         "--max-spawns",
         type=int,
-        default=20,
-        help="Hard cap on total constructs per daemon session (default: 20). "
+        default=30,
+        help="Cap on total constructs per daemon session (default: 30). "
              "Hitting this halts the session to prevent runaway token use. "
-             "Only meaningful with --goal.",
+             "Pass 0 for no cap. Only meaningful with --goal.",
     )
     parser.add_argument(
         "--streaming",
@@ -8069,10 +8137,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pool-size",
         type=int,
-        default=3,
-        help="Target number of pre-warmed sessions in the pool (default: 3). "
-             "Higher = more snappy spawns, but more startup token use. "
-             "Ignored when --no-pool is set.",
+        default=5,
+        help="Target number of pre-warmed sessions in the pool (default: 5). "
+             "Higher = snappier spawns, more startup token use. Adjustable "
+             "mid-session via the `l` Limits modal. Ignored when "
+             "--no-pool is set.",
     )
     args = parser.parse_args()
 
