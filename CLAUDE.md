@@ -65,32 +65,44 @@ session on 2026-04-30 added:
   Pool refill gate added so a lowered target stops oversubscribing.
   Latent `max_total_spawns == 0 = no cap` daemon-session guard
   finally honors what the modal had long advertised.
+- **Mechanic v0 — supervisor only.** Sibling Python process
+  (`mechanic.py`, ~270 LOC) that watches the deck PID, tails the
+  file logger's NDJSON for live claude subprocess pids, and kills
+  them on detected deck death. Cross-platform stdlib + ctypes
+  (Windows `OpenProcess`/`GetExitCodeProcess`; POSIX `os.kill(pid,
+  0)`). Deck-side: `pid` field on `log_header` (so mechanic
+  discovers the deck PID by self-reading the header) + `pid` on
+  `fleet.spawn` payloads via new `Construct.pid` property.
+  `launch.bat` spawns mechanic in a minimized sibling 1s after the
+  deck launches. Real-deck verified at attach + tracking; orphan-
+  cleanup path verified by synthetic smoke test. Known limitation:
+  only constructs are tracked — daemon / watchdog Q&A / authoring
+  one-shots / pool warmer subprocesses still orphan their pre-
+  mechanic way (filed as a follow-up; one elif per source in
+  `mechanic._apply_record`).
 
 Real-deck verified: spine 1-6, slice 2 LLM-authored tripwires
 (rung-1 fork + rung-2 fresh both work), file logger end-to-end,
 magnified view + watchdog Q&A still see all event markers, y/Y
 yank against every focusable surface (chatlog, fleet/daemon/watchdog
 panes, ConstructPane, magnified view, list items), pool refill
-gate (target lowered + spawn doesn't refill above new target).
+gate (target lowered + spawn doesn't refill above new target),
+mechanic attach (header pid discovery, log tailing, 2s heartbeat).
 
-**Next session picks up at: Mechanic v0 — supervisor only.** A
-sibling Python process to the deck that watches the deck's PID,
-tracks its claude subprocesses (read from the file logger's
-`fleet.spawn` events), and kills them on detected deck death.
-Cross-platform Python; no Job Object plumbing in the deck. Concrete
-v0 use case is the orphan-subprocess problem caught during
-2026-04-30's Ctrl+C autopsy. See `cyberdeck-maintbot-design.md` v0
-section for full design + the "PID publish channel" sub-section
-(lean: add `pid` to `fleet.spawn` event payloads, one-line change at
-each spawn site in fleet.py).
+**Next session picks up at: Spine Phase 8 cleanup.** Retire the
+deprecated `add_listener` / `on_event` / `on_change` callback shims
+now that every producer publishes through the bus. Last spine
+slice. ~30 LOC across producer modules + tui.py wiring; low-risk,
+mechanical.
 
-After Mechanic v0, the queued slices in priority order:
-spine Phase 8 cleanup (retire deprecated `add_listener`/`on_*`
-shims), then caliber selection (per-spawn model + effort + fast-mode
-— see `cyberdeck-model-effort-design.md`; phases 1-3 + 5 are
-shippable independently of quota awareness, phase 4 hard-blocks on
+After Phase 8, the queued slices in priority order:
+caliber selection (per-spawn model + effort + fast-mode — see
+`cyberdeck-model-effort-design.md`; phases 1-3 + 5 are shippable
+independently of quota awareness, phase 4 hard-blocks on
 build-plan item 13), then log-readability overhaul, then Mechanic
-v1 (LLM session half).
+v1 (LLM session half — supervisor process already exists from v0,
+just needs the on-demand LLM half attached), then Mechanic v0
+follow-ups (track non-construct subprocess sources).
 
 ## Running it
 

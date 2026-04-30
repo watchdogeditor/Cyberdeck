@@ -762,6 +762,20 @@ class Fleet:
                 # watchdog stops having to reverse-engineer it from
                 # log timing.
                 "origin": origin,
+                # OS pid of the construct's claude subprocess. Read
+                # by the Mechanic supervisor (sibling process) from
+                # the per-launch NDJSON log file — it builds a live
+                # set of "spawned but not finalized" pids and kills
+                # them on detected deck death so claude subprocesses
+                # don't orphan when the deck dies (Task Manager kill,
+                # OOM, blue screen, etc.). Other subprocess sources
+                # (daemon, watchdog Q&A, pool warming) aren't tracked
+                # by the v0 supervisor — they orphan the same way as
+                # before until a follow-up slice publishes their pids
+                # too. Falls back to None if the subprocess somehow
+                # never came up; the supervisor skips entries with
+                # pid=None.
+                "pid": c.pid,
             },
         ))
         consumer = asyncio.create_task(self._consume(c))

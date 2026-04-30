@@ -27,21 +27,55 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** **Mechanic v0 — supervisor only** (subprocess janitor +
-deck heartbeat in one process; no LLM session yet). Lands as a
-small new sibling process to the deck, running always-on,
-cross-platform Python, no claude dependency. Concrete v0 value:
-when the deck dies (any cause, any platform), the supervisor kills
-every tracked claude subprocess so nothing orphans. Solves the
-real-deck Ctrl+C subprocess-disruption pain (autopsied 2026-04-30)
-WITHOUT needing platform-specific OS plumbing (Windows Job
-Objects, Linux PR_SET_PDEATHSIG, etc.) in the deck itself —
-"observe + kill via ordinary signals" is one Python implementation.
-Full design at `cyberdeck-maintbot-design.md` (Mechanic /
-maintbot — netrunner has been calling it Mechanic since
-2026-04-30; file rename deferred to implementation time). The
-LLM-backed half (v1+) is queued behind v0 and ships when the
-preprocessor + cost-model story is clearer.
+**Up next:** **Spine Phase 8 cleanup** (retire deprecated
+`add_listener` / `on_event` / `on_change` callback shims now that
+every producer publishes through the bus). Last spine slice;
+~30 LOC across producer modules + tui.py wiring; low-risk,
+mechanical. Then caliber selection (per-spawn model + effort +
+fast-mode), then log-readability overhaul, then Mechanic v1
+(LLM-session half).
+
+**Mechanic v0 shipped (2026-04-30, late):** sibling supervisor
+process, ~270 LOC `mechanic.py`, no claude dependency, pure stdlib
++ ctypes for Windows PID alive checks. Tails the file logger's
+NDJSON stream, derives live subprocess pids from
+`fleet.spawn`-without-`fleet.finalize`, kills them on detected deck
+death. Cross-platform from day one — no Windows Job Object
+plumbing, no Linux PR_SET_PDEATHSIG, just `os.kill(pid, SIGTERM)`
+in pure Python. Deck-side contribution: `pid` field added to
+`fleet.spawn` payloads (one line in fleet.py via new `Construct.pid`
+property) and `pid` added to log_header (so mechanic discovers the
+deck PID by reading the header). `launch.bat` now spawns mechanic
+in a minimized sibling window 1s after the deck launches. Real-deck
+verified: mechanic attaches cleanly, reads correct deck pid from
+header, watches at 2s cadence. Synthetic smoke test verified the
+death-detection + cleanup path end-to-end. Full design at
+`cyberdeck-maintbot-design.md` (Mechanic / maintbot — netrunner has
+been calling it Mechanic; file rename deferred). The LLM-backed
+half (v1+) is queued behind D1 substrate.
+
+**Mechanic v0 known limitations** (filed for follow-up):
+- **Only constructs are tracked.** Daemon, watchdog Q&A, watchdog
+  authoring one-shots, and pool-warming subprocesses don't publish
+  pids to the bus today; they orphan the same way they did before
+  the supervisor existed. Each is a one-line addition to the
+  respective spawn site once we get to it. The mechanic's
+  `_apply_record` already handles arbitrary `kind=fleet.spawn`
+  events; extending to other kinds is one elif per source.
+- **Mechanic exits when the deck dies.** No auto-restart, no
+  reattach. Each `launch.bat` run spawns a fresh mechanic. v0
+  simplicity; v3 (auto-relaunch in headless mode) is the eventual
+  shape.
+- **Only really earns its keep in non-Windows-default cleanup
+  scenarios.** Modern Win10/11 Task Manager does tree-kill, and
+  Windows Terminal close propagates `CTRL_CLOSE_EVENT` to console
+  children — those everyday paths already cleaned up subprocesses
+  before mechanic existed. Where v0 actually matters: Python
+  uncaught exceptions that escape the cleanup path, pythonw /
+  detached scenarios, force-kill via `taskkill /F /PID` without
+  `/T`, and the eventual Linux/Pi deployment (where none of
+  Windows's accidental cleanup applies). Plus: substrate for v1
+  LLM-session half.
 
 **Spine progress (2026-04-30):** 7/8 phases shipped this push —
 event_bus.py primitives, Fleet → bus, Daemon → bus, Tripwires +
@@ -742,6 +776,18 @@ and 11.
 - **Path shortening keeps absolute version stored separately.**
 - **Windows path mangling in Bash.** Constructs self-correct from
   absolute `C:\...` to relative when their first attempt fails.
+- **`logs/latest.log` is a stale empty snapshot on Windows.** The file
+  logger's `_update_latest_pointer` tries `symlink_to` first (works on
+  POSIX, requires admin / dev mode on Windows) then falls back to
+  `shutil.copy2`. The copy fallback runs once at startup AFTER opening
+  the per-launch file but BEFORE writing the header — so on Windows
+  without admin, latest.log is permanently a zero-byte snapshot and
+  doesn't track the real file's growth. Mechanic v0 sidesteps this by
+  scanning `cyberdeck-*.log` and picking the newest by mtime within a
+  freshness window. Anything else that wants to tail the active log on
+  Windows has to do the same. Fix would be `latest.log.write_text(...)`
+  on every event (perf) or a Windows symlink with elevated permission
+  request (security UX). Both more annoying than the workaround.
 
 ### Editing
 - **`str_replace` ate a class header once** (GoalSetScreen) — when

@@ -358,6 +358,14 @@ class Construct:
         cmd += self.extra_args
         return cmd
 
+    @property
+    def pid(self) -> Optional[int]:
+        """OS pid of the underlying claude subprocess, or None if it
+        hasn't been spawned yet (or already collected). Surfaced so the
+        Mechanic supervisor can track live subprocess pids without
+        reaching past `_proc`'s underscore."""
+        return self._proc.pid if self._proc is not None else None
+
     async def spawn(self) -> None:
         """Start the subprocess. Safe to call once."""
         if self._proc is not None:

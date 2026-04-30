@@ -399,6 +399,21 @@ natively, doesn't suffer chat context truncation.
   oversubscribing on subsequent pulls. Latent
   `max_total_spawns == 0 → "no cap"` daemon-session guard
   finally honors what the modal has long advertised.
+- ✓ Mechanic v0 — supervisor only (2026-04-30, late) — sibling
+  Python process (~270 LOC `mechanic.py`) that watches the deck
+  PID, tails the file logger's NDJSON stream for live claude
+  subprocess pids, and kills them on detected deck death.
+  Cross-platform stdlib + ctypes (no psutil), no claude
+  dependency. Deck-side: `pid` on `fleet.spawn` payloads via new
+  `Construct.pid` property; `pid` on `log_header` for self-
+  discovery. `launch.bat` spawns mechanic in a minimized sibling
+  window 1s after the deck. Real-deck verified at the attach
+  level (header pid discovery, log tailing); synthetic smoke
+  test verified the death-detect + cleanup path end-to-end.
+  Known limitation: only constructs are tracked — daemon /
+  watchdog Q&A / authoring one-shots / pool warmer subprocesses
+  still orphan their pre-mechanic way (filed as #5 in Next
+  Priorities). Full design at `cyberdeck-maintbot-design.md`.
 
 **Spine progress (2026-04-30): 7/8 phases shipped** — see
 `cyberdeck-event-stream-design.md`. Producer migration (Phase 1-5)
@@ -413,26 +428,11 @@ SIGINT swallow); smart Ctrl+Q with running-state guard. Phase 8
 queued behind Mechanic v0.
 
 **Next priorities:**
-1. **Mechanic v0 — supervisor only (no LLM yet).** Cross-platform
-   Python subprocess janitor + deck heartbeat. New sibling process
-   to the deck, runs always-on, ~150 LOC. Solves the real-deck
-   Ctrl+C subprocess-disruption pain (autopsied 2026-04-30) and the
-   orphan-claude-process problem (Task Manager kill / OOM / deck
-   crash leaves zombie subprocesses today). Cross-platform from day
-   one — no Windows Job Object plumbing, no Linux PR_SET_PDEATHSIG,
-   just "observe + kill via ordinary signals" in pure Python.
-   Concrete v0 scope: poll deck PID, read live subprocess PIDs from
-   `<deck>/logs/latest.log` (or a small dedicated pidfile), kill all
-   tracked subprocesses on detected deck death. Deck-side
-   contribution: add `pid` field to `fleet.spawn` event payloads
-   (one-line change at each spawn site, ~5 sites). Full design at
-   `cyberdeck-maintbot-design.md`. The LLM-backed half (v1+) ships
-   later when the cost-model + preprocessor story is clearer.
-2. **Spine phase 8 — cleanup.** Retire the deprecated `add_listener`
+1. **Spine phase 8 — cleanup.** Retire the deprecated `add_listener`
    / `on_event` / `on_change` callback shims now that everyone
    publishes through the bus. Last spine slice. ~30 LOC across the
    producer modules + tui.py wiring. Low-risk, mechanical.
-3. **Model + effort selection — "caliber" per spawn.** The daemon
+2. **Model + effort selection — "caliber" per spawn.** The daemon
    picks `--model` and `--effort` per construct based on task
    needs and remaining quota; the daemon's own caliber is markable
    and netrunner-overridable (CLI flags, Limits modal, daemon
@@ -446,19 +446,28 @@ queued behind Mechanic v0.
    item 13 below), phase 5 (UI polish + introspection). Phases
    1-3 + 5 are shippable independently of quota awareness. Full
    design at `cyberdeck-model-effort-design.md`.
-4. **Log-readability overhaul** — fleet/chatlog/watchdog/daemon
+3. **Log-readability overhaul** — fleet/chatlog/watchdog/daemon
    scattered across windows is hard to follow at a glance; needs
    structural thinking, not just CSS. Distinct from the file-log
    work in the spine slice (this is in-deck UI composition, not
    file shape). Composes better post-spine — display surfaces
    become "subscriber + filter + formatter" units, easier to
    rearrange.
-5. **Mechanic v1 — LLM session half.** Diagnose-only on-demand
+4. **Mechanic v1 — LLM session half.** Diagnose-only on-demand
    triage. Activates on heartbeat-fired unclean exit OR netrunner
-   summon. Cloud Claude substrate; D1 eventual. Blocked on
-   Mechanic v0 (provides the supervisor process to attach LLM
-   session to) and ideally on D1 (cost profile). Full design at
+   summon. Cloud Claude substrate; D1 eventual. Mechanic v0
+   shipped 2026-04-30 — the supervisor process exists; v1 attaches
+   the LLM session half to it. Ideally blocked on D1 (cost profile)
+   but cloud Claude works as an interim substrate. Full design at
    `cyberdeck-maintbot-design.md`.
+5. **Mechanic v0 follow-ups — track non-construct subprocesses.**
+   Daemon, watchdog Q&A, watchdog authoring one-shots, and
+   pool-warming subprocesses don't publish pids to the bus today;
+   they orphan the same way they did before mechanic existed. One
+   line per spawn site to add a `pid` field; one elif per source in
+   `mechanic._apply_record` to track them. Trivial; defer until
+   real-deck use surfaces a concrete orphan from one of those
+   sources.
 6. Connection consequences round 2: daemon parking on connection-
    blocked spawns + recovery flow.
 7. Tripwires slice 3 — severity-aware rendering (critical pulls

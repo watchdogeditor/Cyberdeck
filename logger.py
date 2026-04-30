@@ -233,6 +233,12 @@ class DeckLogger:
             "ts": time.time(),
             "iso": datetime.now().isoformat(timespec="seconds"),
             "deck_version": deck_version,
+            # Deck PID. The Mechanic supervisor reads this to learn
+            # which process to watch — sidesteps having to pass the
+            # PID over argv, and survives any future scenario where a
+            # supervisor attaches mid-flight from `latest.log`. Read
+            # by `mechanic.py` v0.
+            "pid": os.getpid(),
             "argv": argv,
             "env": env_snapshot,
             "brake": brake_label,
