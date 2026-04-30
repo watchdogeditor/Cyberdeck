@@ -377,8 +377,26 @@ class Kind:
     """Kind-namespace constants. Populated incrementally as event
     sources migrate onto the bus.
 
-    Phase 1: this class exists but has no constants. Producers / fronts
-    shouldn't rely on it for anything yet. Phase 2 adds FLEET_* kinds;
-    Phase 3 adds DAEMON_*; etc.
+    Producers should import these constants rather than spelling kind
+    strings as literals, so renames stay one-touch and typos surface
+    at import time. Subscribers can mix constant references with
+    glob patterns (e.g., `[Kind.FLEET_SPAWN, "fleet.event"]`) — both
+    are just strings to the bus.
+
+    Phase 2 adds the FLEET_* kinds. Phase 3 adds DAEMON_*. Subsequent
+    phases extend further (tripwire, brake, blacklist, connection,
+    profile, plugin, chatlog, lifecycle).
     """
-    pass
+    # Fleet (Phase 2). The translator in fleet.py maps each FleetEvent
+    # kind+payload-type onto one of these. Per-construct streaming
+    # events all collapse to FLEET_EVENT today; finer breakdowns
+    # (tool_use, thinking, tool_result, etc.) can land later if a
+    # subscriber actually needs to filter at that granularity. Until
+    # then, subscribers drill into the payload for sub-classification.
+    FLEET_RUN_START = "fleet.run_start"
+    FLEET_RUN_END = "fleet.run_end"
+    FLEET_SPAWN = "fleet.spawn"
+    FLEET_FINALIZE = "fleet.finalize"
+    FLEET_SPAWN_BLOCKED = "fleet.spawn_blocked"
+    FLEET_SPAWN_FAILED = "fleet.spawn_failed"
+    FLEET_EVENT = "fleet.event"  # per-construct streaming events

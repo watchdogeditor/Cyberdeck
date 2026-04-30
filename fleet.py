@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     # runtime cycle since profiles.py is upstream of the rest of the
     # deck and imports cleanly without us.
     from profiles import Profile
+    from event_bus import EventBus
 
 from construct import Construct
 from display import summarize
@@ -65,6 +66,70 @@ class FleetEvent:
     kind: str
     construct_id: str
     payload: dict
+
+
+# Mapping from FleetEvent meta payload "type" → DeckEvent kind. Used
+# by the Fleet → bus translator (Phase 2 of the unified-event-stream
+# slice). Centralized here so the kind taxonomy stays consistent —
+# anything new emitted via FleetEvent meta should also land in this
+# table so subscribers can filter on dotted-namespace strings without
+# having to inspect payloads.
+_META_TYPE_TO_KIND = {
+    "run_start":     "fleet.run_start",
+    "run_end":       "fleet.run_end",
+    "spawned":       "fleet.spawn",
+    "finalized":     "fleet.finalize",
+    "spawn_blocked": "fleet.spawn_blocked",
+    "spawn_failed":  "fleet.spawn_failed",
+}
+
+
+def _fleet_event_to_deck_event(fevent: FleetEvent):
+    """Translate a FleetEvent into a DeckEvent for bus publish.
+
+    Returns None when the FleetEvent shouldn't surface on the bus
+    (today: nothing is filtered out, but the contract leaves room
+    for fleet-internal events that shouldn't propagate).
+
+    Imported lazily so fleet.py stays importable when event_bus.py
+    isn't on the path (mock-test scenarios, partial deployments).
+    Practically there's always a bus when there's a deck, but
+    fleet.py runs standalone too (the `python fleet.py "task A"`
+    console entry).
+    """
+    from event_bus import DeckEvent
+    if fevent.kind == "meta":
+        ptype = fevent.payload.get("type", "unknown")
+        kind = _META_TYPE_TO_KIND.get(ptype, f"fleet.meta.{ptype}")
+    elif fevent.kind == "event":
+        # Per-construct streaming event. Phase 2 collapses these all
+        # into one bus kind; subscribers drill into the payload's
+        # `event_kind` field for sub-classification (system_init,
+        # tool_use, tool_result, thinking, assistant, result, etc.).
+        # Finer kind breakdown (e.g., fleet.event.tool_use) can land
+        # later if a subscriber actually needs to filter at that
+        # granularity. Until then this keeps the taxonomy small.
+        kind = "fleet.event"
+    else:
+        # Unknown FleetEvent.kind — pass through as-is. The bus is
+        # content-agnostic; subscribers either match it or don't.
+        kind = f"fleet.{fevent.kind}"
+
+    return DeckEvent(
+        kind=kind,
+        source="fleet",
+        timestamp=fevent.timestamp,
+        construct_id=(
+            fevent.construct_id
+            if fevent.construct_id != "fleet"  # the run_start/run_end synthetic id
+            else None
+        ),
+        # Severity stays INFO across all fleet events for now. Future
+        # phases may escalate spawn_blocked / spawn_failed to WARNING,
+        # finalize-with-failed-state to WARNING, etc. — leave at INFO
+        # until a subscriber actually needs the gradient.
+        payload=fevent,
+    )
 
 
 def _terminal_manifest_state(construct_state: str) -> str:
@@ -99,6 +164,7 @@ class Fleet:
         connection_state_provider: Optional[
             Callable[[], "ConnectionState"]
         ] = None,
+        bus: Optional["EventBus"] = None,
     ):
         self.run_id = f"run-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -153,6 +219,17 @@ class Fleet:
         # spawns get blocked. None means no gating (e.g., fleet.py
         # console runs without a TUI to host the monitor).
         self.connection_state_provider = connection_state_provider
+
+        # Phase 2 of the unified-event-stream slice. When the deck
+        # passes a bus, every FleetEvent dispatched through `_listeners`
+        # ALSO publishes a translated DeckEvent on the bus. Existing
+        # listener subscribers (e.g., the TUI's `_handle_event`) keep
+        # working unchanged — bus is purely additive during the
+        # migration. None when fleet.py runs standalone (the console
+        # entry point) without a TUI to host the bus. See
+        # `Design Files/cyberdeck-event-stream-design.md` for the
+        # phased migration plan.
+        self.bus = bus
 
         # Listener list. The legacy `on_event` kwarg becomes the first
         # listener for backward compat; new code should use add_listener().
@@ -286,6 +363,17 @@ class Fleet:
                 except Exception as e:
                     if not self.quiet:
                         print(f"[fleet] listener {listener!r} raised: {e!r}")
+
+        # Phase 2: also publish to the unified bus when wired. This
+        # runs AFTER the legacy listener dispatch so existing
+        # subscribers are unaffected by any bus weirdness; the bus
+        # itself isolates per-callback exceptions independently.
+        # Translation: build a DeckEvent from the FleetEvent + payload
+        # type. See `_fleet_event_to_deck_event` for the kind mapping.
+        if self.bus is not None:
+            deck_event = _fleet_event_to_deck_event(fevent)
+            if deck_event is not None:
+                self.bus.publish(deck_event)
 
     # ---- per-construct consumer ----------------------------------------
 

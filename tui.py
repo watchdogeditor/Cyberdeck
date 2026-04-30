@@ -62,6 +62,7 @@ from watchdog import (
     _fingerprint as _blacklist_fingerprint,
 )
 from tripwires import TripwireFire, TripwireAuthoringResult
+from event_bus import EventBus
 from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
@@ -2701,6 +2702,18 @@ class CyberdeckApp(App):
         self.session_manager: Optional[SessionManager] = None
         self.session_pool: Optional[SessionPool] = None
         self._daemon_task: Optional[asyncio.Task] = None
+        # The spine. One canonical event bus that every event source
+        # on the deck eventually publishes to. Phase 1 added the
+        # primitives (event_bus.py); Phase 2 wires Fleet through it
+        # (alongside the existing add_listener path so behavior is
+        # unchanged); subsequent phases migrate Daemon, Tripwires,
+        # Blacklist, Brake, Connection, Profiles, Plugins, direct
+        # chatlog writes, and the file logger. Subscribers register
+        # with role-derived filters; the bus enforces visibility.
+        # Constructs DO NOT receive a reference — they're work units,
+        # not observers. See `Design Files/cyberdeck-event-stream-
+        # design.md` for the full migration plan.
+        self.bus = EventBus()
         # Set of (construct_id, action) pairs we've already warned
         # about for unknown deck-protocol markers. A misbehaving
         # construct emitting the same unknown action in a tight loop
@@ -3355,6 +3368,15 @@ class CyberdeckApp(App):
             # attribute is read at every spawn; DEGRADED or OFFLINE
             # blocks the spawn cleanly with a fleet-log entry.
             connection_state_provider=lambda: self.connection_monitor.state,
+            # Phase 2 of the unified-event-stream slice: pass the
+            # deck's bus to Fleet so every FleetEvent ALSO publishes
+            # as a DeckEvent. Existing _handle_event listener path
+            # below stays unchanged — the bus is purely additive
+            # during the migration. Subscribers (none in this phase;
+            # phases 3+ add them) read from the bus instead of
+            # registering through add_listener. See
+            # `Design Files/cyberdeck-event-stream-design.md`.
+            bus=self.bus,
         )
         self.fleet.add_listener(self._handle_event)
         # Tripwire scanner listener — feeds construct events into the
