@@ -4,8 +4,8 @@ A keyboard-first Textual TUI that orchestrates Claude Code subprocesses.
 The "daemon" coordinator decomposes goals; "constructs" execute in
 parallel; the "watchdog" oracle answers questions about fleet activity.
 Personal hobby project, in active production use on Windows.
-~16k LOC across 21 Python modules at the deck-source root (as of
-2026-04-30, post-spine).
+~19k LOC across 23 Python modules at the deck-source root (as of
+2026-04-30, post-spine + post-y/Y-copy + post-limits-rework).
 
 The user is the "netrunner." Match the cyberpunk vocabulary in code
 and prose — these are the right names for what each thing does.
@@ -44,17 +44,34 @@ Two more for specific moments: `cyberdeck-project-instructions.md`
 future tools-research conversation). `cyberdeck_arbiter_design.md` is
 a deferred wearable-form-factor variant — not current scope.
 
-## Where the deck is right now (2026-04-30)
+## Where the deck is right now (2026-04-30, late)
 
-Just shipped a substantial spine refactor. Every event source
-publishes through `event_bus.py`; the file logger writes per-launch
-NDJSON files at `<deck source>/logs/cyberdeck-YYYY-MM-DD-HHMMSS.log`
-+ `latest.log` pointer; Ctrl+C-as-copy doesn't kill the deck (silent
-SIGINT swallow); smart Ctrl+Q with running-state guard.
+Spine 7/8 phases shipped (event_bus + every producer migrated +
+file logger as bus subscriber + quit discipline). Plus a follow-up
+session on 2026-04-30 added:
 
-Real-deck verified: spine 1-6, slice 2 LLM-authored tripwires (rung-1
-fork + rung-2 fresh both work), file logger end-to-end, magnified
-view + watchdog Q&A still see all event markers.
+- **y/Y copy keybind.** Vim-yank focused widget to clipboard
+  (lowercase = rendered text, uppercase = structured JSON of the
+  underlying data — bus snapshot for chatlog, raw events for
+  ConstructPane, dataclass dicts for list items). New `clipboard.py`
+  module (ctypes Win32 + pbcopy + xclip/wl-copy cascade, stdlib
+  only). Sidesteps Ctrl+C-as-copy SIGINT-into-subprocesses pain.
+  Two diagnosis detours filed as gotchas: (1) `text=True` + cp1252
+  encoder silently exploding on Unicode then timing out;
+  (2) clip.exe preserving the UTF-16-LE BOM into clipboard contents.
+- **Limits modal rework.** Hard ceiling on max_concurrent (was 9)
+  retired. Defaults bumped (max_concurrent 5→10, max_total_spawns
+  20→30, pool_size 3→5). pool_size now editable in the modal.
+  Pool refill gate added so a lowered target stops oversubscribing.
+  Latent `max_total_spawns == 0 = no cap` daemon-session guard
+  finally honors what the modal had long advertised.
+
+Real-deck verified: spine 1-6, slice 2 LLM-authored tripwires
+(rung-1 fork + rung-2 fresh both work), file logger end-to-end,
+magnified view + watchdog Q&A still see all event markers, y/Y
+yank against every focusable surface (chatlog, fleet/daemon/watchdog
+panes, ConstructPane, magnified view, list items), pool refill
+gate (target lowered + spawn doesn't refill above new target).
 
 **Next session picks up at: Mechanic v0 — supervisor only.** A
 sibling Python process to the deck that watches the deck's PID,
@@ -67,10 +84,13 @@ section for full design + the "PID publish channel" sub-section
 (lean: add `pid` to `fleet.spawn` event payloads, one-line change at
 each spawn site in fleet.py).
 
-After Mechanic v0: spine Phase 8 cleanup (retire deprecated
-`add_listener`/`on_*` shims now that everyone publishes through the
-bus), then in-deck copy keybind (sidesteps Ctrl+C-as-copy issue at
-the UX layer cross-platform).
+After Mechanic v0, the queued slices in priority order:
+spine Phase 8 cleanup (retire deprecated `add_listener`/`on_*`
+shims), then caliber selection (per-spawn model + effort + fast-mode
+— see `cyberdeck-model-effort-design.md`; phases 1-3 + 5 are
+shippable independently of quota awareness, phase 4 hard-blocks on
+build-plan item 13), then log-readability overhaul, then Mechanic
+v1 (LLM session half).
 
 ## Running it
 
@@ -91,12 +111,15 @@ vars with `$env:NAME = "..."`, not bash syntax.
 
 ## Layout
 
-- `*.py` (root) — source. `tui.py` is the heart (~7.4k LOC after
-  spine, well-organized but huge — grep for similar patterns before
-  adding a feature). `event_bus.py` (the spine), `logger.py`
-  (DeckLogger + per-launch NDJSON), and per-source translators
-  (`fleet._fleet_event_to_deck_event`, `daemon_session._daemon_event_to_deck_event`)
-  are the post-2026-04-30 additions.
+- `*.py` (root) — source. `tui.py` is the heart (~8.1k LOC after
+  spine + y/Y + limits rework, well-organized but huge — grep for
+  similar patterns before adding a feature). `event_bus.py` (the
+  spine), `logger.py` (DeckLogger + per-launch NDJSON), and
+  per-source translators (`fleet._fleet_event_to_deck_event`,
+  `daemon_session._daemon_event_to_deck_event`) are the
+  2026-04-30 spine additions. `clipboard.py` (cross-platform
+  clipboard write, ctypes Win32 + pbcopy + xclip/wl-copy) is the
+  late-2026-04-30 y/Y addition.
 - `<deck source>/logs/` — per-launch log files. Operational artifacts;
   brake hook protects them from constructs by default. `latest.log`
   always points at the current run.

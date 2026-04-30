@@ -56,6 +56,20 @@ toast). Phase 8 (cleanup — retire deprecated `add_listener` /
 `on_event` / `on_change` shims now that everyone publishes through
 the bus) is the last spine slice, queued behind Mechanic v0.
 
+**Late 2026-04-30 follow-up session:** y/Y copy keybind shipped
+(vim-yank focused widget to clipboard — lowercase rendered text,
+uppercase structured JSON; new `clipboard.py` module with
+ctypes Win32 / pbcopy / xclip-wl-copy cascade; sidesteps
+Ctrl+C-as-copy SIGINT-into-subprocesses). Limits modal rework
+(uncapped construct counts — max_concurrent ceiling of 9 retired;
+defaults bumped 5/20/3 → 10/30/5; pool_size now editable mid-flight;
+pool refill gate on `_spawn_warming_task` so a lowered target
+stops oversubscribing on subsequent pulls; latent
+`max_total_spawns == 0 = no cap` daemon-session guard finally
+honors what the modal had advertised). Caliber design filed for
+post-Mechanic-v0 implementation (see Filed entry below). Per-run
+workspace compartmentalization filed in build plan item 8.
+
 **Then**: D1 (local model substrate) for the long-term Watchdog /
 synthesizer / Mechanic-LLM-half story. Plugin scaffolding,
 brake-as-deck-state, connection spawn-blocking, brake-denial

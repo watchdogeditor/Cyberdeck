@@ -182,7 +182,7 @@ worth the complexity.
 
 ## File-by-file orientation
 
-### `tui.py` (6102 LOC, the heart)
+### `tui.py` (~8.2k LOC, the heart)
 - App class, BINDINGS, action handlers
 - All modal screens (NewConstructScreen, AskWatchdogScreen,
   TalkDaemonScreen, GoalSetScreen, LimitsScreen, EjectScreen,
@@ -402,6 +402,26 @@ grep for existing similar work — the pattern is almost always there.
 - Pool with manifest, cross-restart reuse, 5h stale window
 - Warms with `default` profile only
 
+### `clipboard.py` — cross-platform clipboard write (shipped 2026-04-30)
+- Stdlib-only — no third-party dependency.
+- `copy(text) -> (ok, err)` — single entry point.
+- Per-platform branches: Windows uses ctypes against the Win32
+  clipboard API (CF_UNICODETEXT direct), macOS uses `pbcopy`,
+  Linux tries `wl-copy` (Wayland) → `xclip -selection clipboard`
+  (X11). All paths pass explicit byte encoding (UTF-16-LE on
+  Windows, UTF-8 elsewhere) — `text=True` was tried first and
+  blew up on Unicode via cp1252 default encoder.
+- ctypes path on Windows is what `clip.exe` should have been:
+  no encoding round-trip, no BOM injection, no subprocess
+  timeout. clip.exe was tried twice (once with `text=True`, once
+  with explicit UTF-16-LE+BOM bytes) — both had real bugs that
+  ctypes sidesteps. Filed gotchas in cyberdeck-state.md.
+- Used by `tui.action_copy_focused` (lowercase y) and
+  `tui.action_copy_focused_json` (uppercase Y) plus the parallel
+  ExpandModal `action_copy` / `action_copy_json` for in-modal
+  yank. Surface map matches `action_expand` (z) — anything you
+  can zoom, you can yank.
+
 ### `mock_claude.py`, `mock_daemon.py`
 - Test fixtures for the chat-era development. Several streaming
   variants exist in `/tmp/mock_streaming_claude.py`,
@@ -543,6 +563,9 @@ substantive change is still useful. Keep it.
 | The spine (event bus, phases 1-7 shipped) | `event_bus.py` (DeckEvent + EventBus + Subscription + Severity + Kind constants) + `tui.CyberdeckApp.bus` (instance) + producers wire bus= via constructors (Fleet, DaemonSession, Watchdog, Blacklist, TripwireEngine, BrakeStateStore, ConnectionMonitor, ProfileRegistry, PluginRegistry) + `tui._chatlog_write` publishes `chatlog.direct` + `tui._chatlog_format_bus_event` dispatches by event payload type (FleetEvent → format_fleet, DaemonEvent → format_daemon, chatlog.direct → event.text) + `tui._render_chatlog_buffer` (magnified view, reads `bus.snapshot()`) + `tui._build_watchdog_context` (Q&A snapshot, reads `bus.snapshot()`). Each producer module has its own translator (`_fleet_event_to_deck_event`, `_daemon_event_to_deck_event`, etc.) and adds bus publish AFTER the legacy callback fan-out — additive migration. See `cyberdeck-event-stream-design.md`. |
 | File logger (Phase 7a) | `logger.py` (`DeckLogger` + `_serialize_payload` + `_SEVERITY_RANKS`) + `tui.CyberdeckApp.deck_logger` instance built after `brake_state_store.load()` + `attach_to_bus(self.bus)` subscription + close(reason="shutdown") in `_drive_fleet` teardown + close(reason="eject") in `_do_eject`. CLI: `--log-dir` / `--log-level` / env `CYBERDECK_LOG_DIR` / `CYBERDECK_LOG_LEVEL`. Default dir `<deck source>/logs/`; `latest.log` pointer alongside. Header on first line, footer on last. NDJSON. |
 | Quit discipline (Phase 7b) | `signal.signal(SIGINT, lambda: None)` installed in `tui.py` `__main__` block before App construction + smart `CyberdeckApp.action_quit` (idle: clean exit; running: toast + block, lists daemon-running + live constructs). Ctrl+F (held) remains the only halt-now gesture. EJECT responsiveness via existing `asyncio.gather` parallelization in `_do_eject`; SIGTERM-grace-skip force-kill upgrade is queued separately. |
+| Copy keybind (y/Y) | `clipboard.py` (cross-platform write) + `tui._extract_text_for_copy` / `tui._extract_json_for_copy` (duck-typed surface dispatch) + `tui._snapshot_lines_to_plain_text` (markup-strip helper) + `CyberdeckApp.action_copy_focused` / `action_copy_focused_json` (App bindings y / Y) + `ExpandModal.action_copy` / `action_copy_json` (modal-scoped y / Y; modals don't inherit App BINDINGS). JSON path reuses `logger._serialize_payload` so the yank shape matches the per-launch .log files exactly. |
+| Limits modal (post-rework) | `LimitsScreen` (now takes `pool_size` alongside `max_concurrent` + `max_total_spawns`; lower-clamps only; the 9-construct hard ceiling retired 2026-04-30) + `CyberdeckApp.action_open_limits` + `_handle_limits_submitted` (applies pool_size live by setting `session_pool.target_size` + nudging `start()` to top up). Sidebar renders `spawn: N/∞` when max_total_spawns == 0. Defaults: max_concurrent=10, max_total_spawns=30, pool_size=5. |
+| Pool refill gate | `SessionPool._spawn_warming_task` no-ops when `warm_count + len(_warming_tasks) >= target_size`. Bounds every caller (pull / start / future). Fixes the latent "lower target mid-session, pool keeps refilling toward old target" bug; same fix covers manual and daemon-driven spawns since both flow through `pool.pull()`. |
 
 ---
 
