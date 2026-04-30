@@ -76,11 +76,16 @@ class PluginRegistry:
         plugins_dir: Path,
         *,
         on_event: Optional[PluginEventListener] = None,
+        bus: Optional[object] = None,
     ) -> None:
         self.plugins_dir = Path(plugins_dir)
         self._listeners: list[PluginEventListener] = []
         if on_event is not None:
             self._listeners.append(on_event)
+        # Phase 5 of the unified-event-stream slice. When wired,
+        # `_emit` ALSO publishes a `plugin.<kind>` DeckEvent on the
+        # bus alongside the legacy listener fan-out.
+        self.bus = bus
 
         # Authoritative state
         self._by_name: dict[str, Plugin] = {}
@@ -103,6 +108,26 @@ class PluginRegistry:
             except Exception as exc:
                 print(
                     f"plugin_registry: listener error: {exc!r}",
+                    file=sys.stderr,
+                )
+        # Phase 5: also publish on the bus when wired. PluginEvent's
+        # `kind` field maps to dotted-namespace; scan_error escalates
+        # to warning severity.
+        if self.bus is not None:
+            try:
+                from event_bus import DeckEvent
+                severity = (
+                    "warning" if event.kind == "scan_error" else "info"
+                )
+                self.bus.publish(DeckEvent(
+                    kind=f"plugin.{event.kind}",
+                    source="plugin_registry",
+                    severity=severity,
+                    payload=event,
+                ))
+            except Exception as exc:
+                print(
+                    f"plugin_registry: bus publish error: {exc!r}",
                     file=sys.stderr,
                 )
 

@@ -104,6 +104,7 @@ class ConnectionMonitor:
         # heartbeat with a stub that returns ("ok"|"timeout"|"refused"
         # |"dns_failure"). Real deck always uses the live socket.
         heartbeat_fn: Optional[Callable[[], "asyncio.Future[str]"]] = None,
+        bus: Optional[object] = None,
     ) -> None:
         self.target_host = target_host
         self.target_port = target_port
@@ -113,6 +114,10 @@ class ConnectionMonitor:
         self.recover_threshold = recover_threshold
         self.on_state_change = on_state_change
         self.heartbeat_fn = heartbeat_fn
+        # Phase 5 of the unified-event-stream slice. When wired,
+        # state transitions ALSO publish a `connection.transition`
+        # DeckEvent on the bus alongside on_state_change.
+        self.bus = bus
 
         # State. Start ONLINE on the optimistic assumption that the
         # deck launches with a working connection — we'll downgrade
@@ -298,14 +303,39 @@ class ConnectionMonitor:
         # NEW failures, not the historical count.
         self._consecutive_failures = 0
         self._consecutive_successes = 0
+        evt = StateChangeEvent(
+            timestamp=time.time(),
+            old_state=old,
+            new_state=new_state,
+            reason=reason,
+        )
         if self.on_state_change is not None:
             try:
-                self.on_state_change(StateChangeEvent(
-                    timestamp=time.time(),
-                    old_state=old,
-                    new_state=new_state,
-                    reason=reason,
-                ))
+                self.on_state_change(evt)
             except Exception:
                 # Listener errors don't kill the monitor.
+                pass
+        # Phase 5: also publish on the bus when wired. Severity
+        # reflects the destination state — anything other than
+        # ONLINE escalates to warning so subscribers can react to
+        # "we lost network" without inspecting payload state names.
+        if self.bus is not None:
+            try:
+                from event_bus import DeckEvent
+                severity = (
+                    "info" if new_state == ConnectionState.ONLINE
+                    else "warning"
+                )
+                self.bus.publish(DeckEvent(
+                    kind="connection.transition",
+                    source="connection_monitor",
+                    timestamp=evt.timestamp,
+                    severity=severity,
+                    text=(
+                        f"connection: {old.value} → "
+                        f"{new_state.value} ({reason})"
+                    ),
+                    payload=evt,
+                ))
+            except Exception:
                 pass

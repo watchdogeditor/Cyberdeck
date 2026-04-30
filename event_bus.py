@@ -432,3 +432,35 @@ class Kind:
     # watchdog shutdown). If a `blacklist.removed` ever lands, it
     # joins this namespace.
     BLACKLIST_ADDED = "blacklist.added"
+
+    # Brake state (Phase 5). The deck-global brake. Single event today
+    # — `brake.change` covers paranoid/default/yolo transitions in
+    # either direction. Severity escalates with the destination tier
+    # (paranoid=info, default=info, yolo=warning) so subscribers can
+    # gate on severity for "alert me when constructs go unrestricted"
+    # workflows.
+    BRAKE_CHANGE = "brake.change"
+
+    # Connection monitor (Phase 5). Single event for online/degraded/
+    # offline transitions; payload carries the StateChangeEvent.
+    # Severity reflects the destination state (online=info, others
+    # =warning) so subscribers can react to "we lost network" without
+    # looking at the payload.
+    CONNECTION_TRANSITION = "connection.transition"
+
+    # Profile registry (Phase 5). Each ProfileEvent kind maps to a
+    # corresponding bus kind. Subscribers that just want "anything
+    # changed in the profile world" use `profile.*` glob; ones that
+    # care specifically about a single shape use the constant.
+    PROFILE_ADDED = "profile.added"
+    PROFILE_CHANGED = "profile.changed"
+    PROFILE_REMOVED = "profile.removed"
+    PROFILE_SCAN_ERROR = "profile.scan_error"
+    PROFILE_SCAN_COMPLETE = "profile.scan_complete"
+
+    # Plugin registry (Phase 5). Same shape as profile kinds —
+    # PluginEvent.kind ∈ {loaded, scan_error, scan_complete} maps to
+    # plugin.<kind>.
+    PLUGIN_LOADED = "plugin.loaded"
+    PLUGIN_SCAN_ERROR = "plugin.scan_error"
+    PLUGIN_SCAN_COMPLETE = "plugin.scan_complete"

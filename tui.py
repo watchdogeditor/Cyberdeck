@@ -2728,6 +2728,7 @@ class CyberdeckApp(App):
         self.profile_registry = ProfileRegistry(
             self.profiles_dir,
             on_event=self._handle_profile_event,
+            bus=self.bus,
         )
         # Plugins directory: defaults next to profiles. Plugins are
         # capability bundles (manifest + README + entry script) that
@@ -2739,6 +2740,7 @@ class CyberdeckApp(App):
         self.plugin_registry = PluginRegistry(
             self.plugins_dir,
             on_event=self._handle_plugin_event,
+            bus=self.bus,
         )
         # Watchdog Q&A oracle. Async question→answer pipe backed by
         # one-shot `claude -p` invocations. The simpler half of the
@@ -2784,6 +2786,7 @@ class CyberdeckApp(App):
         # events that those consumers will subscribe to.
         self.connection_monitor = ConnectionMonitor(
             on_state_change=self._handle_connection_change,
+            bus=self.bus,
         )
         # Brake state — deck-global enum (paranoid/default/yolo) that
         # gates what constructs are permitted to do at runtime. The
@@ -2796,6 +2799,7 @@ class CyberdeckApp(App):
         self.brake_state_store = BrakeStateStore(
             state_path=self.home_dir / ".cyberdeck" / "state.json",
             on_change=self._handle_brake_change,
+            bus=self.bus,
         )
         # Loaded synchronously in __init__ rather than on_mount so
         # any spawn (including the initial pool warm-up) sees the

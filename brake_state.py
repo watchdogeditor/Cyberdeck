@@ -88,12 +88,19 @@ class BrakeStateStore:
         state_path: Path,
         *,
         on_change: Optional[BrakeListener] = None,
+        bus: Optional[object] = None,
     ) -> None:
         self.state_path = Path(state_path)
         self._state: BrakeState = self.DEFAULT_STATE
         self._listeners: list[BrakeListener] = []
         if on_change is not None:
             self._listeners.append(on_change)
+        # Phase 5 of the unified-event-stream slice. When wired,
+        # `set()` ALSO publishes a `brake.change` DeckEvent on the
+        # bus alongside the existing listener fan-out. Object type
+        # rather than EventBus to avoid a circular import — same
+        # reason as Phase 4's TripwireEngine / Blacklist.
+        self.bus = bus
 
     # ---- read API ----------------------------------------------------------
 
@@ -188,6 +195,33 @@ class BrakeStateStore:
                 # practice; this is the safety net.
                 print(
                     f"brake_state: listener error: {exc!r}",
+                    file=sys.stderr,
+                )
+        # Phase 5: also publish on the bus when wired. Severity
+        # escalates with destination tier — yolo gets warning so
+        # subscribers can react to "constructs are now unrestricted"
+        # without inspecting payload state names. paranoid and
+        # default stay info; both are tightening or staying-baseline
+        # transitions.
+        if self.bus is not None:
+            try:
+                from event_bus import DeckEvent
+                severity = (
+                    "warning" if new_state == BrakeState.YOLO else "info"
+                )
+                self.bus.publish(DeckEvent(
+                    kind="brake.change",
+                    source="brake_state",
+                    severity=severity,
+                    text=(
+                        f"\\[brake] {old_state.value} → "
+                        f"{new_state.value} ({reason})"
+                    ),
+                    payload=event,
+                ))
+            except Exception as exc:
+                print(
+                    f"brake_state: bus publish error: {exc!r}",
                     file=sys.stderr,
                 )
 

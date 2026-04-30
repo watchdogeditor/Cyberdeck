@@ -136,12 +136,17 @@ class ProfileRegistry:
         *,
         on_event: Optional[ProfileEventListener] = None,
         poll_interval: float = 1.0,
+        bus: Optional[object] = None,
     ) -> None:
         self.profiles_dir = Path(profiles_dir)
         self.poll_interval = poll_interval
         self._listeners: list[ProfileEventListener] = []
         if on_event is not None:
             self._listeners.append(on_event)
+        # Phase 5 of the unified-event-stream slice. When wired,
+        # `_emit` ALSO publishes a `profile.<kind>` DeckEvent on the
+        # bus alongside the legacy listener fan-out.
+        self.bus = bus
 
         # Authoritative state
         self._by_name: dict[str, Profile] = {}
@@ -179,6 +184,26 @@ class ProfileRegistry:
                 # carry on.
                 print(
                     f"profile_registry: listener error: {e!r}",
+                    file=sys.stderr,
+                )
+        # Phase 5: also publish on the bus when wired. ProfileEvent
+        # already has a `kind` field that maps cleanly to dotted-
+        # namespace; scan_error escalates to warning severity.
+        if self.bus is not None:
+            try:
+                from event_bus import DeckEvent
+                severity = (
+                    "warning" if event.kind == "scan_error" else "info"
+                )
+                self.bus.publish(DeckEvent(
+                    kind=f"profile.{event.kind}",
+                    source="profile_registry",
+                    severity=severity,
+                    payload=event,
+                ))
+            except Exception as e:
+                print(
+                    f"profile_registry: bus publish error: {e!r}",
                     file=sys.stderr,
                 )
 
