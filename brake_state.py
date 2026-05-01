@@ -263,6 +263,14 @@ def make_spawn_settings(
     # tried to open it). Forward slashes + double quotes survives the
     # shell pass cleanly. Same fix the dispatcher uses elsewhere.
     hook_path_str = str(hook_path).replace("\\", "/")
+    # Slice 2 of the safety architecture pass: construct_id is now
+    # passed to brake_hook.py as a second argv arg. The hook reads
+    # `<home>/.cyberdeck/spawns/<construct_id>.deny_pending.json`
+    # written by the watchdog's TripwireEngine on warning/critical
+    # fires — that's how tripwires get teeth (they extend brake by
+    # writing per-construct flags the hook reads). Without this
+    # arg, the hook can't identify which spawn it's enforcing
+    # against, and tripwire-based denies wouldn't work.
     settings = {
         "hooks": {
             "PreToolUse": [
@@ -272,7 +280,8 @@ def make_spawn_settings(
                         {
                             "type": "command",
                             "command": (
-                                f'python "{hook_path_str}" {brake.value}'
+                                f'python "{hook_path_str}" '
+                                f'{brake.value} {construct_id}'
                             ),
                         },
                     ],

@@ -3193,6 +3193,13 @@ class CyberdeckApp(App):
             # engine) and authoring lifecycle publish to it alongside
             # the existing on_event / on_fire callbacks.
             bus=self.bus,
+            # Slice 2 of the safety architecture pass: home_dir is
+            # threaded to the TripwireEngine so it can write per-
+            # construct deny_pending.json files. The brake hook reads
+            # those files at every invocation and denies the next
+            # tool call from a construct that fired a warning or
+            # critical tripwire — that's how tripwires get teeth.
+            home_dir=self.home_dir,
         )
         # Connection monitor — heartbeats api.anthropic.com:443 to
         # detect Online/Degraded/Offline transitions. Per spec line
@@ -3259,6 +3266,17 @@ class CyberdeckApp(App):
                 deck_version="cyberdeck-spine-phase-7",
                 brake_label=self.brake_state_store.state.value,
                 home_dir=self.home_dir,
+                # Slice 2: dump blacklist contents on close so cross-
+                # run analysis can spot recurring fingerprints. Lambda
+                # rather than a direct list reference because the
+                # blacklist mutates over the session's lifetime; we
+                # want the snapshot AT close time, not at construction.
+                blacklist_provider=lambda: (
+                    self.watchdog.blacklist.entries
+                    if self.watchdog is not None
+                    and self.watchdog.blacklist is not None
+                    else []
+                ),
             )
             self.deck_logger.attach_to_bus(self.bus)
         except Exception as exc:
@@ -6793,6 +6811,37 @@ class CyberdeckApp(App):
             )
         except Exception:
             pass
+        # Slice 2 of the safety architecture pass: critical tripwires
+        # auto-terminate the construct. The brake hook's deny_pending
+        # check has already blocked the construct's next tool call
+        # (or will, on the next invocation), so the construct can't
+        # run the dangerous action. Killing it ensures it can't keep
+        # trying variations of the same dangerous approach. The deck-
+        # global brake hook still applies to any future spawns.
+        #
+        # Best-effort: if the construct already finalized between the
+        # tripwire fire and this handler, kill_construct returns
+        # False — no harm. If fleet isn't wired (headless test
+        # contexts), skip silently. Critical fires still render to
+        # chatlog so the netrunner sees the event regardless.
+        if fire.severity == Severity.CRITICAL and self.fleet is not None:
+            try:
+                self.run_worker(
+                    self.fleet.kill_construct(fire.construct_id),
+                    name=f"tripwire-kill-{fire.construct_id}",
+                )
+                self._chatlog_write(
+                    f"[red b]× auto-term[/red b] [cyan]"
+                    f"{fire.construct_id}[/cyan] [dim](critical "
+                    f"tripwire {fire.tripwire_name})[/dim]"
+                )
+            except Exception:
+                # run_worker can fail if the App isn't fully mounted
+                # yet, or if the fleet is in a transitional state.
+                # Log to chatlog and move on — the construct may
+                # finalize on its own; the deny_pending flag still
+                # blocks its next call.
+                pass
 
     # ---- slice 2: LLM-authored tripwires --------------------------------
     #

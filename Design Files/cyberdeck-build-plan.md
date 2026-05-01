@@ -454,6 +454,33 @@ natively, doesn't suffer chat context truncation.
   the widest unprotected attack surface; the LOOM v6 production
   database in particular was reachable via execute_sql until
   this slice shipped.
+- ✓ Safety Architecture Pass slice 2/4: Tripwire escalation chain
+  (2026-04-30, late) — tripwires now have teeth. Severity-driven
+  escalation: low→log; warning→brake hook denies next tool call
+  with description + suggestion in stderr; critical→deny + tui
+  handler calls `fleet.kill_construct` via `run_worker`;
+  critical+bad_enough→same plus auto-blacklist proposal (action
+  deferred to slice 3 for approval window). Mechanism:
+  TripwireEngine writes `<home>/.cyberdeck/spawns/<cid>.
+  deny_pending.json` on warning/critical fires; brake_hook reads
+  + clears the file at every invocation. Race mitigation: 100ms
+  recheck on write-class tools (Read/Glob/Grep skip — no latency
+  penalty for the common case). New Tripwire schema fields:
+  `description`, `suggestion`, `bad_enough`. Authoring prompt
+  rewritten to forbid the depth-of-defense antipattern (no more
+  `rm(?!\s+-rf)` negative-lookahead skipping). brake_state.
+  make_spawn_settings now passes construct_id as second argv arg
+  to the hook. Logger dumps blacklist on close per netrunner ask
+  — cross-run analysis can spot recurring fingerprints. Real-
+  deck verified end-to-end via cx-279d4ae8 bait construct: 4
+  critical tripwires fired simultaneously on one Bash echo, all
+  4 logged to chatlog with red-bold styling, brake hook denied
+  with new message format quoting the tripwire name, construct
+  auto-termed via bus subscriber. Authoring confirmed producing
+  6 well-shaped patterns including bad_enough on shell-
+  destructive baselines (rm_rf, format_disk, dd, fork_bomb,
+  shutdown). +~350 LOC across tripwires.py, brake_hook.py,
+  brake_state.py, watchdog.py, tui.py, logger.py.
 
 **Spine progress (2026-04-30): 8/8 phases shipped (COMPLETE)** —
 see `cyberdeck-event-stream-design.md`. Producer migration (Phase
@@ -487,26 +514,17 @@ longer maintain their own listener fan-out paths.
      LOC; real-deck verified end-to-end. Per-spawn allowlist
      override deferred to compose with slice (c). See "Post-
      migration shipped" entry above.
-   - **(b) 🔥 Tripwire escalation chain** (architectural
-     unfinished work; turns tripwires from observers into inputs
-     to brake/blacklist):
-     - `low` → log only (current behavior)
-     - `warning` → log + redirect construct with "why" via
-       brake-style denial on next tool call (reuses brake hook
-       mechanics; tripwire engine writes a denial-flag file the
-       hook reads)
-     - `critical` → log + auto-term construct; structured
-       `tripwire.auto_term` event published to bus carrying the
-       "why"
-     - `critical + "bad enough"` → auto-term + auto-blacklist
-     "Bad enough" threshold uses hybrid: deterministic floor
-     (specific tripwire NAMES like `credentials_exfiltration`,
-     `pii_leak`, `auth_bypass_attempt` always blacklist on
-     critical fire) + watchdog LLM judgment for gray zone (with
-     structured output) + 30s netrunner approval window before
-     any auto-blacklist commits (mirrors variable-outcome pause
-     UX in (c)).
-   - **(c) Variable-outcome pause UX** (re-frame from
+   - ~~**(b) Tripwire escalation chain**~~ ✅ shipped 2026-04-30
+     (late). Tripwires gained teeth: low→log; warning→brake
+     denies next call with suggestion; critical→deny + auto-term
+     via tui handler; critical+bad_enough→same + blacklist
+     proposal (deferred application). Real-deck verified —
+     cx-279d4ae8 bait construct fired 4 critical tripwires on
+     one Bash echo, all logged + auto-termed cleanly; authoring
+     prompt rewrite produced shell-destructive baselines with
+     bad_enough flags. +~350 LOC across 6 files. See "Post-
+     migration shipped" entry above.
+   - **🔥 Active: (c) Variable-outcome pause UX** (re-frame from
      netrunner). Brake state determines DEFAULT ACTION; pause
      window is netrunner's chance to OVERRIDE. YOLO → pause-
      before-allowing. Default → pause-before-denying-destructive.

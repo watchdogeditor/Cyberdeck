@@ -110,6 +110,22 @@ class Tripwire:
     construct_id: Optional[str] = None  # only meaningful when scope=PER_CONSTRUCT
     origin: str = Origin.MANUAL
     authored_at: float = field(default_factory=time.time)
+    # Slice 2 escalation chain additions: tripwires gain teeth.
+    # `suggestion` is the warning-tier "do this instead" message — the
+    # netrunner's framing was "hey, not like that." Surfaced in the
+    # brake-hook denial stderr so the construct sees the alternative
+    # alongside the deny. Empty string for low/critical (the deny
+    # message there doesn't need to suggest a pivot — low is log-only,
+    # critical kills the construct).
+    suggestion: str = ""
+    # `bad_enough` is the critical-tier auto-blacklist marker — the
+    # netrunner's "rogue AI red button." When True and the tripwire
+    # fires at critical severity, the watchdog proposes a blacklist
+    # add (with netrunner approval window — wired in slice 3, not yet
+    # automatic). When False, critical fires kill the construct but
+    # don't blacklist. Default False so the netrunner has to explicitly
+    # opt into auto-blacklist on a per-tripwire basis.
+    bad_enough: bool = False
 
 
 @dataclass
@@ -121,6 +137,16 @@ class TripwireFire:
     construct_id: str
     matched_text_excerpt: str  # truncated; the full event is still in logs
     event_kind: str
+    # Slice 2 escalation chain additions: fire records carry the
+    # source tripwire's description / suggestion / bad_enough so
+    # downstream consumers (brake hook flag file, chatlog, kill
+    # handler) don't need to dereference back through the registry.
+    # Denormalized intentionally — fires are short-lived records, the
+    # registry can mutate, and the fire's context should outlive any
+    # registry change.
+    description: str = ""
+    suggestion: str = ""
+    bad_enough: bool = False
     fired_at: float = field(default_factory=time.time)
 
 
@@ -261,6 +287,7 @@ class TripwireEngine:
         self,
         on_fire: Optional[Callable[[TripwireFire], None]] = None,
         bus: Optional[Any] = None,
+        home_dir: Optional[Any] = None,
     ) -> None:
         # Indexed by name. Names must be unique; re-registering an
         # existing name updates in place (useful for LLM authoring
@@ -283,6 +310,14 @@ class TripwireEngine:
         # -> watchdog ordering at import; staying duck-typed keeps
         # the dependency graph clean. Same pattern in Blacklist.
         self.bus = bus
+        # Slice 2 escalation chain: when a warning or critical fires,
+        # the engine writes a per-construct deny_pending JSON file
+        # the brake hook reads to deny that construct's NEXT tool
+        # call. home_dir tells the engine where to write — the same
+        # spawns/ directory brake_state.make_spawn_settings uses.
+        # None means no flag-write path (engine still fires for
+        # observability, but tripwires don't gain teeth).
+        self.home_dir = home_dir
 
     # ---- registry --------------------------------------------------
 
@@ -409,6 +444,9 @@ class TripwireEngine:
                     construct_id=construct_id,
                     matched_text_excerpt=excerpt_with_ctx,
                     event_kind=event_kind,
+                    description=tw.description,
+                    suggestion=tw.suggestion,
+                    bad_enough=tw.bad_enough,
                 )
                 fires.append(fire)
         # Dispatch all fires after the scan loop (so on_fire callbacks
@@ -451,7 +489,52 @@ class TripwireEngine:
                     # itself shouldn't crash the engine if something
                     # weird happens (broken bus reference, etc.).
                     pass
+        # Slice 2 escalation chain: warning + critical fires write a
+        # per-construct deny_pending file the brake hook reads. The
+        # hook denies the next tool call from this construct with
+        # the recorded reason + suggestion (warning) or terminal
+        # message (critical). Critical fires ALSO trigger kill via
+        # the bus subscriber (tui handler subscribed to
+        # tripwire.fire), but the deny is the pre-tool-use block —
+        # kill is reactive and only stops SUBSEQUENT calls. The
+        # block is what prevents the dangerous call from running in
+        # the first place. See cyberdeck-state.md "Safety
+        # architecture analysis" for why hook-block matters.
+        if self.home_dir is not None:
+            for fire in fires:
+                if fire.severity in (Severity.WARNING, Severity.CRITICAL):
+                    self._write_deny_pending(fire)
         return fires
+
+    def _write_deny_pending(self, fire: TripwireFire) -> None:
+        """Write the per-construct deny_pending JSON the brake hook
+        reads. Best-effort — disk failures are silent; the cost of
+        a missed write is one tool call slipping through under
+        warning severity (critical still kills the construct via
+        the bus path)."""
+        if self.home_dir is None:
+            return
+        try:
+            from pathlib import Path
+            import json as _json
+            spawns_dir = Path(self.home_dir) / ".cyberdeck" / "spawns"
+            spawns_dir.mkdir(parents=True, exist_ok=True)
+            path = spawns_dir / f"{fire.construct_id}.deny_pending.json"
+            payload = {
+                "tripwire_name": fire.tripwire_name,
+                "severity": fire.severity,
+                "description": fire.description,
+                "suggestion": fire.suggestion,
+                "matched_text_excerpt": fire.matched_text_excerpt,
+                "event_kind": fire.event_kind,
+                "fired_at": fire.fired_at,
+            }
+            path.write_text(
+                _json.dumps(payload), encoding="utf-8",
+            )
+        except OSError:
+            # Disk full / permission denied / etc. — degrade gracefully.
+            pass
 
 
 # -- default tripwires shipped with the deck --------------------------------
@@ -559,30 +642,57 @@ agents called "constructs" under a human supervisor (the "netrunner").
 You normally answer the netrunner's questions about fleet activity. For
 this turn only, switch modes: you are AUTHORING TRIPWIRES.
 
-Tripwires are the deck's early-warning system. They are deterministic
-regex matchers that fire on construct event content as it streams in
-(sub-millisecond, in-process). When a tripwire fires, the netrunner
-sees a line in the chatlog. Tripwires are HEURISTIC — their job is to
-say "look at this," not to decide whether something is dangerous.
+Tripwires are deterministic regex matchers that fire on construct
+event content as it streams in (sub-millisecond, in-process). They
+are NOT observation-only — they have teeth. When a tripwire fires,
+the deck takes ACTION based on severity:
+
+  - low      → log the fire to the chatlog. No effect on the
+               construct. Use for informational signals.
+  - warning  → BLOCK the construct's next tool call with a denial
+               that quotes your `description` and `suggestion`. The
+               construct sees the block as a tool error and decides
+               how to pivot. Use for "hey, not like that — try this
+               instead" cases.
+  - critical → BLOCK the next tool call AND auto-terminate the
+               construct entirely. The construct stops running. Use
+               for "this thought process is broken; throw the whole
+               thing away and try again" cases.
+  - critical + bad_enough=true → all of the above, plus the watchdog
+               proposes adding the construct's task fingerprint to
+               the session blacklist (with netrunner approval). Use
+               for "this is a rogue-AI red-button signal." Reserved
+               for genuine emergencies; the netrunner will see every
+               fire and approve or reject.
 
 What tripwires are NOT:
-  - They are not the brake hook. The brake hook is a separate
-    deterministic layer that BLOCKS dangerous tool calls (rm -rf,
-    OS-root writes, destructive bash patterns, fork bombs, etc.). Do
-    NOT author tripwires that duplicate brake-hook coverage — those
-    calls are already gated and your rule would just be noise.
-  - They are not policy. They don't grant or refuse permission. They
-    surface noteworthy patterns; the netrunner decides what to do.
+  - They are not policy. The netrunner is the policy authority. You
+    are encoding the netrunner's likely intent for THIS GOAL into
+    deterministic patterns that fire when the construct drifts.
 
-What you author here will run alongside two deck-default tripwires
-that ship with every session:
-  - keyword_credentials: matches password/api_key/secret/credentials
-    keywords in tool_result_content (low severity).
-  - keyword_destructive_sql: matches DROP TABLE / TRUNCATE / DELETE
-    FROM in tool_use_command (warning severity).
-Don't duplicate either. Author rules that target THIS GOAL's specific
-risks — drift indicators, error patterns the netrunner needs to know
-about, off-rails shapes for this kind of work.
+LAYERED DEFENSE — DO NOT SKIP PATTERNS. The deck has a separate
+brake hook that ALSO blocks destructive shapes (rm -rf system roots,
+OS-root writes, fork bombs, MCP destructive verbs). DO NOT skip
+authoring a tripwire on the basis that "the brake hook will catch
+it." That reasoning is the depth-of-defense antipattern: every
+layer assumes another caught the dangerous case, and the dangerous
+case slips through if any one layer is misconfigured (e.g., brake
+flipped to YOLO). Real-deck observed: a prior authoring pass
+authored a `benign_delete_attempt` tripwire whose regex used
+negative-lookahead to EXCLUDE rm -rf because "brake handles it" —
+exactly the antipattern that defeats layering. If a pattern is
+catastrophically dangerous, EVERY layer covers it, REGARDLESS of
+what other layers do. Authoring shell-destructive patterns
+(rm -rf, format, dd of=/dev, mkfs, fork bombs, shutdown) at
+critical severity is REQUIRED, not optional.
+
+Two deck-default tripwires ship with every session:
+  - keyword_credentials: low — credentials keywords in tool_result.
+  - keyword_destructive_sql: warning — DROP TABLE / TRUNCATE /
+    DELETE FROM in tool_use_command.
+Don't duplicate these specifically (the patterns already cover
+them). DO author other shell-destructive baselines and goal-
+specific drift indicators alongside.
 
 OUTPUT FORMAT — strict JSON, nothing else (no prose, no markdown
 fences, no preamble):
@@ -596,7 +706,9 @@ fences, no preamble):
       "event_kinds": ["tool_use", "tool_result", "assistant", "thinking"],
       "field": "tool_use_command|tool_use_input|tool_result_content|thinking_text|assistant_text|user_text|any",
       "severity": "low|warning|critical",
-      "scope": "deck_global"
+      "scope": "deck_global",
+      "suggestion": "for warning only: what the construct should do instead",
+      "bad_enough": false
     }
   ]
 }
@@ -610,7 +722,7 @@ Field reference:
       saw / received Y."
     * assistant: model's prose response. Match here for "model said Z."
     * thinking: model's reasoning blocks. Match here for "model is
-      considering W." Rare; prefer assistant for most prose checks.
+      considering W."
   - field: which extracted text the regex runs against. The field
     selector is what makes tripwires precise — won't false-fire on
     incidental text mentions of dangerous-looking tokens.
@@ -623,37 +735,48 @@ Field reference:
     * user_text: rare; mostly inject paths.
     * any: union of all of the above. Use sparingly — defeats the
       precision gain.
-  - severity: how the netrunner should react.
-    * low: informational, "worth noting." Renders dim.
-    * warning: "look at this, the construct may be off-rails." Renders
-      yellow.
-    * critical: "stop and check, this is likely bad." Reserved for
-      genuine emergencies — rare. Renders red.
-  - scope: always "deck_global" in slice 2. Per-construct authoring at
-    spawn time is a future slice.
+  - severity: as above.
+  - scope: always "deck_global" in slice 2. Per-construct authoring
+    at spawn time is a future slice.
+  - suggestion: required for `severity: warning` — the alternative
+    course of action surfaced to the construct alongside the deny.
+    Example: tripwire on `shutdown` shell command, suggestion =
+    "Restart your dev server / process instead of shutting down the
+    machine; the deck stays up." Empty for low/critical.
+  - bad_enough: optional, default false. Only meaningful when
+    `severity: critical`. Set true only when the pattern matching
+    means the construct's thought process is so off-rails it should
+    be permanently blacklisted for this session, not just killed.
+    Reserved for genuine red-button signals. The watchdog will
+    propose the blacklist add to the netrunner; auto-application
+    requires netrunner approval.
 
 Authoring guidance:
-  - Be surgical. 0-8 rules per pass is normal; 15+ risks noise that
-    trains the netrunner to ignore the chatlog.
-  - Empty output {"tripwires": []} is a valid answer. If the goal
-    doesn't suggest patterns worth watching for (vague exploration,
-    pure-research goals with no execution risk), output an empty
-    list. Padding with weak rules is worse than authoring nothing.
-  - Prefer specific patterns over broad keyword lists. False positives
-    train the netrunner to ignore the chatlog.
+  - Be surgical. 0-8 rules per pass is normal; 15+ risks noise.
+  - Empty output {"tripwires": []} is a valid answer for goals with
+    no execution risk. Padding with weak rules is worse than
+    authoring nothing.
+  - Prefer specific patterns over broad keyword lists. False
+    positives train the netrunner to ignore the chatlog.
   - Pick the smallest applicable field. Don't use "any" unless the
     pattern is genuinely cross-field.
   - Each `description` should answer "what triggers this, and why
-    does the netrunner care?" in one sentence. The netrunner reads
-    descriptions when fires happen — bad descriptions waste their
-    attention.
+    does the netrunner care?" in one sentence. The construct sees
+    `description` quoted in deny messages on warning fires — bad
+    descriptions waste the construct's pivot opportunity.
+  - For warnings, `suggestion` should describe a concrete safer
+    alternative, not just "don't do that." The construct uses your
+    suggestion to pivot; vague suggestions produce vague pivots.
   - Names must be unique within this pass (no duplicates) and use
-    snake_case. The deck shows them in chatlog fires, so make them
-    glanceable: `error_pattern_X`, `credential_in_response`,
-    `unexpected_network_call`, etc.
+    snake_case. They appear in chatlog fires and deny messages, so
+    make them glanceable.
+  - DO author critical-severity shell-destructive baselines
+    (rm_rf_system_root, format_disk, dd_to_dev, mkfs_run,
+    fork_bomb, shutdown_command, etc.) — even though the brake hook
+    also blocks them. Layered defense is the whole point.
 
-OUTPUT NOTHING BUT THE JSON OBJECT. Do not wrap it in fences. Do not
-preface it with "Here are the tripwires:". The deck parses your
+OUTPUT NOTHING BUT THE JSON OBJECT. Do not wrap it in fences. Do
+not preface it with "Here are the tripwires:". The deck parses your
 response programmatically; any non-JSON content makes parsing harder.
 """
 
@@ -925,6 +1048,21 @@ def parse_authoring_response(
         if not isinstance(description, str):
             description = ""
 
+        # Slice 2 escalation chain fields. `suggestion` is meaningful
+        # for warnings (the construct sees it in the deny stderr and
+        # uses it to pivot); we accept it for any severity but it'll
+        # only show up in the deny formatter when severity=warning.
+        # `bad_enough` is meaningful for criticals (auto-blacklist
+        # marker); same forgiving validation — accept the field at
+        # any severity but it only takes effect when severity=critical.
+        suggestion = entry.get("suggestion", "")
+        if not isinstance(suggestion, str):
+            suggestion = ""
+
+        bad_enough = entry.get("bad_enough", False)
+        if not isinstance(bad_enough, bool):
+            bad_enough = False
+
         # Construction can still fail validation at engine.register
         # time (regex compile). We don't compile here — leave that to
         # the engine so there's one source of truth for "is this
@@ -940,6 +1078,8 @@ def parse_authoring_response(
             severity=severity,
             scope=scope,
             origin=default_origin,
+            suggestion=suggestion,
+            bad_enough=bad_enough,
         ))
         seen_names.add(name)
 

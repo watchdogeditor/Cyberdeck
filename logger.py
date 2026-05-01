@@ -152,6 +152,7 @@ class DeckLogger:
         deck_version: str = "unknown",
         brake_label: str = "default",
         home_dir: Optional[Path] = None,
+        blacklist_provider: Optional[Any] = None,
     ) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +175,15 @@ class DeckLogger:
         # path goes through _safe_write which reads self._closed.
         self._subscription: Optional[Any] = None
         self._closed = False
+        # Slice 2 of the safety architecture pass: a callable that
+        # returns the current blacklist entries. Called once on
+        # close() to write a structured `blacklist_summary` event
+        # before the footer. None means no dump (e.g. headless test
+        # contexts without a Watchdog). Per the netrunner's ask
+        # 2026-04-30 (late) — accumulating blacklist entries across
+        # sessions in the per-launch logs gives us cross-run signal
+        # for "which fingerprints recur, which are session-unique."
+        self._blacklist_provider = blacklist_provider
         self._update_latest_pointer()
 
         # Header line — self-describing so any single shared file can
@@ -326,6 +336,36 @@ class DeckLogger:
                 self._subscription.unsubscribe()
         except Exception:
             pass
+        # Slice 2 of the safety architecture pass: dump the session's
+        # blacklist before the footer. This persists the netrunner's
+        # session-scoped blacklist into the per-launch log so cross-
+        # run analysis can see "which fingerprints fired across many
+        # sessions vs. which were one-offs." Best-effort: provider
+        # errors don't break shutdown; missing provider just skips
+        # the dump.
+        if self._blacklist_provider is not None:
+            try:
+                entries = self._blacklist_provider() or []
+                # Walk each entry through _serialize_payload so
+                # dataclass shapes (BlacklistEntry) become plain
+                # dicts. Same path used by the bus-event writer above
+                # — keeps the on-disk shape consistent.
+                serialized = [
+                    _serialize_payload(e, depth=0) for e in entries
+                ]
+                self._safe_write({
+                    "type": "blacklist_summary",
+                    "ts": time.time(),
+                    "iso": datetime.now().isoformat(timespec="seconds"),
+                    "count": len(serialized),
+                    "entries": serialized,
+                })
+            except Exception:
+                # Don't let blacklist serialization failures block the
+                # footer write. Silent on purpose — the netrunner can
+                # still see the blacklist via the live bus events
+                # logged earlier in the session.
+                pass
         # Footer line — the marker downstream consumers (heartbeat,
         # maintbot) look for to distinguish clean from unclean exit.
         # Write it via _safe_write so the disk-error guard still

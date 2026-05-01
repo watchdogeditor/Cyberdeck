@@ -14,7 +14,13 @@ the brake stays elegant or it stops being a brake.
 
 Protocol (per real-deck verification on claude 2.1.118):
   Stdin:  JSON {tool_name, tool_input, hook_event_name, ...}
-  Argv:   [brake_state]   — "paranoid" | "default" | "yolo"
+  Argv:   [brake_state, construct_id]
+            brake_state — "paranoid" | "default" | "yolo"
+            construct_id — "cx-xxxx" passed by brake_state
+                           .make_spawn_settings (slice 2 of safety
+                           architecture pass; tripwire engine writes
+                           per-construct deny_pending flag the hook
+                           reads)
   Exit 0: allow
   Exit 2: deny
   Stderr: when denying, the human-readable reason. Claude Code
@@ -24,6 +30,24 @@ YOLO is a no-op: the deck doesn't install this hook for YOLO spawns,
 so we shouldn't ever be invoked under it. If we are anyway, fail open
 (exit 0) — never break a YOLO construct because of a misconfigured
 hook.
+
+Tripwire integration (slice 2 of safety architecture pass): when the
+watchdog's TripwireEngine fires at warning or critical severity on a
+bus event (thinking, assistant, tool_use, tool_result), it writes
+`<home>/.cyberdeck/spawns/<cid>.deny_pending.json` with the deny
+reason. The hook reads + clears that file at every invocation; if
+present, denies the call with the recorded reason. This is what gives
+tripwires teeth — without it they were observation-only.
+
+Race-mitigation recheck: when a tripwire fires on the SAME tool_use
+event the hook is currently evaluating, the engine's flag-write may
+land microseconds after the hook's first read. The hook reads, sleeps
+100ms, re-reads — catches the engine's late publish without changing
+the hook's protocol. 100ms is small enough to be invisible in normal
+construct work and large enough to win the race against asyncio
+scheduling on the deck side. Read-only tools (Read/Glob/Grep/etc.)
+skip the recheck since they can't be denied by tripwires destructive
+of state anyway — only write-class tools wait.
 """
 from __future__ import annotations
 
@@ -31,6 +55,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 
@@ -548,9 +573,100 @@ def check_default(tool: str, inp: dict) -> tuple[bool, str]:
     return False, ""
 
 
+def deny_pending_path(construct_id: str) -> Path:
+    """Where the watchdog's TripwireEngine writes its
+    deny_pending.json files. Mirrors the per-spawn settings convention
+    used by `brake_state.make_spawn_settings` so both files live in
+    the same directory."""
+    return cyberdeck_home_dir() / ".cyberdeck" / "spawns" / f"{construct_id}.deny_pending.json"
+
+
+def read_and_clear_deny_pending(construct_id: str):
+    """Read the per-construct deny_pending.json if present and
+    delete it (so the next call doesn't keep denying after the
+    construct has already been redirected once). Returns the parsed
+    dict on success, None if the file doesn't exist or is unreadable.
+
+    Atomic-ish: read then unlink in sequence. A concurrent write from
+    the engine while we're reading is theoretically possible but
+    requires the engine to fire mid-hook-invocation on a different
+    thread, which doesn't happen in practice (engine runs on the
+    deck's asyncio loop, hook runs in a separate Python subprocess).
+    """
+    path = deny_pending_path(construct_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # Corrupted or unreadable — treat as absent. The construct
+        # gets the normal allow/deny based on built-in patterns.
+        return None
+    # Delete the file so subsequent calls aren't denied repeatedly
+    # for the same fire. The construct only deserves one denial per
+    # tripwire fire — if the engine wants to deny again, it'll
+    # write a fresh file.
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def format_deny_pending_reason(flag: dict) -> str:
+    """Build the human-readable stderr reason from a deny_pending
+    flag. Severity-aware: warning gets the suggestion appended;
+    critical announces termination."""
+    name = flag.get("tripwire_name", "?")
+    description = flag.get("description", "") or "(no description recorded)"
+    suggestion = flag.get("suggestion", "")
+    severity = flag.get("severity", "warning")
+    excerpt = flag.get("matched_text_excerpt", "")
+    if severity == "critical":
+        msg = (
+            f"⚠ tripwire {name} (CRITICAL): {description}. "
+            f"Construct will be terminated."
+        )
+    else:
+        msg = f"⚠ tripwire {name}: {description}."
+        if suggestion:
+            msg += f" Suggested alternative: {suggestion}"
+    if excerpt:
+        msg += f" [matched: {excerpt}]"
+    return msg
+
+
+# Tools that can change deck or world state. The deny_pending recheck
+# (100ms sleep + re-read) only fires for these — read-only tools
+# can't be denied by tripwires productively (a tripwire on Read
+# would fire after the read already happened) and shouldn't pay the
+# latency. This is the same intuition behind slice 3's variable-
+# outcome pause UX (write-class only) but applied here as a cheaper
+# pre-implementation of the race-mitigation mechanism.
+_WRITE_CLASS_TOOLS = frozenset({
+    "Write", "Edit", "NotebookEdit", "Bash", "PowerShell",
+})
+
+
+def is_write_class(tool: str) -> bool:
+    """Whether this tool can change deck or world state. MCP tools
+    are write-class if their verb is in the destructive set; the
+    read-shaped ones are auto-allowed by check_default and don't
+    need the recheck either."""
+    if tool in _WRITE_CLASS_TOOLS:
+        return True
+    if tool.startswith("mcp__"):
+        verb = extract_mcp_verb(tool)
+        return verb is not None and verb not in MCP_READ_VERBS
+    return False
+
+
 def main() -> int:
     """Read stdin, dispatch on brake, emit stderr + exit code."""
     brake = sys.argv[1] if len(sys.argv) > 1 else "default"
+    construct_id = sys.argv[2] if len(sys.argv) > 2 else ""
 
     # YOLO short-circuits to allow. This shouldn't actually be invoked
     # under YOLO (the deck omits --settings), but we fail open if it is.
@@ -571,6 +687,30 @@ def main() -> int:
     inp = payload.get("tool_input") or {}
     if not isinstance(inp, dict):
         inp = {}
+
+    # Slice 2 of the safety architecture pass: tripwire deny_pending
+    # check. The watchdog's TripwireEngine writes the flag when a
+    # warning or critical tripwire matches a bus event; we read it
+    # here at the top of every invocation so the next tool call from
+    # this construct gets denied with the recorded reason.
+    #
+    # Race mitigation: when the engine fires on the SAME tool_use
+    # event we're currently evaluating (engine sees it via bus, we
+    # see it via Claude Code's hook invocation), the engine's flag-
+    # write may land just after our first read. For write-class
+    # tools, sleep 100ms and re-check. Read-only tools skip the
+    # recheck — tripwires don't usefully deny Read/Glob/Grep/etc.
+    # (the read already happened by the time anyone could match
+    # against it), so the recheck would just add latency for no
+    # safety gain.
+    if construct_id:
+        flag = read_and_clear_deny_pending(construct_id)
+        if flag is None and is_write_class(tool):
+            time.sleep(0.1)
+            flag = read_and_clear_deny_pending(construct_id)
+        if flag is not None:
+            print(format_deny_pending_reason(flag), file=sys.stderr)
+            return 2
 
     if brake == "paranoid":
         deny, reason = check_paranoid(tool, inp)

@@ -528,6 +528,7 @@ class Watchdog:
         history: Optional["WatchdogHistory"] = None,
         on_tripwire_fire: Optional[Callable[["TripwireFire"], None]] = None,
         bus: Optional[Any] = None,
+        home_dir: Optional[Any] = None,
     ) -> None:
         self.id = f"wd-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -557,8 +558,20 @@ class Watchdog:
         # keyword + destructive SQL) installed automatically; slice 2
         # adds LLM-authored tripwires registered at goal-start /
         # goal-update time.
+        # Slice 2 of the safety architecture pass: pass home_dir
+        # through to the engine so it can write per-construct
+        # deny_pending.json files for warning/critical fires. The
+        # brake hook reads these files at every invocation and
+        # denies the next tool call from the construct that fired.
+        # Without home_dir, the engine still fires + publishes events
+        # but tripwires stay observation-only (the pre-slice-2
+        # behavior).
         from tripwires import TripwireEngine, install_default_tripwires
-        self.tripwires = TripwireEngine(on_fire=on_tripwire_fire, bus=bus)
+        self.tripwires = TripwireEngine(
+            on_fire=on_tripwire_fire,
+            bus=bus,
+            home_dir=home_dir,
+        )
         install_default_tripwires(self.tripwires)
         # Persistent Q&A log. When set, every resolved question gets
         # appended to a JSONL file before the callback fires. The TUI

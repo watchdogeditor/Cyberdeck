@@ -40,7 +40,7 @@ for full layer breakdown.
 
 Four composable slices, current state:
 
-1. **✅ MCP gating in `brake_hook.py`** — SHIPPED 2026-04-30 (late).
+1. **✅ MCP gating in `brake_hook.py`** — SHIPPED 2026-04-30 (late, slice 1/4).
    Verb-based pattern matching added: `MCP_READ_VERBS` (get, list,
    search, describe, fetch, show, read, view, peek, check,
    validate, inspect, find, query, lookup, count, exists, has,
@@ -75,29 +75,42 @@ Four composable slices, current state:
    follow-up — needs UI design (probably composes with the
    variable-outcome pause UX in slice 3).
 
-2. **🔥 Tripwire escalation chain** — the architectural unfinished
-   work. Tripwires today are pure observers; the netrunner's
-   stated original design intent (re-confirmed 2026-04-30) was a
-   severity-driven escalation that turns tripwires into INPUTS to
-   the existing hard-gate layers (brake / blacklist) rather than
-   a parallel observability silo:
-   - `low` → log only (current behavior; matches today)
-   - `warning` → log + redirect construct with "why" via
-     brake-style denial on next tool call
-   - `critical` → log + auto-term construct with structured "why"
-     bus event
-   - `critical + "bad enough"` → auto-term + auto-blacklist
-   The "bad enough" threshold uses a hybrid: deterministic floor
-   (specific tripwire NAMES like `credentials_exfiltration`,
-   `pii_leak`, `auth_bypass_attempt` always blacklist on critical
-   fire) + watchdog LLM judgment for the gray zone (with
-   structured output) + 30s netrunner approval window before any
-   auto-blacklist commits (mirrors the variable-outcome pause UX).
-   The "redirect with why" mechanism is brake-style denial —
-   tripwire fire causes brake hook to return deny on the next
-   tool call from that construct with the tripwire reason as
-   stderr; reuses every existing mechanism, no mid-stream message
-   injection needed.
+2. **✅ Tripwire escalation chain** — SHIPPED 2026-04-30 (late,
+   slice 2/4). Tripwires now have teeth: severity-driven
+   escalation turns them into INPUTS to the existing hard-gate
+   layers (brake / blacklist) rather than a parallel observability
+   silo. Wired:
+   - `low` → log only (unchanged)
+   - `warning` → log + brake hook denies next tool call from this
+     construct with `description` + `suggestion` in stderr.
+     Construct sees a normal `tool_result.is_error` and decides
+     how to pivot.
+   - `critical` → log + brake hook denies + tui handler calls
+     `fleet.kill_construct(cid)` via `run_worker`. Construct
+     terminates entirely.
+   - `critical + bad_enough=true` → all of the above; auto-
+     blacklist proposal is filed but NOT auto-applied yet (waits
+     for the variable-outcome pause UX in slice 3 for the approval
+     window).
+   Mechanism: TripwireEngine writes per-construct
+   `<home>/.cyberdeck/spawns/<cid>.deny_pending.json` on warning
+   /critical fires. Brake hook reads + clears that file at every
+   invocation; if present, denies the call with the recorded
+   reason. Race mitigation: 100ms recheck for write-class tools
+   (Write/Edit/NotebookEdit/Bash/PowerShell + MCP destructive
+   verbs) — read-only tools skip the recheck, no latency penalty.
+   Authoring prompt rewrite: forbids the "brake handles X so
+   tripwire skips X" depth-of-defense antipattern that produced
+   the `rm(?!\s+-rf)` negative-lookahead on a prior session.
+   New schema fields on Tripwire: `description`, `suggestion`
+   (warning), `bad_enough` (critical). Real-deck verified
+   2026-04-30 (late) via cx-279d4ae8 bait construct: 4 critical
+   tripwires fired simultaneously on a single Bash echo, all
+   logged to chatlog with red-bold styling, brake hook denied
+   with the new message format, construct auto-termed via the
+   bus subscriber. Plus authoring confirmed working with the
+   new schema (6 patterns including bad_enough flags on
+   shell-destructive baselines).
 
 3. **Variable-outcome pause UX** (re-frame from netrunner). Brake
    state determines DEFAULT ACTION; pause window is netrunner's

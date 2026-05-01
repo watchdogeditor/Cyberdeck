@@ -110,8 +110,8 @@ Phase 8 bus subscriptions (every migrated path renders correctly
 in the chatlog), kill state transitions (k + Shift+K both move
 panes to `[KILLED]` + chatlog shows orange × glyph).
 
-**Next session picks up at: 🔥 SAFETY ARCHITECTURE PASS (1/4
-shipped, slice 2 next).** Real-deck testing + log analysis on
+**Next session picks up at: 🔥 SAFETY ARCHITECTURE PASS (2/4
+shipped, slice 3 next — but kill-site audit jumped the queue).** Real-deck testing + log analysis on
 2026-04-30 (late) revealed the structural truth: **the brake
 hook is doing 95% of real safety work alone, and most other
 "safety" layers don't compose with it.** Tripwires today are
@@ -130,14 +130,35 @@ Pass progress:
    verified across the netrunner's actual Supabase/Gmail/Drive/
    Calendar connectors. The `execute_sql`-against-LOOM-production
    surface is closed.
-2. **🔥 Tripwire escalation chain** (architectural unfinished
-   work). `low`=log only (current); `warning`=log + redirect via
-   brake-style denial on next tool call; `critical`=auto-term
-   with structured "why" bus event; `critical + bad enough`=
-   auto-term + auto-blacklist. Hybrid threshold: deterministic
-   floor + watchdog LLM judgment + 30s netrunner approval window.
-   Turns tripwires into INPUTS to the existing hard-gate layers.
-3. **Variable-outcome pause UX** (re-frame from netrunner).
+2. ~~**Tripwire escalation chain**~~ ✅ SHIPPED 2026-04-30 (late).
+   Tripwires gained teeth: low→log; warning→brake denies next
+   call with description+suggestion in stderr; critical→deny +
+   tui handler kills construct via run_worker; critical+
+   bad_enough→same plus blacklist proposal (deferred application
+   to slice 3). TripwireEngine writes per-construct deny_pending
+   .json that brake_hook reads at every invocation. 100ms recheck
+   for write-class tools mitigates same-turn race. Authoring
+   prompt rewritten — depth-of-defense antipattern explicitly
+   forbidden. Real-deck verified via cx-279d4ae8 bait construct:
+   4 critical tripwires fired on one Bash echo, all logged,
+   brake denied with new message, construct auto-termed.
+3. **🚨 KILL AUDIT (mission critical, real-deck-surfaced
+   2026-04-30 late).** Constructs are getting killed without
+   identifiable cause in the log file. Two real-deck sessions
+   showed constructs going from spawn → 1 Read tool_use →
+   `state=killed`, denials=0, with no preceding tripwire.fire /
+   brake.deny / blacklist.added / mechanic event. Netrunner
+   confirms NOT them. Suspected timeout-driven kills among other
+   candidates. Action: grep every kill-invoking site (tui kill
+   actions, fleet timeouts, mechanic, EJECT, daemon outcomes,
+   c.wait timeouts, tripwire critical handler), ensure each emits
+   a `fleet.kill_requested` bus event with source/reason BEFORE
+   calling kill. Plus `kill_source` field on the finalize meta
+   payload populated from whoever called Construct.kill(). Until
+   this lands, kill behavior is fundamentally unobservable —
+   diagnostic constructs can't explain deaths, watchdog Q&A
+   can't either, the file logger doesn't know.
+4. **Variable-outcome pause UX** (re-frame from netrunner).
    Brake state determines DEFAULT ACTION; pause window is the
    netrunner's chance to OVERRIDE. YOLO=pause-before-allowing,
    Default=pause-before-denying-destructive,
@@ -147,13 +168,15 @@ Pass progress:
    original "review delay" filing AND parts of kill-deny-in-
    flight-tool-calls AND sticky tool-call surface — one
    mechanism, three problems.
-4. **DEFAULT_TRIPWIRES expansion + authoring prompt fix.** Default
-   set must include shell-destructive baselines (rm -rf, format,
-   dd, mkfs, fork bombs, shutdown). Authoring prompt forbids the
-   "brake handles X so tripwire skips X" antipattern (real-deck
-   observed: authoring negative-lookahead-EXCLUDED `rm -rf`
-   because "brake will block it" — exactly the antipattern that
-   defeats layered defense).
+5. **DEFAULT_TRIPWIRES expansion** (slice 2 already shipped the
+   authoring-prompt fix). What's left: the deck-default tripwire
+   set (in `tripwires.py` `DEFAULT_TRIPWIRES`) still only ships
+   `keyword_credentials` + `keyword_destructive_sql`. The
+   authoring prompt now produces shell-destructive baselines per
+   goal, but they don't exist BEFORE the watchdog's first
+   authoring run completes. Add deck-default tripwires for rm-rf,
+   format, dd, mkfs, fork bombs, shutdown so coverage is non-zero
+   from the moment the deck launches, before any goal is set.
 
 Plus discrete bugs / observations from log analysis to land
 alongside the cluster:
