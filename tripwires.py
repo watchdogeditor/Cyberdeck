@@ -539,11 +539,17 @@ class TripwireEngine:
 
 # -- default tripwires shipped with the deck --------------------------------
 #
-# Two examples that demonstrate the engine without requiring LLM
-# authoring (which lands in slice 2). Both are deck-global, both fire
-# on patterns that the existing brake hook + chatlog don't surface
-# specifically, and both are scoped via event_kinds + field so they
-# don't false-fire on incidental mentions.
+# Deck-default tripwires live on the engine before any LLM authoring
+# pass runs. They cover patterns that don't depend on the current goal
+# (catastrophic shapes that are wrong regardless of context) so the
+# deck has non-zero coverage from the moment it launches. The watchdog's
+# LLM authoring (slice 2) layers GOAL-SPECIFIC patterns on top — the
+# defaults are the always-on baseline.
+#
+# All entries are deck-global, all are scoped via event_kinds + field
+# to avoid false-firing on incidental mentions in unrelated text. When
+# adding new defaults, prefer specificity over breadth — a noisy
+# default trains the netrunner to ignore the chatlog.
 
 DEFAULT_TRIPWIRES: tuple[Tripwire, ...] = (
     Tripwire(
@@ -590,6 +596,61 @@ DEFAULT_TRIPWIRES: tuple[Tripwire, ...] = (
         severity=Severity.WARNING,
         scope=Scope.DECK_GLOBAL,
         origin=Origin.DEFAULT,
+    ),
+    Tripwire(
+        name="host_restart_command",
+        description=(
+            "Construct issued a host-level restart, reboot, halt, or "
+            "power-off command (shutdown, reboot, halt, poweroff, "
+            "init 6, systemctl reboot, Restart-Computer, etc.). The "
+            "deck runs on this machine — rebooting the host kills "
+            "every running construct, the daemon, the watchdog, and "
+            "the netrunner's terminal session. Warning severity (not "
+            "critical) so the netrunner can still override on the "
+            "rare legitimate case."
+        ),
+        pattern_type="regex",
+        # Anchor on shell-token boundaries (start-of-line, whitespace,
+        # or one of `;`, `&`, `|`, backtick, `(`) so the match keys
+        # off command position rather than substrings inside longer
+        # tokens. The trailing `(?:\s|$)` on each bare verb prevents
+        # `reboot-tests`, `halting`, `poweroffline`, etc. from firing.
+        # `systemctl` is restricted to its three power-state verbs so
+        # `systemctl restart nginx` does NOT fire. Shape lifted from
+        # an authored tripwire that the watchdog produced for a goal
+        # about restart-command safety on 2026-04-30 — the construct
+        # that wrote it had thought through all the edge cases
+        # already (anchor positions, false-positive trade-offs,
+        # PowerShell verb forms). Promoted to default 2026-05-01.
+        pattern=(
+            r"(?:^|[\s;&|`(])"
+            r"(?:"
+            r"shutdown(?:\s|$)"
+            r"|reboot(?:\s|$)"
+            r"|halt(?:\s|$)"
+            r"|poweroff(?:\s|$)"
+            r"|init\s+[06](?:\s|$)"
+            r"|telinit\s+[06](?:\s|$)"
+            r"|systemctl\s+(?:reboot|halt|poweroff)(?:\s|$)"
+            r"|Restart-Computer"
+            r"|Stop-Computer"
+            r")"
+        ),
+        event_kinds=(EventKind.TOOL_USE,),
+        field=Field.TOOL_USE_COMMAND,
+        severity=Severity.WARNING,
+        scope=Scope.DECK_GLOBAL,
+        origin=Origin.DEFAULT,
+        suggestion=(
+            "Don't issue machine-level reboot/shutdown commands — "
+            "the deck and your session run on this host. To restart "
+            "a service, target it specifically: `systemctl restart "
+            "<unit>`, `pkill -f <process>` then re-launch, or "
+            "`docker restart <container>`. If a host reboot is "
+            "genuinely needed, surface that to the netrunner as a "
+            "question rather than executing it."
+        ),
+        bad_enough=False,
     ),
 )
 
