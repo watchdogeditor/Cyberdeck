@@ -77,6 +77,30 @@ Concrete responsibilities:
 - **Heartbeat.** Polls the deck's PID at a slow cadence (every few
   seconds is plenty). When the PID disappears or its exit code is
   non-zero / missing, the supervisor knows the deck is dead.
+- **Liveness heartbeat (filed 2026-05-01, post-Mechanic-v0).** PID
+  presence proves the Python process exists; it doesn't prove the
+  deck's UI is responsive. A locked-up event loop, a wedged Textual
+  redraw cycle, or a deadlocked async primitive can keep the PID
+  alive while the netrunner sees a frozen TUI. Filed by netrunner
+  direction: the deck should write a small heartbeat (touch a file
+  or append a timestamp to `<home>/.cyberdeck/heartbeat`) every few
+  seconds from the main UI loop. The supervisor watches that file's
+  mtime alongside the PID. PID-alive + heartbeat-stale-by-N-seconds
+  → "soft crash" — same response as a hard crash (kill tracked
+  subprocesses + fire LLM-session triage in a new wt window with
+  the diagnostic preamble "deck appears locked up; PID still alive
+  but heartbeat stale for X seconds"). This belongs in the Mechanic
+  v0→v1 bridge: the supervisor half learns soft-crash detection in
+  v0.5; the LLM session half (v1) gains the "frozen-deck" code path
+  alongside "crashed-deck" and "deliberate-summon." Cadence: deck
+  writes heartbeat every ~5s; supervisor flags as stale after ~20s
+  (4× safety factor for transient writes that miss a tick due to a
+  legit busy spell). Implementation: deck-side it's a 5s
+  asyncio.Task in the main App that writes the timestamp; supervisor-
+  side it's an extension of the existing PID polling loop. Cheap:
+  one mtime check per supervisor tick, one open-write-close per deck
+  tick. Composes with the existing log-tail mechanism — supervisor
+  knows where to look.
 - **Cleanup.** On detected deck death, kills every tracked
   subprocess via cross-platform Python (`os.kill(pid, signal.SIGTERM)`
   with a short grace, then `signal.SIGKILL`; or `psutil.Process(pid).

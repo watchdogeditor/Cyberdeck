@@ -31,6 +31,16 @@ proposal.*
 - **One-hand-operable, left-hand-heavy.** Right hand is safety zone.
 - **Space = primary action; Enter = submit alias outside text.**
 - **Esc = cancel / unfocus / up one level.**
+- **X = approval / execute (deck-wide).** Established 2026-05-01 with
+  slice 3 of the safety architecture pass (variable-outcome delay UX).
+  Universal "netrunner takes action on this prompt" key — bidirectional
+  by context: under default/paranoid brake X approves a deny-default;
+  under YOLO X interrupts an allow-default. Mnemonic: **X-ecute**. The
+  rule extends to all future netrunner-prompt surfaces — auto-blacklist
+  proposals (slice 2 deferred), daemon-requested captures, planning-mode
+  launch, etc. Z stays for zoom; X is approve/execute. Implementation
+  in `tui.action_x_focused`; both lowercase and Shift+X bound to the
+  same action since "deliberate execute" is the same gesture either way.
 - **Sub-50ms input latency.** No model in the keypress hot path.
 - **No confirmation dialogs** — use deliberate-consent (held keys ~500ms).
 - **Input history is sacred** — up-arrow recall in modals.
@@ -38,6 +48,9 @@ proposal.*
 The semantic-amplifier convention (Shift = "louder same-verb") is up
 for revision in this pass — it currently applies cleanly to `q/Q` and
 `k/K` but is doing arbitrary modal switching for `t/T`, `n/N`, `c/C`.
+With the slice 3 X convention landing, that's *another* example of
+the convention NOT being amplifier-shaped — `x/X` are deliberately the
+same action, not soft/loud variants. Worth folding into Layer 2.
 
 ---
 
@@ -110,7 +123,8 @@ Tag values: `keep`, `drop`, `move`, `add`, `?`.*
 |---|---|---|---|---|---|---|---|
 | Set brake state | Pick paranoid / default / yolo | `b` → `BrakeScreen` (p/d/y picks; yolo held 3s) | global | ✓ | | | Yolo uses deliberate-consent gesture |
 | EJECT | Full halt; SIGKILL all subprocesses; snapshot to disk | `Ctrl+F` (held 500ms) | global | ✓ | | | Survivor of redesign |
-| Open limits modal | View/adjust max_concurrent, max_total_spawns, etc. | `l` → `LimitsScreen` | global | ✓ | | | |
+| Open limits modal | View/adjust max_concurrent, max_total_spawns, delay_window, etc. | `l` → `LimitsScreen` | global | ✓ | | | Slice 3 added delay_window_seconds field |
+| Approve / execute (slice 3) | Override the focused delay window's default action: approve a deny-default, interrupt an allow-default | `x` / `X` → `action_x_focused` | global (resolves to focused pane's delay, then Delays tab cursor, then sole-pending convenience) | ✓ | | | Universal "act on prompt" key; same action lowercase + Shift |
 
 ### Panel / view manipulation
 

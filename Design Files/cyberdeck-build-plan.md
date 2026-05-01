@@ -569,20 +569,63 @@ longer maintain their own listener fan-out paths.
      prompt rewrite produced shell-destructive baselines with
      bad_enough flags. +~350 LOC across 6 files. See "Post-
      migration shipped" entry above.
-   - **🔥 Active next: (c) Variable-outcome pause UX** (re-frame from
-     netrunner). Brake state determines DEFAULT ACTION; pause
-     window is netrunner's chance to OVERRIDE. YOLO → pause-
-     before-allowing. Default → pause-before-denying-destructive.
-     Paranoid → pause-before-anything. Tool-calls bus-driven
-     sticky panel shows pending calls + countdown + Z-keybind to
-     negate the default. Brake hook delays N seconds
-     (configurable in Limits modal as `pause_window_seconds`,
-     default 0 = current behavior). Subsumes the original
-     "review delay" filing AND parts of kill-deny-in-flight-
-     tool-calls (kill-flag is one of the conditions evaluated
-     during the pause) AND sticky tool-call surface (the panel
-     IS the sticky surface). One mechanism, three problems
-     solved.
+   - ~~**(c) Variable-outcome delay UX phase 1**~~ ✅ SHIPPED
+     2026-05-01. Renamed pause→delay (pause is reserved for the
+     daemon-pause feature; this is a timed-default thing). Z→X:
+     X is the deck-wide approval/execute key (mnemonic: **X-ecute**),
+     bidirectional by context (under default/paranoid X approves
+     a deny-default; under YOLO X interrupts an allow-default).
+     Phase 1 delivers: brake_hook delay mechanism (write
+     `<cid>.delay_pending.json`, poll for `<cid>.delay_override.
+     json`, apply default-or-override per brake matrix), YOLO
+     hook-install lifted when delay > 0, new `brake_delay.py`
+     module (DelayMonitor + DelayEntry + DelayResolution +
+     write_delay_override + read_active_delays), per-pane delay
+     overlay with EJECT-style countdown bar + bold "(Running |
+     Redirecting) in Xs" + "press X to (block | approve)" hint,
+     Delays right-panel tab listing all pending delays with
+     focusable rows, X keybind that resolves to focused pane's
+     delay → Delays tab cursor → sole-pending convenience,
+     Limits modal `delay_window_seconds` field (default 0 = no
+     delay). Chatlog markers + bus events
+     (`brake.delay_opened` / `brake.delay_resolved`) round it
+     out. ~600 LOC across construct.py is untouched, brake_state.py,
+     brake_hook.py, brake_delay.py (new), tui.py.
+
+   - **(c) Phase 1.5: persist delay_window_seconds across deck
+     restarts.** Real-deck-caught 2026-05-01: netrunner set
+     delay=N, deck restarted (intentionally for second test),
+     delay reset to 0. Brake ran in pure pre-slice-3 mode for
+     the second test; netrunner had to remember to re-set the
+     delay. Same shape as brake_state.json — persist
+     `delay_window_seconds` in the same `<home>/.cyberdeck/state.
+     json` file (or alongside) so the netrunner's last setting
+     survives a launch. Tiny addition (~30 LOC: extend
+     BrakeStateStore.load/save or add a similar mechanism).
+     Pairs with the wedge_timeout_seconds setting which has the
+     same property — both are runtime tunables that should
+     persist. Could land alongside this or as a follow-up.
+
+   - **(c) Phase 2: blacklist-proposal composition + attention-
+     needed area** — DEFERRED. Two pieces that compose naturally:
+     (i) when a critical+bad_enough tripwire fires (slice 2's
+     deferred application), surface the proposed BlacklistEntry
+     as an X-pressable approval — same pattern as the brake-hook
+     delay but driven by TripwireEngine on the deck side (no hook
+     polls; deck owns the timer + cleanup). (ii) Dedicated
+     "attention needed" area in the main column (or as a sticky
+     header) consolidating every construct that requires netrunner
+     action: open delay windows, blacklist proposals, future daemon-
+     requested captures. Per netrunner direction 2026-05-01: "an
+     attention needed area for constructs that require approval
+     or have hit a tripwire." Both pieces share the X-press
+     resolution shape; one UI surface, multiple sources. The
+     blacklist-proposal flow is structurally different from the
+     brake-hook delay (deck owns the timer, no hook polling,
+     different cleanup) — phase 1 deliberately stayed focused on
+     the brake-hook path so the abstraction stayed clean. The
+     attention-needed area is the proper home for proposal-shaped
+     UX.
    - **(d) DEFAULT_TRIPWIRES expansion + authoring prompt fix**
      PARTIAL ✅. Authoring prompt antipattern guard shipped
      with slice 2. `host_restart_command` (warning, with

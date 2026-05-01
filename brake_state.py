@@ -238,20 +238,33 @@ def make_spawn_settings(
     brake: BrakeState,
     home_dir: Path,
     construct_id: str,
+    delay_window_seconds: float = 0.0,
 ) -> Optional[Path]:
     """Generate a transient `claude --settings` JSON file for a spawn.
 
     Returns the path to the written file, or None if no settings are
-    needed (YOLO brake — the deck installs no hook, claude runs
-    unrestricted save for --permission-mode).
+    needed (YOLO brake AND no delay window — the deck installs no hook,
+    claude runs unrestricted save for --permission-mode).
 
     The hook command is computed from this module's location: brake_hook.py
     sits next to brake_state.py in the deck source dir. The constructed
     JSON has a single PreToolUse hook with matcher "*" so every tool
     call routes through it; the hook itself is dumb and consults the
     brake state passed via argv to decide allow/deny.
+
+    `delay_window_seconds` is the variable-outcome pause UX (slice 3
+    of the safety architecture pass). When > 0, the hook pauses
+    interesting calls for up to that many seconds, watching for a
+    netrunner X-keypress override. The hook installs even under YOLO
+    when delay > 0 — that's the "pause-before-allowing" lane in the
+    delay matrix (X interrupts; otherwise the call goes through).
     """
-    if brake == BrakeState.YOLO:
+    # Hook installs unless: (YOLO brake AND no delay window). With
+    # delay > 0 under YOLO, we still need the hook running so the
+    # delay window mechanism can observe + pause + watch for X-press
+    # overrides. The hook itself short-circuits to allow under YOLO
+    # when no delay is set.
+    if brake == BrakeState.YOLO and delay_window_seconds <= 0:
         return None
 
     hook_path = Path(__file__).resolve().parent / "brake_hook.py"
@@ -271,6 +284,16 @@ def make_spawn_settings(
     # writing per-construct flags the hook reads). Without this
     # arg, the hook can't identify which spawn it's enforcing
     # against, and tripwire-based denies wouldn't work.
+    #
+    # Slice 3 of the safety architecture pass: delay_window_seconds
+    # is the third argv arg. When > 0, the hook holds interesting
+    # calls for up to that many seconds, watching for a netrunner
+    # X-keypress override file. Default 0 = no delay = pre-slice-3
+    # behavior. Threaded through Fleet at construction; the deck
+    # mutates Fleet.delay_window_seconds via the Limits modal so
+    # changes apply to the next spawn (existing in-flight spawns
+    # baked their value into per-spawn settings already — same
+    # propagation model as brake state itself).
     settings = {
         "hooks": {
             "PreToolUse": [
@@ -281,7 +304,8 @@ def make_spawn_settings(
                             "type": "command",
                             "command": (
                                 f'python "{hook_path_str}" '
-                                f'{brake.value} {construct_id}'
+                                f'{brake.value} {construct_id} '
+                                f'{delay_window_seconds:g}'
                             ),
                         },
                     ],

@@ -67,6 +67,10 @@ from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
 from brake_state import BrakeState, BrakeStateStore, BrakeChangeEvent
+from brake_delay import (
+    DelayEntry, DelayResolution, DelayMonitor,
+    write_delay_override,
+)
 from logger import _serialize_payload
 import clipboard
 import json
@@ -701,6 +705,20 @@ class ConstructPane(Static, can_focus=True):
     ConstructPane > #pane_header {
         height: 1;
     }
+    /* Slice 3: variable-outcome delay overlay. Hidden by default; the
+     * `.-delaying` class flips display:block + reserves two rows for
+     * the countdown bar + the X-press hint. Pops out automatically
+     * with the tool call (DelayMonitor → bus → pane.set_delay) so the
+     * netrunner doesn't have to switch tabs to see what's pending. */
+    ConstructPane > #pane_delay {
+        height: 0;
+        display: none;
+    }
+    ConstructPane.-delaying > #pane_delay {
+        height: 2;
+        display: block;
+        margin-top: 0;
+    }
     ConstructPane > #pane_current {
         height: 1;
         color: $text-muted;
@@ -774,6 +792,23 @@ class ConstructPane(Static, can_focus=True):
         border: round $error 60%;
         text-style: not dim;
     }
+    /* Slice 3: variable-outcome delay overlay. The pane gets a heavy
+     * magenta border while a delay window is open — distinct from
+     * yellow (brake-blocked / focused / paranoid indicator), red
+     * (blacklisted / EJECT / errors), green (success), and the
+     * default $accent. Magenta because the deck doesn't currently
+     * use it for anything else, and "this is time-sensitive, act on
+     * it or it auto-resolves" is exactly the kind of attention-needed
+     * signal that wants its own color slot.
+     *
+     * Heavy weight (not round) so the overlay reads as MORE urgent
+     * than the ambient brake-blocked yellow ring — a delaying pane
+     * outranks a finalized blocked pane visually. Focus styles still
+     * take priority (focus = $warning heavy yellow, more urgent than
+     * a passive delay). */
+    ConstructPane.-delaying {
+        border: heavy magenta;
+    }
     """
 
     state: reactive[str] = reactive("starting")
@@ -790,6 +825,11 @@ class ConstructPane(Static, can_focus=True):
     # AND the .-blocked class (see watcher below). Reactive so a
     # late finalize event repaints the header without manual call.
     denial_summary: reactive[str] = reactive("")
+    # Slice 3 delay overlay. Carries the active DelayEntry when the
+    # brake hook is holding a tool call from this construct, None
+    # otherwise. The watcher toggles `.-delaying` (CSS pops the
+    # overlay row in/out) and refreshes the rendered countdown.
+    delay_entry: reactive[Optional[object]] = reactive(None)
 
     def __init__(
         self,
@@ -862,6 +902,14 @@ class ConstructPane(Static, can_focus=True):
 
     def compose(self) -> ComposeResult:
         yield Label("", id="pane_header")
+        # Slice 3 delay overlay. Hidden until set_delay(entry) is
+        # called from a brake.delay_opened bus event; the bar drains
+        # over delay_window_seconds while the netrunner has a chance
+        # to press X. Sits between header and current so the tool
+        # being delayed (which shows up in pane_current as a tool_use
+        # event) is visually adjacent to the "you can override this"
+        # affordance.
+        yield Label("", id="pane_delay", markup=True)
         yield Label("", id="pane_current")
         yield Log(id="pane_log", max_lines=200, highlight=False)
 
@@ -889,6 +937,81 @@ class ConstructPane(Static, can_focus=True):
 
     def watch_compact(self, _old: bool, new: bool) -> None:
         self.set_class(new, "-compact")
+
+    def watch_delay_entry(self, _old: object, new: object) -> None:
+        # Toggle the .-delaying class (pops the overlay row open/closed)
+        # and immediately render the current state. Refresh ticks
+        # afterwards keep the bar drained without re-toggling the class.
+        self.set_class(new is not None, "-delaying")
+        self._refresh_delay_overlay()
+
+    def set_delay(self, entry: object) -> None:
+        """Open the delay overlay for this pane. Called from the App's
+        brake.delay_opened handler with a DelayEntry whose construct_id
+        matches this pane.
+
+        Idempotent: setting twice for the same delay window just refreshes
+        the rendered text. If a different DelayEntry comes in (rare —
+        race between back-to-back delay windows), it overwrites cleanly."""
+        self.delay_entry = entry
+
+    def clear_delay(self) -> None:
+        """Close the delay overlay. Called from the App's
+        brake.delay_resolved handler. Safe to call when no delay is open."""
+        self.delay_entry = None
+
+    def refresh_delay_countdown(self) -> None:
+        """Re-render the overlay's countdown text. Called periodically
+        by the App's 100ms refresh timer. No-op when no delay is open."""
+        if self.delay_entry is not None:
+            self._refresh_delay_overlay()
+
+    def _refresh_delay_overlay(self) -> None:
+        """Render the bold-verb + bar + X-press hint into #pane_delay.
+
+        Verb maps from default_action × brake intent:
+          - default=allow (only happens under YOLO+delay) → "Running"
+            (the call IS about to execute; X interrupts)
+          - default=deny  (Default+destructive or Paranoid) → "Redirecting"
+            (the call is about to bounce back to the construct as a
+            tool_result.is_error; X overrides to approve)
+
+        Bar drains over delay_window_seconds — full at open, empty at
+        deadline. EJECT-style 20 cells with █ filled / ░ empty."""
+        e = self.delay_entry
+        if e is None:
+            return
+        # Verb based on what the default action is, not the override —
+        # netrunner needs to see "what's about to happen" first, with
+        # the X-press hint on the second line as the override option.
+        if e.default_action == "allow":
+            verb = "Running"
+            bar_color = "red"   # caution: about to execute under YOLO
+            x_action = "block"
+        else:
+            verb = "Redirecting"
+            bar_color = "yellow"   # about to deny; less urgent
+            x_action = "approve"
+        BAR = 20
+        progress = e.progress
+        # Bar shows TIME REMAINING — full at open, empties as deadline
+        # approaches. Mirrors EjectScreen's countdown bar rendering.
+        filled = max(0, BAR - int(round(BAR * progress)))
+        bar = "█" * filled + "░" * (BAR - filled)
+        remaining = e.remaining_seconds
+        text = (
+            f"[b]{verb}[/b] in [b]{remaining:.1f}s[/b]  "
+            f"[{bar_color}]{bar}[/{bar_color}]\n"
+            f"[dim]press [b]X[/b] to {x_action}  "
+            f"[bright_black]· brake={e.brake} · "
+            f"{e.tool_name}[/bright_black][/dim]"
+        )
+        try:
+            self.query_one("#pane_delay", Label).update(text)
+        except Exception:
+            # Mount race — overlay not rendered yet. Refresh tick will
+            # try again. Safe to drop this paint.
+            pass
 
     def set_injected_to(self, construct_id: str) -> None:
         """Mark this pane as having been redirected to a follow-up
@@ -1612,6 +1735,7 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         max_total_spawns: int,
         pool_size: int,
         wedge_timeout_seconds: float,
+        delay_window_seconds: float,
         current_live: int,
         current_spawned: int,
         cost_so_far: float,
@@ -1622,6 +1746,7 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         self.initial_max_total_spawns = max_total_spawns
         self.initial_pool_size = pool_size
         self.initial_wedge_timeout_seconds = wedge_timeout_seconds
+        self.initial_delay_window_seconds = delay_window_seconds
         self.current_live = current_live
         self.current_spawned = current_spawned
         self.cost_so_far = cost_so_far
@@ -1671,6 +1796,13 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                     id="input_wedge_timeout_seconds",
                     type="integer",
                 )
+            with Horizontal(classes="limits_row"):
+                yield Label("delay window (seconds):")
+                yield Input(
+                    value=str(int(self.initial_delay_window_seconds)),
+                    id="input_delay_window_seconds",
+                    type="integer",
+                )
             yield Label(
                 "[dim]No hard ceilings. max_concurrent and "
                 "max_total_spawns each accept 0 = 'no cap' (use with "
@@ -1686,7 +1818,16 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                 "seeing legitimate slow shutdowns get killed; lower it "
                 "for snappier shutdown at the cost of less stderr "
                 "post-mortem. 0 disables (debug only — a real wedge "
-                "will block deck shutdown).[/dim]"
+                "will block deck shutdown). "
+                "delay_window is the variable-outcome pause UX (slice "
+                "3): brake hook holds interesting tool calls for N "
+                "seconds, watching for an X-press override. Under YOLO "
+                "every side-effect call gets the delay (default=allow, "
+                "X=block); under default only would-deny calls (default"
+                "=deny, X=approve); paranoid same as default. 0 = no "
+                "delay = pre-slice-3 behavior. Applies to NEW spawns "
+                "only (existing in-flight constructs keep what they "
+                "spawned with).[/dim]"
             )
 
     def on_mount(self) -> None:
@@ -1710,10 +1851,12 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             mts_str = self.query_one("#input_max_total_spawns", Input).value.strip()
             ps_str = self.query_one("#input_pool_size", Input).value.strip()
             wt_str = self.query_one("#input_wedge_timeout_seconds", Input).value.strip()
+            dw_str = self.query_one("#input_delay_window_seconds", Input).value.strip()
             mc = int(mc_str)
             mts = int(mts_str)
             ps = int(ps_str)
             wt = int(wt_str)
+            dw = int(dw_str)
         except (ValueError, AttributeError):
             # Bad input — toast back via dismissal of None. Caller
             # will treat as cancel; user can re-open if desired.
@@ -1744,12 +1887,15 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             ps = 0
         if wt < 0:
             wt = 0
+        if dw < 0:
+            dw = 0
 
         self.dismiss({
             "max_concurrent": mc,
             "max_total_spawns": mts,
             "pool_size": ps,
             "wedge_timeout_seconds": float(wt),
+            "delay_window_seconds": float(dw),
         })
 
     def action_cancel(self) -> None:
@@ -2993,6 +3139,15 @@ class CyberdeckApp(App):
         Binding("Q", "interrupt_inject", "I-inject", show=False),
         Binding("k", "kill_focused", "Kill"),
         Binding("K", "hard_kill_focused", "Hard-kill", show=False),
+        # Slice 3: X is the deck-wide approval / override key. For an
+        # open delay window, X flips the brake hook's default action
+        # (approve a deny-default, interrupt an allow-default). Future
+        # netrunner-prompt surfaces (blacklist proposals, daemon-
+        # requested captures, pause-mode launch) will reuse the same
+        # key — "press X" is the universal "act on this prompt"
+        # gesture. Z stays for zoom; X is approve/execute.
+        Binding("x", "x_focused", "X-ecute", show=False),
+        Binding("X", "x_focused", "X-ecute", show=False),
 
         # Daemon / goal
         Binding("t", "talk_watchdog", "Ask", show=False),
@@ -3033,6 +3188,7 @@ class CyberdeckApp(App):
         use_pool: bool = True,
         pool_size: int = 5,
         wedge_timeout_seconds: float = 30.0,
+        delay_window_seconds: float = 0.0,
         home_dir: Optional[Path] = None,
         profiles_dir: Optional[Path] = None,
         default_profile_name: Optional[str] = None,
@@ -3126,6 +3282,15 @@ class CyberdeckApp(App):
         # submitted writes straight to fleet.wedge_timeout_seconds so
         # changes apply on the next finalize, no fleet rebuild needed.
         self.wedge_timeout_seconds = wedge_timeout_seconds
+        # Variable-outcome delay window (slice 3 of the safety
+        # architecture pass). Read fresh per spawn from
+        # fleet.delay_window_seconds, baked into each construct's
+        # per-spawn settings JSON. Limits modal mutates this attr +
+        # fleet's mirror; changes apply to the NEXT spawn (existing
+        # in-flight spawns keep what they were spawned with — same
+        # propagation model as brake state itself). 0 = no delay =
+        # pre-slice-3 behavior.
+        self.delay_window_seconds = delay_window_seconds
         self.fleet: Optional[Fleet] = None
         self.daemon: Optional[Daemon] = None
         self.session: Optional[DaemonSession] = None
@@ -3288,6 +3453,36 @@ class CyberdeckApp(App):
             filter=["brake.change"],
             name="tui.brake_change",
         )
+
+        # Slice 3 of the safety architecture pass: variable-outcome
+        # delay UX. DelayMonitor polls <home>/.cyberdeck/spawns/ for
+        # *.delay_pending.json files written by brake_hook when an
+        # interesting tool call enters the delay window. On
+        # appearance / disappearance it publishes brake.delay_opened /
+        # brake.delay_resolved bus events; the chatlog renderer and
+        # the new Delays tab subscribe.
+        #
+        # Always constructed (delay_window_seconds == 0 just means no
+        # files ever appear; the monitor's poll is essentially free).
+        # Started later in _drive_fleet alongside ConnectionMonitor.
+        self.delay_monitor = DelayMonitor(
+            home_dir=self.home_dir,
+            bus=self.bus,
+        )
+        self.bus.subscribe(
+            self._handle_delay_opened,
+            filter=["brake.delay_opened"],
+            name="tui.delay_opened",
+        )
+        self.bus.subscribe(
+            self._handle_delay_resolved,
+            filter=["brake.delay_resolved"],
+            name="tui.delay_resolved",
+        )
+        # Periodic refresh of the DelayPanel's countdown bars. 100ms
+        # gives smooth visible motion without burning cycles. Started
+        # after the UI mounts; see on_mount.
+        self._delay_refresh_timer = None
 
         # Phase 7 — instantiate the file logger now that brake_state has
         # loaded from disk so the header records the real value. Built
@@ -3827,6 +4022,21 @@ class CyberdeckApp(App):
             self.connection_monitor.start(),
             name="connection-monitor-start",
         )
+        # Slice 3: DelayMonitor polls the spawns dir for delay_pending
+        # files. Cheap; runs unconditionally because delay_window_
+        # seconds == 0 just means no files ever appear. Mirrors
+        # ConnectionMonitor's start pattern.
+        self._delay_monitor_start_task = asyncio.create_task(
+            self.delay_monitor.start(),
+            name="delay-monitor-start",
+        )
+        # 100ms refresh tick that drains the per-pane delay overlay's
+        # countdown bar + the Delays tab's list items. Cheap when no
+        # delays open; visible smooth countdown when one is. Mirrors
+        # the EJECT modal's tick interval.
+        self._delay_refresh_timer = self.set_interval(
+            0.1, self._refresh_delay_countdowns
+        )
         self.run_worker(self._drive_fleet(), exclusive=True, name="fleet")
 
     def _refresh_subtitle(self) -> None:
@@ -3926,6 +4136,11 @@ class CyberdeckApp(App):
             # Limits modal mutates fleet.wedge_timeout_seconds in
             # place; the wait-call site reads it fresh per finalize.
             wedge_timeout_seconds=self.wedge_timeout_seconds,
+            # Slice 3 delay window. Read fresh per spawn by Fleet
+            # when it builds the per-spawn settings JSON. Limits
+            # modal updates fleet.delay_window_seconds; new spawns
+            # pick up the new value, in-flight spawns keep theirs.
+            delay_window_seconds=self.delay_window_seconds,
         )
         # Phase 8: subscribe via the bus instead of fleet.add_listener.
         # `fleet.*` matches every dotted-namespace fleet kind
@@ -4086,6 +4301,20 @@ class CyberdeckApp(App):
             # Stop the connection monitor heartbeat loop.
             await self.connection_monitor.shutdown()
 
+            # Slice 3: stop the delay monitor polling task. Idempotent;
+            # safe if start() never finished or hadn't been called.
+            try:
+                await self.delay_monitor.stop()
+            except Exception:
+                pass
+            # Stop the per-tick countdown refresh.
+            if self._delay_refresh_timer is not None:
+                try:
+                    self._delay_refresh_timer.stop()
+                except Exception:
+                    pass
+                self._delay_refresh_timer = None
+
             # Phase 7: close the file logger. Writes a footer event
             # with reason="shutdown" — heartbeat sensor + maintbot use
             # this marker to distinguish clean exit from unclean
@@ -4225,6 +4454,107 @@ class CyberdeckApp(App):
             )
         except Exception:
             pass
+
+    # ---- delay (slice 3 of safety architecture pass) -------------------
+
+    def _handle_delay_opened(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber: brake.delay_opened event arrived.
+
+        The DeckEvent's payload is a DelayEntry. Job: pop the
+        construct's pane overlay (countdown bar + bold verb +
+        X-press hint) AND promote the pane to the top of #main so
+        the netrunner doesn't have to scroll past finalized panes
+        to find what needs attention. Plus a chatlog marker for the
+        timeline record. The 100ms refresh timer (started on mount)
+        drains the countdown bar as the deadline approaches.
+
+        Promote-to-top is the inverse of the compact-to-bottom move
+        that finalized panes get — same `move_child` mechanism, just
+        the opposite end. Delaying panes carry a magenta border (see
+        ConstructPane CSS) that's distinct from every other pane
+        state so the visual signal pops even at a glance.
+        """
+        entry: DelayEntry = deck_event.payload
+        try:
+            pane = self.panes.get(entry.construct_id)
+            if pane is not None:
+                pane.set_delay(entry)
+                # Promote to the top of #main. The mirror image of
+                # _compact_pane_after_delay's move-to-bottom: time-
+                # sensitive panes float to where the netrunner is
+                # already looking. Best-effort — if the move fails
+                # (race against mount), the magenta border alone is
+                # still the attention signal.
+                try:
+                    main = self.query_one("#main", VerticalScroll)
+                    children = list(main.children)
+                    if children and children[0] is not pane:
+                        main.move_child(pane, before=children[0])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Chatlog marker — timeline record. Color matches the per-pane
+        # overlay's bar color: yellow when default=deny (less urgent;
+        # netrunner has time to approve), red when default=allow under
+        # YOLO (more urgent; netrunner has time to interrupt).
+        try:
+            color = "yellow" if entry.default_action == "deny" else "red"
+            self._chatlog_write(
+                f"[{color}]⏳[/{color}] delay: "
+                f"[cyan]{entry.construct_id}[/cyan] "
+                f"[dim]{entry.tool_name}[/dim] "
+                f"[{color}]{entry.default_action}[/{color}] "
+                f"[dim]in {entry.delay_window_seconds:g}s "
+                f"· press X to {entry.override_action}[/dim]"
+            )
+        except Exception:
+            pass
+
+    def _handle_delay_resolved(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber: brake.delay_resolved event arrived.
+
+        Closes the per-pane overlay (border returns to whatever it
+        was before — usually $accent). Pane stays at the top of
+        #main; we don't auto-reorder back. The netrunner just saw
+        the resolution; leaving the pane at top keeps it findable
+        for follow-up. Once finalized, the existing compact-to-
+        bottom path takes over."""
+        resolution = deck_event.payload
+        cid = getattr(resolution, "construct_id", "")
+        reason = getattr(resolution, "reason", "unknown")
+        applied = getattr(resolution, "applied_action", "?")
+        try:
+            pane = self.panes.get(cid)
+            if pane is not None:
+                pane.clear_delay()
+        except Exception:
+            pass
+        try:
+            # Color: green when override applied (netrunner X), dim
+            # otherwise (default expired). Visible signal that "the
+            # netrunner intervened" vs "timer ran out."
+            color = "green" if reason == "override" else "dim"
+            label = "X-pressed" if reason == "override" else "timer expired"
+            self._chatlog_write(
+                f"[{color}]⏳[/{color}] delay resolved: "
+                f"[cyan]{cid}[/cyan] "
+                f"applied=[b]{applied}[/b] "
+                f"[dim]({label})[/dim]"
+            )
+        except Exception:
+            pass
+
+    def _refresh_delay_countdowns(self) -> None:
+        """100ms timer tick: walk every active pane, refresh the
+        countdown rendering on any with an open delay. Cheap (no-op
+        for panes without a delay; one label.update() for those with
+        one). Started in on_mount, runs for the life of the app."""
+        for pane in self.panes.values():
+            try:
+                pane.refresh_delay_countdown()
+            except Exception:
+                pass
 
     def _start_daemon_task(self) -> None:
         """Kick off a daemon session worker for the current goal.
@@ -6852,6 +7182,76 @@ class CyberdeckApp(App):
             name=f"hard-kill-{cid}",
         )
 
+    def action_x_focused(self) -> None:
+        """Slice 3 X-press: override the delay window's default action.
+
+        Resolution order (first match wins):
+          1. A focused ConstructPane with an open delay → use that
+             pane's delay entry. (Primary path: delaying panes get
+             promoted to the top of #main with a magenta border, so
+             "find the construct that needs attention, focus it, X"
+             is the everyday flow.)
+          2. Single open delay anywhere → use it. (Convenience: if
+             only one delay is pending, X always lands on it
+             regardless of focus — netrunner can be anywhere on
+             screen and still respond.)
+          3. Nothing → toast "no delay to override".
+
+        For each match we:
+          - Note the override in DelayMonitor (so the resolution event
+            attributes the close to "override" not "expired").
+          - Write the override file via brake_delay.write_delay_override.
+          - The brake hook's polling loop picks it up within ~100ms
+            and applies the flipped action.
+
+        X-press is universal "approve / interrupt the default" — same
+        key for every brake state's matrix. Under default+paranoid (X
+        approves a deny); under YOLO (X interrupts an allow). The
+        per-pane overlay shows the netrunner what X means BEFORE they
+        press, so it's never ambiguous.
+        """
+        if self.fleet is None or self.delay_monitor is None:
+            return
+
+        target_entry = None
+        focused_pane = self._focused_pane()
+        if (focused_pane is not None
+                and focused_pane.delay_entry is not None):
+            target_entry = focused_pane.delay_entry
+
+        # Single-pending-delay convenience.
+        if target_entry is None:
+            try:
+                active = list(self.delay_monitor._active.values())
+                if len(active) == 1:
+                    target_entry = active[0]
+            except Exception:
+                pass
+
+        if target_entry is None:
+            self._toast("no delay to override")
+            return
+
+        cid = target_entry.construct_id
+        action = target_entry.override_action
+        # Note before write so the resolution event is attributed
+        # correctly even if the hook polls before the monitor's next
+        # tick (note_override populates the dict synchronously; the
+        # disappearance lookup happens later).
+        self.delay_monitor.note_override(cid, action)
+        ok = write_delay_override(self.home_dir, cid, action)
+        if ok:
+            try:
+                fleet_log = self.query_one("#fleet_log", RichLog)
+                fleet_log.write(
+                    f"[green]X[/green] override: "
+                    f"[cyan]{cid}[/cyan] → [b]{action}[/b]"
+                )
+            except Exception:
+                pass
+        else:
+            self._toast(f"X-press for {cid} failed (couldn't write override)")
+
     def _scan_for_tripwires(self, deck_event: "DeckEvent") -> None:
         """Bus subscriber that feeds construct events into the
         watchdog's TripwireEngine.
@@ -8027,6 +8427,7 @@ class CyberdeckApp(App):
                 max_total_spawns=self.max_total_spawns,
                 pool_size=self.pool_size,
                 wedge_timeout_seconds=self.wedge_timeout_seconds,
+                delay_window_seconds=self.delay_window_seconds,
                 current_live=live,
                 current_spawned=spawned,
                 cost_so_far=cost,
@@ -8062,6 +8463,9 @@ class CyberdeckApp(App):
         new_ps = result.get("pool_size", self.pool_size)
         new_wt = result.get(
             "wedge_timeout_seconds", self.wedge_timeout_seconds
+        )
+        new_dw = result.get(
+            "delay_window_seconds", self.delay_window_seconds
         )
 
         changes: list[str] = []
@@ -8136,6 +8540,22 @@ class CyberdeckApp(App):
             if self.fleet is not None:
                 try:
                     self.fleet.wedge_timeout_seconds = new_wt
+                except Exception:
+                    pass
+        if new_dw != self.delay_window_seconds:
+            changes.append(
+                f"delay_window: {self.delay_window_seconds:g}s → "
+                f"{new_dw:g}s [dim](next spawn)[/dim]"
+            )
+            self.delay_window_seconds = new_dw
+            # Mirror to fleet so the NEXT spawn picks up the new value
+            # via make_spawn_settings. Existing in-flight spawns keep
+            # what they were spawned with — same propagation model as
+            # brake state itself (Claude Code can't have its --settings
+            # mutated post-spawn, so the value is baked in).
+            if self.fleet is not None:
+                try:
+                    self.fleet.delay_window_seconds = new_dw
                 except Exception:
                     pass
 

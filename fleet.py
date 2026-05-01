@@ -171,6 +171,7 @@ class Fleet:
         ] = None,
         bus: Optional["EventBus"] = None,
         wedge_timeout_seconds: float = 30.0,
+        delay_window_seconds: float = 0.0,
     ):
         self.run_id = f"run-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -246,6 +247,20 @@ class Fleet:
         # rebuild. 0 disables the timeout (debug only — a real wedge
         # will hold up shutdown indefinitely). Filed 2026-05-01.
         self.wedge_timeout_seconds = wedge_timeout_seconds
+
+        # Slice 3 of the safety architecture pass: variable-outcome
+        # delay UX. When > 0, brake_hook holds interesting tool calls
+        # for up to N seconds, watching for a netrunner X-keypress
+        # override file. The delay matrix per brake state:
+        #   YOLO:     every call paused; default = allow; X = interrupt
+        #   Default:  destructive only; default = deny;  X = approve
+        #   Paranoid: every call paused; default = deny;  X = approve
+        # Mutable at runtime — Limits modal writes to this attribute,
+        # so changes take effect on the NEXT spawn (existing in-flight
+        # spawns baked the value into their per-spawn settings JSON
+        # at spawn time; same propagation model as brake state itself).
+        # 0 = no delay = pre-slice-3 behavior. Filed 2026-05-01.
+        self.delay_window_seconds = delay_window_seconds
 
         self._constructs: list[Construct] = []
         self._consumers: list[asyncio.Task] = []
@@ -728,6 +743,13 @@ class Fleet:
                     brake=self.brake_state_provider(),
                     home_dir=self.home_dir,
                     construct_id=c.id,
+                    # Slice 3: delay window read fresh per spawn from
+                    # self.delay_window_seconds. Limits modal mutates
+                    # this attribute live, so a netrunner adjustment
+                    # mid-session takes effect on the next spawn.
+                    # Existing in-flight spawns keep whatever delay
+                    # was baked into their per-spawn settings JSON.
+                    delay_window_seconds=self.delay_window_seconds,
                 )
                 if settings_path is not None:
                     c.settings_path = str(settings_path)

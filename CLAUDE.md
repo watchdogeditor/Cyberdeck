@@ -110,44 +110,110 @@ Phase 8 bus subscriptions (every migrated path renders correctly
 in the chatlog), kill state transitions (k + Shift+K both move
 panes to `[KILLED]` + chatlog shows orange × glyph).
 
-**✅ WEDGE-TIMEOUT DIAGNOSTIC** shipped 2026-05-01 (uncommitted
-working tree as of this CLAUDE.md update). Three tight changes
-addressing the real-deck-discovered wedge frequency that was
-degrading everyday usefulness:
-(a) `Construct.wait()`'s `TimeoutError` handler now drains
-stderr with a 2s `asyncio.wait_for` ceiling into `self._stderr_
-buf` BEFORE calling `self.kill()`. Previously we threw away the
-only diagnostic signal claude/node subprocesses left behind —
-kill() closes the pipes.
-(b) Fleet finalize meta payload carries `stderr_excerpt` (last
-500 chars) when `kill_source == "fleet_wedge_timeout"`; None
-on every other source. DeckLogger persists it on the bus event
-so wedge kills are now grep-able from `latest.log`.
-(c) Wedge timeout is configurable. Fleet.__init__ takes
-`wedge_timeout_seconds: float = 30.0` (mutable attribute; no
-fleet rebuild needed). Limits modal grew a fourth row; the
-handler writes straight to `fleet.wedge_timeout_seconds` so
-edits apply on the next finalize. CyberdeckApp.__init__ takes
-the parameter too; CLI flag deliberately skipped this round to
-keep diff tight.
-+118 LOC across construct.py / fleet.py / tui.py. Compile-clean,
-signatures verified. Real-deck verification pending — next wedge
-fire should land with claude's own stderr output, finally
-disambiguating Windows-orphan vs model-error vs network-timeout
-wedges.
+**✅ WEDGE-TIMEOUT DIAGNOSTIC** shipped 2026-05-01 (commit f3f6f2d).
+Stderr drain in Construct.wait()'s TimeoutError handler before kill;
+stderr_excerpt on finalize when kill_source=fleet_wedge_timeout;
+configurable wedge_timeout_seconds via Limits modal (default 30; 0
+disables). +118 LOC across construct.py / fleet.py / tui.py / CLAUDE.md.
+Real-deck verification pending — next wedge fire lands with claude's
+own stderr output, finally disambiguating Windows-orphan vs model-
+error vs network-timeout wedges.
 
-**Next session picks up at: SAFETY ARCHITECTURE PASS slice 3 —
-variable-outcome pause UX.** Largest remaining safety-pass piece.
-Brake state determines DEFAULT ACTION; pause window is the
-netrunner's chance to OVERRIDE. YOLO=pause-before-allowing,
-Default=pause-before-denying-destructive, Paranoid=pause-before-
-anything. Bus-driven sticky panel shows pending tool-calls +
-countdown; Z-keybind negates the default. Configurable in Limits
-as `pause_window_seconds`, default 0. Subsumes original "review
-delay" filing AND kill-deny-in-flight-tool-calls AND sticky
-tool-call surface — one mechanism, three problems. See
-`cyberdeck-state.md` "Safety architecture analysis" + slice 4
-notes for full layer breakdown.
+**✅ SAFETY ARCHITECTURE PASS slice 3 PHASE 1 — variable-outcome
+delay UX** shipped 2026-05-01 (uncommitted working tree as of this
+CLAUDE.md update). Renamed pause→delay (pause is reserved for the
+deferred daemon-pause feature; this is timed-default). Z→**X**
+deck-wide convention: X is the universal approval/execute key
+(mnemonic: **X-ecute**), bidirectional by context — under default/
+paranoid X approves a deny-default, under YOLO X interrupts an
+allow-default. Both x and Shift+X bound to the same action; this
+isn't a soft/loud pair like q/Q or k/K, it's deliberate-execute
+either way. Filed as a deck-wide rule in
+`cyberdeck-keymap-revision.md` Layer 1 + spec constants section.
+
+Phase 1 delivers, end-to-end:
+- **brake_hook delay mechanism**: write `<cid>.delay_pending.json`,
+  poll for `<cid>.delay_override.json` every 100ms up to deadline,
+  apply default-or-override per matrix:
+    YOLO     — every side-effect call delayed; default=allow; X=deny
+    Default  — only would-deny calls delayed; default=deny;  X=approve
+    Paranoid — only would-deny calls delayed; default=deny;  X=approve
+  Tripwire denies (deny_pending.json from slice 2) BYPASS the delay —
+  hard-stop signals from the watchdog stay deterministic.
+- **YOLO hook-install** lifted when delay_window_seconds > 0. The
+  hook short-circuits to allow under YOLO when no delay is set, so
+  we keep the original "fail open" behavior for the no-delay case.
+- **brake_delay.py** (new module, ~280 LOC): DelayEntry +
+  DelayResolution dataclasses, DelayMonitor (50ms polling task that
+  publishes brake.delay_opened / brake.delay_resolved bus events on
+  file appearance / disappearance + tracks pending overrides),
+  write_delay_override / read_active_delays helpers.
+- **Per-pane delay overlay** on ConstructPane — pops out
+  automatically with the tool call. EJECT-style 20-cell countdown
+  bar that drains over delay_window_seconds + bold "(Running |
+  Redirecting) in Xs" verb-by-default-action + "press X to (block |
+  approve)" hint. New `.-delaying` CSS class toggles overlay row
+  in/out. Refresh tick: 100ms.
+- **Promote-to-top on delay open**: the construct's pane moves to
+  the top of #main when its delay opens (mirror of the compact-to-
+  bottom move that finalized panes get). Magenta heavy border
+  (`.-delaying` CSS class) marks the pane as time-sensitive — chosen
+  to be visually distinct from yellow ($warning, used by focus +
+  brake-blocked + paranoid indicator), red ($error, used by
+  blacklisted + EJECT), green (success), and the default $accent.
+  Initial design had a Delays right-panel tab; netrunner pulled it
+  on real-deck observation 2026-05-01: "The delays tab isn't
+  selectable, and is in a weird place — better to push to the top
+  of the construct stack with a special outline." Tab + DelayList
+  Item dropped; promote-to-top + magenta border replaces it.
+- **action_x_focused**: resolves to focused pane's delay → focused
+  DelayListItem → sole-pending convenience → toast "no delay to
+  override." Calls delay_monitor.note_override (so resolution event
+  attributes correctly) + write_delay_override.
+- **Limits modal**: new `delay_window_seconds` field (default 0; 0 =
+  no delay = pre-slice-3 behavior). _handle_limits_submitted mirrors
+  to fleet.delay_window_seconds for the next spawn — existing in-
+  flight constructs keep what they spawned with (Claude Code can't
+  have its --settings mutated post-spawn).
+- **Chatlog markers**: `⏳ delay: cid Tool deny in 5s · press X to
+  approve` on opened; `⏳ delay resolved: cid applied=allow (X-
+  pressed)` or `(timer expired)` on resolved.
+
+~600 LOC across brake_state.py (delay_window_seconds threaded into
+make_spawn_settings; YOLO short-circuit lifted), brake_hook.py
+(should_delay + run_delay_window + main() integration), brake_delay.py
+(new), tui.py (DelayListItem + DelayPanel tab + ConstructPane overlay
++ handlers + refresh timer + X keybind + Limits field). All compile-
+clean, signatures verified. Real-deck verification pending.
+
+**Next session picks up at: SLICE 3 PHASE 2.** Two pieces compose:
+1. **Slice 2 deferred composition: blacklist proposal as approval
+   prompt.** When a critical+bad_enough tripwire fires, the proposed
+   BlacklistEntry surfaces as an X-pressable approval. Same pattern
+   as the brake-hook delay but driven by TripwireEngine on the deck
+   side (deck owns the timer + cleanup; no hook polling). X = apply
+   blacklist; expiry = drop proposal.
+2. **"Attention needed" UI surface** (netrunner direction 2026-05-01).
+   Dedicated area consolidating every construct that requires
+   netrunner action: open delay windows, blacklist proposals, future
+   daemon-requested captures. Per netrunner: "an attention needed area
+   for constructs that require approval or have hit a tripwire." Both
+   pieces share the X-press resolution shape — one UI surface, multi-
+   ple sources. The blacklist-proposal flow is structurally different
+   from the brake-hook delay (deck-owned timer vs hook polling), so
+   phase 1 stayed focused on the brake-hook path. The attention-needed
+   area is the proper home for proposal-shaped UX. Filed in
+   `cyberdeck-build-plan.md` slice progress.
+
+**Filed for Mechanic v0→v1 bridge (2026-05-01):** liveness heartbeat.
+Currently Mechanic v0 watches the deck PID — proves the process
+exists, doesn't prove the UI is responsive. A locked event loop or
+wedged Textual redraw cycle keeps the PID alive while the netrunner
+sees a frozen TUI. Fix: deck writes a heartbeat to
+`<home>/.cyberdeck/heartbeat` every ~5s from the main App; supervisor
+flags as stale after ~20s; PID-alive + heartbeat-stale → soft crash,
+fire LLM-session triage in a new wt window. Bridges v0 (supervisor
+only) and v1 (LLM session). Filed in `cyberdeck-maintbot-design.md`.
 
 **SAFETY ARCHITECTURE PASS** (in progress — 2.25/4 shipped).
 Slice 1 (MCP gating), slice 2 (tripwire escalation chain) and a
@@ -190,16 +256,14 @@ Pass progress:
    are now explicable: they're all `fleet_wedge_timeout`. The
    wedge-timeout diagnostic shipped 2026-05-01 surfaces stderr
    on those finalizes, closing the loop.
-4. **Variable-outcome pause UX** (re-frame from netrunner).
-   Brake state determines DEFAULT ACTION; pause window is the
-   netrunner's chance to OVERRIDE. YOLO=pause-before-allowing,
-   Default=pause-before-denying-destructive,
-   Paranoid=pause-before-anything. Tool-calls bus-driven sticky
-   panel + Z-keybind to negate the default. Configurable in
-   Limits as `pause_window_seconds`, default 0. Subsumes the
-   original "review delay" filing AND parts of kill-deny-in-
-   flight-tool-calls AND sticky tool-call surface — one
-   mechanism, three problems.
+4. ~~**Variable-outcome delay UX phase 1**~~ ✅ SHIPPED 2026-05-01
+   (uncommitted as of this CLAUDE.md update — slice 3/4 of the
+   safety architecture pass). Renamed pause→delay (pause is the
+   deferred daemon-pause feature); Z→X (X-ecute is deck-wide).
+   See the dedicated section above for the full delivery.
+   **Phase 2 deferred:** slice 2 blacklist-proposal composition
+   + attention-needed UI surface — see "Next session picks up
+   at" above.
 5. **DEFAULT_TRIPWIRES expansion** ¼ ✅ SHIPPED 2026-05-01
    (commit 2a53e0e). `host_restart_command` (warning, with
    suggestion) added — promoted from a construct-authored

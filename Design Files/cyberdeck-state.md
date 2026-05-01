@@ -1006,6 +1006,19 @@ and 11.
 ## Filed gotchas (institutional memory; cumulative)
 
 ### Terminal / Textual
+- **Don't shadow Textual `Widget._render()`.** It's a real method
+  on the base class that returns a `Visual`. Overriding it with a
+  custom render method returns `None` (or whatever your method
+  returns) and crashes Textual's render pipeline with
+  `AttributeError: 'NoneType' object has no attribute 'render_strips'`
+  in `widget.py:_render_content` → `Visual.to_strips`. Real-deck
+  caught 2026-05-01 on the first slice 3 phase 1 attempt: `DelayList
+  Item._render` shadowed the parent. Crash on first paint of the
+  Delays tab. Fix: rename your custom render method to anything else
+  (`_paint`, `_redraw`, `_update_text`). General rule: any
+  underscore-prefixed method on a Widget subclass should be checked
+  against Textual's API before being added — Textual treats
+  underscore-prefix names as protected, not private.
 - **`shift+space`, `ctrl+space`, `ctrl+i`, `ctrl+m`** rarely transmit
   distinctly in real terminals. Trust pilot for binding wiring; trust
   real terminal for capability.

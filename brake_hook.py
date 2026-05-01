@@ -663,14 +663,248 @@ def is_write_class(tool: str) -> bool:
     return False
 
 
+# =============================================================================
+# Slice 3 of the safety architecture pass: variable-outcome delay window.
+#
+# When the deck's `delay_window_seconds` is > 0, this hook holds
+# "interesting" tool calls for up to that many seconds, watching for a
+# netrunner X-keypress override file. The call's default action depends
+# on the brake state:
+#
+#   YOLO     — every side-effect call delayed; default = allow; X = deny
+#   Default  — only would-deny calls delayed; default = deny;  X = approve
+#   Paranoid — only would-deny calls delayed; default = deny;  X = approve
+#
+# Communication with the deck is via two files in the spawns/ dir:
+#   <cid>.delay_pending.json   — written by hook, read by deck
+#   <cid>.delay_override.json  — written by deck (on X press), read by hook
+#
+# The hook owns cleanup: it deletes both files on resolution (override
+# applied or expiry). Tripwire-driven denies (deny_pending.json from
+# slice 2) bypass the delay entirely — those are hard-stop signals
+# from the watchdog, not negotiable.
+# =============================================================================
+
+
+def delay_pending_path(construct_id: str) -> Path:
+    """Where the hook writes its delay_pending.json — read by the
+    deck's DelayMonitor + DelayPanel. Mirrors the per-spawn settings
+    convention used by make_spawn_settings + deny_pending."""
+    return (
+        cyberdeck_home_dir() / ".cyberdeck" / "spawns"
+        / f"{construct_id}.delay_pending.json"
+    )
+
+
+def delay_override_path(construct_id: str) -> Path:
+    """Where the deck writes its delay_override.json on X-press —
+    polled by the hook every ~100ms during the delay window."""
+    return (
+        cyberdeck_home_dir() / ".cyberdeck" / "spawns"
+        / f"{construct_id}.delay_override.json"
+    )
+
+
+def tool_input_summary(tool: str, tool_input: dict) -> str:
+    """Short, human-readable summary of a tool call for the DelayPanel.
+    Truncated to 200 chars so the JSON blob the deck reads stays small.
+    Tool-specific shaping where it helps (Bash command vs. Write path)."""
+    if tool in ("Bash", "PowerShell"):
+        cmd = str(tool_input.get("command", ""))
+        return cmd[:200]
+    if tool in ("Write", "Edit", "NotebookEdit"):
+        path = str(tool_input.get("file_path", ""))
+        return path[:200]
+    if tool == "WebFetch":
+        url = str(tool_input.get("url", ""))
+        return url[:200]
+    if tool.startswith("mcp__"):
+        # MCP input is arbitrary JSON; just dump the keys + first
+        # values to give the netrunner enough to recognize the call.
+        try:
+            parts = []
+            for k, v in tool_input.items():
+                vs = str(v)
+                parts.append(f"{k}={vs[:60]}")
+            return ("; ".join(parts))[:200]
+        except Exception:
+            return ""
+    # Fallback: dump tool_input compactly.
+    try:
+        return json.dumps(tool_input, ensure_ascii=False)[:200]
+    except Exception:
+        return ""
+
+
+def should_delay(
+    brake: str,
+    tool: str,
+    would_deny: bool,
+    delay_window_seconds: float,
+) -> bool:
+    """Decide whether a call should enter the delay window.
+
+    Matrix per brake state (assumes delay_window_seconds > 0):
+
+      Default / Paranoid: delay only would-deny calls. Allow-class
+        calls pass through immediately — they were going to allow
+        anyway, no override needed.
+
+      YOLO: delay every side-effect-capable call. Default action is
+        allow (would have been allowed anyway); the delay gives the
+        netrunner a chance to interrupt with X. Read-class calls
+        skip the delay (Read/Glob/Grep/etc. — uninteresting under
+        any brake). This means YOLO + delay is opt-in friction
+        proportional to the netrunner's intent: "I want ceremony
+        on the things that touch state."
+    """
+    if delay_window_seconds <= 0:
+        return False
+    if would_deny:
+        return True
+    if brake == "yolo" and is_write_class(tool):
+        return True
+    return False
+
+
+def run_delay_window(
+    construct_id: str,
+    tool: str,
+    tool_input: dict,
+    brake: str,
+    default_action: str,
+    default_reason: str,
+    delay_window_seconds: float,
+) -> tuple[str, str]:
+    """Run the delay window for one tool call.
+
+    Writes <cid>.delay_pending.json with all the context the deck
+    needs to render the panel entry. Polls every 100ms for
+    <cid>.delay_override.json. Returns (final_action, reason) where
+    final_action is "allow" or "deny" and reason is the deny stderr
+    text (empty for allow). Cleans up both files before returning.
+
+    The panel-side flow:
+      1. DelayMonitor sees the new delay_pending.json appear, emits
+         brake.delay_opened bus event.
+      2. DelayPanel renders an entry with countdown.
+      3. Netrunner focuses entry, presses X.
+      4. action_x_focused writes delay_override.json with the
+         flipped action.
+      5. We poll, see the override, apply it, clean up.
+
+    If steps 3-5 don't happen within delay_window_seconds, we apply
+    default_action and clean up. Either way the construct sees a
+    deterministic outcome — same protocol the brake hook always had,
+    just with timing.
+    """
+    pending_path = delay_pending_path(construct_id)
+    override_path = delay_override_path(construct_id)
+
+    opened_at = time.time()
+    deadline = opened_at + delay_window_seconds
+
+    # The flipped-default is what X means for this delay. We pre-
+    # compute it so the deck doesn't have to know the matrix; the
+    # panel just shows "press X to <override_action>".
+    override_action = "deny" if default_action == "allow" else "allow"
+
+    pending = {
+        "construct_id": construct_id,
+        "tool_name": tool,
+        "tool_input_summary": tool_input_summary(tool, tool_input),
+        "brake": brake,
+        "default_action": default_action,
+        "default_reason": default_reason,
+        "override_action": override_action,
+        "opened_at": opened_at,
+        "deadline_ts": deadline,
+        "delay_window_seconds": delay_window_seconds,
+    }
+    try:
+        pending_path.write_text(
+            json.dumps(pending), encoding="utf-8",
+        )
+    except OSError:
+        # Can't write the panel signal — fall through to default.
+        # No silent break: the construct still gets the deterministic
+        # brake outcome, the netrunner just doesn't see the delay
+        # surface for this call. Filed as a degraded mode.
+        return default_action, default_reason
+
+    # Poll for the override file every 100ms. 100ms matches the
+    # tripwire deny_pending recheck interval (consistent friction
+    # ceiling) and is well below the typical netrunner reaction
+    # time, so missing an X-press by 100ms is not realistic.
+    poll_interval = 0.1
+    final_action = default_action
+    final_reason = default_reason
+
+    while time.time() < deadline:
+        try:
+            if override_path.exists():
+                try:
+                    raw = override_path.read_text(encoding="utf-8")
+                    payload = json.loads(raw) if raw else {}
+                except (OSError, json.JSONDecodeError):
+                    payload = {}
+                requested = payload.get("action", "")
+                if requested in ("allow", "deny"):
+                    final_action = requested
+                    if requested == "deny":
+                        final_reason = (
+                            f"netrunner X-press during delay window "
+                            f"(would have allowed under {brake} brake)"
+                        )
+                    else:
+                        final_reason = ""
+                # Clear the override file regardless of validity so
+                # the next call from this construct starts clean.
+                try:
+                    override_path.unlink()
+                except OSError:
+                    pass
+                break
+        except OSError:
+            pass
+        time.sleep(poll_interval)
+
+    # Clean up the pending file. The DelayMonitor sees its
+    # disappearance and emits brake.delay_resolved.
+    try:
+        pending_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    # Best-effort cleanup of any stale override file (e.g., netrunner
+    # pressed X after deadline; we ignored their press but should
+    # still clear the file so next call doesn't pick it up).
+    try:
+        override_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    return final_action, final_reason
+
+
 def main() -> int:
     """Read stdin, dispatch on brake, emit stderr + exit code."""
     brake = sys.argv[1] if len(sys.argv) > 1 else "default"
     construct_id = sys.argv[2] if len(sys.argv) > 2 else ""
+    # Slice 3: delay_window_seconds is the third argv arg. Float so
+    # the deck can express sub-second delays if it ever wants. 0 =
+    # no delay = pre-slice-3 behavior. Bad input → 0.0 (fail safe;
+    # don't punish the construct for our argv parsing).
+    try:
+        delay_window_seconds = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+    except ValueError:
+        delay_window_seconds = 0.0
 
-    # YOLO short-circuits to allow. This shouldn't actually be invoked
-    # under YOLO (the deck omits --settings), but we fail open if it is.
-    if brake == "yolo":
+    # YOLO + no delay short-circuits to allow. The deck normally
+    # omits --settings under YOLO so we wouldn't be invoked at all,
+    # but with delay > 0 the deck installs the hook even under YOLO
+    # so we run the delay window. Without a delay configured, we're
+    # back to the original "fail open under YOLO" behavior.
+    if brake == "yolo" and delay_window_seconds <= 0:
         return 0
 
     try:
@@ -703,6 +937,15 @@ def main() -> int:
     # (the read already happened by the time anyone could match
     # against it), so the recheck would just add latency for no
     # safety gain.
+    #
+    # Tripwire denies BYPASS the slice-3 delay window. Tripwires are
+    # hard-stop signals from the watchdog (the construct just fired
+    # a critical pattern); the delay UX is for the brake's own
+    # default-action, not for tripwire-driven denials. The auto-
+    # blacklist proposal that critical+bad_enough fires (deferred
+    # in slice 2) DOES go through a delay-shaped approval window,
+    # but that's a separate file the engine owns, not the brake
+    # hook's call.
     if construct_id:
         flag = read_and_clear_deny_pending(construct_id)
         if flag is None and is_write_class(tool):
@@ -712,10 +955,15 @@ def main() -> int:
             print(format_deny_pending_reason(flag), file=sys.stderr)
             return 2
 
+    # Compute the brake's default outcome. YOLO falls through to
+    # would_deny=False — every call is allow-by-default, but the
+    # delay window can still wrap it (see should_delay).
     if brake == "paranoid":
-        deny, reason = check_paranoid(tool, inp)
+        would_deny, default_reason = check_paranoid(tool, inp)
     elif brake == "default":
-        deny, reason = check_default(tool, inp)
+        would_deny, default_reason = check_default(tool, inp)
+    elif brake == "yolo":
+        would_deny, default_reason = False, ""
     else:
         # Unknown brake state — log and allow. The deck shouldn't
         # produce this, but better to fail open than to silently
@@ -726,8 +974,32 @@ def main() -> int:
         )
         return 0
 
-    if deny:
-        print(reason, file=sys.stderr)
+    # Slice 3: variable-outcome delay window. When delay > 0 and
+    # this call qualifies (see should_delay matrix), pause the call
+    # and watch for a netrunner X-press override. The deck's
+    # DelayMonitor sees the delay_pending.json appear, the
+    # DelayPanel renders it with a countdown, the netrunner can
+    # focus + press X to flip the default action.
+    if construct_id and should_delay(
+        brake, tool, would_deny, delay_window_seconds
+    ):
+        default_action = "deny" if would_deny else "allow"
+        final_action, final_reason = run_delay_window(
+            construct_id=construct_id,
+            tool=tool,
+            tool_input=inp,
+            brake=brake,
+            default_action=default_action,
+            default_reason=default_reason,
+            delay_window_seconds=delay_window_seconds,
+        )
+        if final_action == "deny":
+            print(final_reason or "denied", file=sys.stderr)
+            return 2
+        return 0
+
+    if would_deny:
+        print(default_reason, file=sys.stderr)
         return 2
     return 0
 
