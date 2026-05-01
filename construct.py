@@ -558,6 +558,23 @@ class Construct:
                 self.state = ConstructState.DONE
             else:
                 self.state = ConstructState.FAILED
+        else:
+            # Kill was requested AND proc.wait() just returned, so
+            # the process is confirmed dead. Set KILLED here in case
+            # kill()'s own state-flip is racing this path: both
+            # kill() and _consume's finally call proc.wait() on the
+            # same Process object, and asyncio doesn't guarantee
+            # which resumes first when the proc exits. Without this
+            # branch, _consume's finally emits the finalize meta
+            # event with `state="running"` whenever wait() wins the
+            # race, leaving the pane stuck at RUNNING and the
+            # chatlog showing the neutral "·" glyph instead of the
+            # orange "×" kill marker. Real-deck-caught 2026-04-30
+            # via both Shift+K (blacklist + hard-kill) and k
+            # (soft-kill) leaving panes stuck. Belt-and-suspenders
+            # with kill()'s own self.state = KILLED at function-end:
+            # whichever runs first wins, the other is a no-op.
+            self.state = ConstructState.KILLED
 
         self._finalized = True
         return self.state
