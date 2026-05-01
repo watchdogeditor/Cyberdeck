@@ -5460,6 +5460,21 @@ class CyberdeckApp(App):
                 )
             else:
                 fleet_log.write(f"[cyan]+[/cyan] {fevent.construct_id}")
+            # Slice 3 diagnostic: when delay > 0 is configured, every
+            # spawn should be running the brake hook with that delay
+            # baked into its argv. Surface the value at spawn time so
+            # the netrunner can confirm the plumbing is live without
+            # poking at .cyberdeck/spawns/ files. Quiet (dim, brief)
+            # when delay is 0 so it doesn't spam the log in normal use.
+            try:
+                dw = getattr(self.fleet, "delay_window_seconds", 0.0)
+                if dw and dw > 0:
+                    fleet_log.write(
+                        f"[dim]  └─ delay armed: {dw:g}s "
+                        f"(brake_hook will hold qualifying calls)[/dim]"
+                    )
+            except Exception:
+                pass
         elif ptype == "finalized":
             pane = self.panes.get(fevent.construct_id)
             files = fevent.payload.get("files_written") or []
@@ -5645,6 +5660,13 @@ class CyberdeckApp(App):
         existing = self.panes.get(construct_id)
         if existing is None or existing.compact:
             return
+        try:
+            self.query_one("#fleet_log", RichLog).write(
+                f"[dim]compact: scheduled {construct_id} "
+                f"(in {self.COMPACT_DELAY_SECS:g}s)[/dim]"
+            )
+        except Exception:
+            pass
         self.run_worker(
             self._compact_pane_after_delay(construct_id, self.COMPACT_DELAY_SECS),
             name=f"compact-{construct_id}",
@@ -5655,11 +5677,27 @@ class CyberdeckApp(App):
     ) -> None:
         """Wait `delay` seconds, then mark the pane compact, force-collapse
         it, and move it to the bottom of #main. Idempotent: if called
-        twice for the same pane the second invocation is a no-op."""
+        twice for the same pane the second invocation is a no-op.
+
+        Diagnostic surface (added 2026-05-01 after real-deck-observed
+        compact-to-bottom regression): both the schedule and the fire
+        log to fleet_log so the netrunner can see when each step
+        happens. If "compact: schedule" appears but "compact: fired"
+        doesn't, it's an asyncio scheduling issue. If both appear but
+        the pane stays where it is, it's a Textual move_child issue.
+        Exceptions inside the move are surfaced (not silently
+        swallowed) so the failure mode is visible.
+        """
         await asyncio.sleep(delay)
         pane = self.panes.get(construct_id)
         if pane is None or pane.compact:
             return
+        try:
+            self.query_one("#fleet_log", RichLog).write(
+                f"[dim]compact: firing {construct_id}[/dim]"
+            )
+        except Exception:
+            pass
         pane.compact = True
         # Force-collapse on transition. The user can re-expand later;
         # we just don't want a fully-expanded log eating screen real
@@ -5674,10 +5712,21 @@ class CyberdeckApp(App):
             children = list(main.children)
             if children and children[-1] is not pane:
                 main.move_child(pane, after=children[-1])
-        except Exception:
-            # If move fails, the compact styling alone still de-emphasizes
-            # the pane. Visual order won't be perfect but nothing's broken.
-            pass
+        except Exception as exc:
+            # SURFACE the failure (not silent) — real-deck-observed
+            # 2026-05-01 that compact-to-bottom stopped working with
+            # no diagnostic signal. Whatever's failing here, the
+            # netrunner needs to see it. Compact styling still
+            # applied (the class flip is above this block), so the
+            # pane still gets de-emphasized; only the spatial reorder
+            # is at risk.
+            try:
+                self.query_one("#fleet_log", RichLog).write(
+                    f"[red]compact: move failed for {construct_id}: "
+                    f"{exc!r}[/red]"
+                )
+            except Exception:
+                pass
 
     async def action_quit(self) -> None:
         """Smart quit (Phase 7b of the unified-event-stream slice).
