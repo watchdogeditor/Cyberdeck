@@ -5383,8 +5383,18 @@ class CyberdeckApp(App):
                     if c.state.value not in ("done", "failed", "killed")
                 ]
                 if live:
+                    # Slice-2-followup: each c.kill() carries reason
+                    # "eject" so the finalize event's kill_source
+                    # field shows the correct attribution. We don't
+                    # route through fleet.kill_construct here because
+                    # gather-of-direct-kills is meaningfully faster
+                    # for many-construct EJECTs and the finalize
+                    # field is sufficient observability for the
+                    # post-mortem (no real-time-during-eject use case
+                    # for the bus event since the deck is being torn
+                    # down).
                     await asyncio.gather(
-                        *(c.kill() for c in live),
+                        *(c.kill(reason="eject") for c in live),
                         return_exceptions=True,
                     )
                 # Now signal the fleet's run loop to exit too. With all
@@ -6677,7 +6687,15 @@ class CyberdeckApp(App):
         cid = pane.construct_id
         fleet_log = self.query_one("#fleet_log", RichLog)
         fleet_log.write(f"[orange1]×[/orange1] {cid}")
-        self.run_worker(self.fleet.kill_construct(cid), name=f"kill-{cid}")
+        # Source label travels through fleet.kill_construct → bus
+        # event → finalize.kill_source. Filed 2026-04-30 late after
+        # real-deck mystery-kill investigation: prior to this, the
+        # only signal of a netrunner-k kill was a TUI-only fleet_log
+        # write — bus + log file showed nothing.
+        self.run_worker(
+            self.fleet.kill_construct(cid, source="netrunner_k"),
+            name=f"kill-{cid}",
+        )
 
     def action_hard_kill_focused(self) -> None:
         """Hard kill: terminate the focused construct AND register its
@@ -6739,8 +6757,13 @@ class CyberdeckApp(App):
         fleet_log.write(
             f"[red]×[/red] {cid} [dim](hard-kill: blacklisted)[/dim]"
         )
+        # Source label travels through fleet.kill_construct → bus
+        # event → finalize.kill_source. blacklist.added is already
+        # emitted to the bus separately (above), but the kill itself
+        # gets its own event so the kill source is observable
+        # uniformly with other kill paths.
         self.run_worker(
-            self.fleet.kill_construct(cid),
+            self.fleet.kill_construct(cid, source="netrunner_shift_k"),
             name=f"hard-kill-{cid}",
         )
 
@@ -6826,8 +6849,15 @@ class CyberdeckApp(App):
         # chatlog so the netrunner sees the event regardless.
         if fire.severity == Severity.CRITICAL and self.fleet is not None:
             try:
+                # Source label includes the tripwire NAME so post-hoc
+                # diagnosis (and watchdog Q&A) can tell which tripwire
+                # fired. Format follows the colon-separated convention
+                # for parametrized sources: "tripwire_critical:<name>".
                 self.run_worker(
-                    self.fleet.kill_construct(fire.construct_id),
+                    self.fleet.kill_construct(
+                        fire.construct_id,
+                        source=f"tripwire_critical:{fire.tripwire_name}",
+                    ),
                     name=f"tripwire-kill-{fire.construct_id}",
                 )
                 self._chatlog_write(
@@ -7239,9 +7269,14 @@ class CyberdeckApp(App):
         )
         # Now actually kill — finalize event will fire, _handle_meta
         # will see the pending injection and spawn the follow-up.
+        # Source "inject_interrupt" surfaces in finalize.kill_source +
+        # fleet.kill_requested bus event so observers can tell this
+        # kill apart from a netrunner-k or wedge-timeout (real-deck
+        # filed 2026-04-30 late: prior to this, every kill looked
+        # the same in the log).
         if self.fleet is not None:
             self.run_worker(
-                self.fleet.kill_construct(target_id),
+                self.fleet.kill_construct(target_id, source="inject_interrupt"),
                 name=f"inject-kill-{target_id}",
             )
 

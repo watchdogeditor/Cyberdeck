@@ -75,12 +75,18 @@ class FleetEvent:
 # table so subscribers can filter on dotted-namespace strings without
 # having to inspect payloads.
 _META_TYPE_TO_KIND = {
-    "run_start":     "fleet.run_start",
-    "run_end":       "fleet.run_end",
-    "spawned":       "fleet.spawn",
-    "finalized":     "fleet.finalize",
-    "spawn_blocked": "fleet.spawn_blocked",
-    "spawn_failed":  "fleet.spawn_failed",
+    "run_start":      "fleet.run_start",
+    "run_end":        "fleet.run_end",
+    "spawned":        "fleet.spawn",
+    "finalized":      "fleet.finalize",
+    "spawn_blocked":  "fleet.spawn_blocked",
+    "spawn_failed":   "fleet.spawn_failed",
+    # Slice-2-followup: emitted BEFORE c.kill() at every kill site
+    # so observers see WHO requested the kill regardless of how the
+    # subprocess actually terminates. Closes the observability gap
+    # surfaced 2026-04-30 late where ~36s wedge-timeout kills had
+    # zero upstream cause in the log file.
+    "kill_requested": "fleet.kill_requested",
 }
 
 
@@ -515,6 +521,20 @@ class Fleet:
                         # ("blocked: Write -> C:/Windows/...") and to
                         # feed the watchdog's brake-awareness layer.
                         "permission_denials": list(permission_denials),
+                        # Slice-2-followup: who/what initiated the
+                        # kill, populated from Construct._kill_reason
+                        # in Construct.kill(). None for non-killed
+                        # finalizes (state=done/failed). For state=
+                        # killed without an explicit reason set, this
+                        # would be "unspecified" — visible signal that
+                        # some kill site needs to be wired up. Real-
+                        # deck-confirmed sources: "netrunner_k",
+                        # "netrunner_shift_k", "tripwire_critical:
+                        # <name>", "inject_interrupt", "eject",
+                        # "fleet_shutdown", "fleet_wedge_timeout".
+                        "kill_source": (
+                            c._kill_reason if c._kill_reason else None
+                        ),
                     },
                 ))
             finally:
@@ -752,11 +772,34 @@ class Fleet:
         self._consumers.append(consumer)
         return c
 
-    async def kill_construct(self, construct_id: str) -> bool:
-        """Kill one construct by ID. Returns True if found and killed."""
+    async def kill_construct(
+        self, construct_id: str, source: str = "unspecified",
+    ) -> bool:
+        """Kill one construct by ID. Returns True if found and killed.
+
+        `source` identifies who requested the kill — surfaced as a
+        `fleet.kill_requested` bus event BEFORE c.kill() is called,
+        and stamped on the finalize event's `kill_source` field via
+        Construct._kill_reason. Canonical sources are documented on
+        Construct.kill(). The bus event lets observers (chatlog,
+        watchdog, file logger) see kills in real-time; the finalize
+        field gives durable post-hoc attribution. Real-deck filed
+        2026-04-30 late: prior to this addition, mystery kills (and
+        even legitimate netrunner-k kills) had no observable cause
+        in the log file beyond `state=killed` on finalize.
+        """
         for c in self._constructs:
             if c.id == construct_id:
-                await c.kill()
+                # Emit kill_requested BEFORE c.kill so the bus event
+                # is visible regardless of whether the kill itself
+                # finishes quickly.
+                await self._queue.put(FleetEvent(
+                    timestamp=time.time(),
+                    kind="meta",
+                    construct_id=construct_id,
+                    payload={"type": "kill_requested", "source": source},
+                ))
+                await c.kill(reason=source)
                 return True
         return False
 
@@ -834,8 +877,17 @@ class Fleet:
             # meta events, drain_task will catch them and exit on the
             # pending-zero check (in non-keep-alive mode) or stop check
             # (in keep-alive mode, which set the stop event to get here).
+            #
+            # Slice-2-followup: each c.kill() carries a reason that's
+            # stamped on the finalize event's kill_source field. We
+            # don't emit a separate fleet.kill_requested event here
+            # because (a) drain_task is already winding down and may
+            # not consume queue puts reliably during shutdown, and (b)
+            # the finalize event with kill_source="fleet_shutdown"
+            # carries enough signal — the netrunner / observer can
+            # see WHY each construct went down post-hoc.
             await asyncio.gather(
-                *(c.kill() for c in self._constructs),
+                *(c.kill(reason="fleet_shutdown") for c in self._constructs),
                 return_exceptions=True,
             )
             await drain_task

@@ -369,9 +369,22 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
                     f"{denial_suffix}"
                 )
             if state == "killed":
+                # Slice-2-followup: append kill_source so the netrunner
+                # (and post-hoc diagnostic constructs) can see WHY the
+                # kill happened, not just THAT it did. Real-deck filed
+                # 2026-04-30 late after ~36s mystery kills proved
+                # opaque. None / empty falls back to "(no source)" so
+                # any callsite that forgets to pass a reason becomes
+                # immediately visible.
+                kill_source = payload.get("kill_source")
+                source_suffix = (
+                    f" [dim]· {kill_source}[/dim]"
+                    if kill_source else " [dim]· (no source)[/dim]"
+                )
                 return (
                     f"[orange1]×[/orange1] [b]{cid}[/b] killed "
                     f"[dim]({runtime:.1f}s)[/dim]"
+                    f"{source_suffix}"
                     f"{denial_suffix}"
                 )
             # Unknown terminal state — render the literal so we
@@ -393,6 +406,30 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
             return (
                 f"[yellow b]⊘[/yellow b] spawn blocked: "
                 f"[dim]{preview}[/dim] [yellow]· {reason}[/yellow]"
+            )
+
+        if ptype == "kill_requested":
+            # Slice-2-followup: emitted by Fleet.kill_construct BEFORE
+            # c.kill() so the netrunner sees the kill being requested
+            # in real time, not just the finalize landing 0-36s later.
+            # Source label comes from the caller (netrunner_k,
+            # netrunner_shift_k, tripwire_critical:<name>,
+            # inject_interrupt, fleet_wedge_timeout, etc.); we
+            # surface it so post-hoc diagnosis is trivial. Color-
+            # coded by source class: tripwire/wedge get red (loud);
+            # netrunner-initiated and inject get orange (deliberate);
+            # eject/shutdown skip the chatlog entirely (they have
+            # their own EJECT line + the deck is going down anyway).
+            source = payload.get("source", "unspecified")
+            if source in ("eject", "fleet_shutdown"):
+                return None
+            if source.startswith("tripwire_critical") or source == "fleet_wedge_timeout":
+                color = "red"
+            else:
+                color = "orange1"
+            return (
+                f"[{color}]×[/{color}] kill: [cyan]{cid}[/cyan] "
+                f"[dim]({source})[/dim]"
             )
 
         # Other meta types (run_start, run_end, etc) come through but

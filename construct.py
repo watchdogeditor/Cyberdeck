@@ -255,6 +255,18 @@ class Construct:
         # code" the moment kill() is called, while keeping the visible
         # state honest about whether the kill has actually completed.
         self._kill_requested: bool = False
+        # Source/reason of the kill, populated by kill() so the
+        # finalize event can attribute the termination. Sources are
+        # short canonical strings: "netrunner_k", "netrunner_shift_k",
+        # "tripwire_critical:<tripwire_name>", "eject",
+        # "fleet_shutdown", "fleet_wedge_timeout", "inject_interrupt".
+        # Empty string means no kill was requested (construct exited
+        # normally). "unspecified" means kill was called without a
+        # reason — visible signal that some callsite needs to be
+        # wired up. Filed 2026-04-30 (late) after real-deck mystery
+        # kills surfaced as ~36s wedge-timeout escalations with zero
+        # observability of who/what initiated the kill.
+        self._kill_reason: str = ""
         # Server-side session_id for this conversation. When resuming
         # a warm session, we know it up front; otherwise it's captured
         # from the `system_init` event when the subprocess starts up.
@@ -530,7 +542,17 @@ class Construct:
             # We don't await wait() again here — kill() does its own
             # bounded wait with escalation, and if even that fails,
             # the subprocess is truly wedged and nothing we do matters.
-            await self.kill(timeout=1.0)
+            #
+            # Reason "fleet_wedge_timeout" is the Windows-orphan
+            # pattern: claude/node subprocess exited its main loop
+            # but didn't actually terminate, stdout closes, events()
+            # returns, _consume calls c.wait(timeout=30.0), wait
+            # times out at 30s, here we are. Real-deck-confirmed
+            # 2026-04-30 late: every "mystery kill" had runtime
+            # ~36s = 30s wait timeout + ~6s for kill grace + escalation.
+            # Without the reason, the finalize event just said
+            # state=killed and nobody could explain why.
+            await self.kill(timeout=1.0, reason="fleet_wedge_timeout")
             # kill() now sets state = KILLED only on confirmed death.
             # If kill() didn't make it that far (e.g. the wait inside
             # kill itself timed out and the process is truly wedged),
@@ -579,8 +601,34 @@ class Construct:
         self._finalized = True
         return self.state
 
-    async def kill(self, timeout: float = 2.0) -> None:
+    async def kill(self, timeout: float = 2.0, reason: str = "unspecified") -> None:
         """SIGTERM first; escalate to SIGKILL if it won't die.
+
+        `reason` is recorded as the kill source so the finalize event
+        can attribute the termination. Canonical sources:
+          - "netrunner_k"             — netrunner pressed `k`
+          - "netrunner_shift_k"       — netrunner pressed `Shift+K`
+          - "tripwire_critical:<name>" — critical tripwire fired
+          - "inject_interrupt"        — netrunner injection (Q key)
+          - "eject"                   — Ctrl+F EJECT
+          - "fleet_shutdown"          — fleet stop event during shutdown
+          - "fleet_wedge_timeout"     — wait() timeout escalation in
+                                        _consume's finally; subprocess
+                                        didn't exit within 30s of stdout
+                                        closing (the Windows-orphan
+                                        pattern that real-deck-confirmed
+                                        accounts for ~36s mystery kills)
+          - "unspecified"             — caller didn't pass a reason;
+                                        signal that a callsite needs
+                                        wiring
+
+        Idempotent on reason: if a previous kill() call already set
+        `_kill_reason`, subsequent calls don't overwrite. Real case:
+        netrunner presses `k` (reason="netrunner_k"), SIGTERM doesn't
+        kill within timeout, escalate inside this same kill() call to
+        SIGKILL — the original reason stays. If wait()'s timeout path
+        called kill() AFTER an explicit kill that's still running,
+        the original reason is preserved.
 
         State transition order: `_kill_requested` flips immediately so
         wait() knows not to overwrite with DONE/FAILED. `state` flips
@@ -593,6 +641,8 @@ class Construct:
         if self._proc is None:
             return
         self._kill_requested = True
+        if not self._kill_reason:
+            self._kill_reason = reason or "unspecified"
         try:
             self._proc.terminate()
             await asyncio.wait_for(self._proc.wait(), timeout=timeout)
