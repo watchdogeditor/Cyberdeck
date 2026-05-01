@@ -454,6 +454,32 @@ natively, doesn't suffer chat context truncation.
   the widest unprotected attack surface; the LOOM v6 production
   database in particular was reachable via execute_sql until
   this slice shipped.
+- ✓ Kill audit (2026-04-30 late, commit 72ee5e9) — every kill
+  site (`netrunner_k`, `netrunner_shift_k`, `inject_interrupt`,
+  `tripwire_critical:<name>`, `eject`, `fleet_shutdown`,
+  `fleet_wedge_timeout`) now passes a source/reason label that's
+  stamped on the finalize event's `kill_source` field + emitted
+  as a real-time `fleet.kill_requested` bus event. Closes the
+  observability gap surfaced by ~36s mystery kills in earlier
+  sessions — every kill is now attributable. Real-deck verified.
+  ~190 LOC across construct.py, fleet.py, tui.py, display.py.
+- ✓ Tui dupe-pane fix (2026-04-30 late, commit daf6f6d) —
+  `_drive_fleet` was accumulating bus subscriptions on every
+  invocation (post-EJECT respawn etc.). Each rerun multiplied
+  spawn-handler fires per fleet event, mounting orphan
+  ConstructPanes that hung at [STARTING]. Bug latent since
+  Phase 8. Fixed via subscription-handle tracking +
+  unsubscribe-before-resubscribe. Defensive `_spawn_pane`
+  guard logs to chatlog if a pane already exists for a cid.
+- ✓ Safety Architecture Pass slice 4/4 PARTIAL (2026-05-01,
+  commit 2a53e0e) — `host_restart_command` lifted from a
+  construct-authored artifact into `DEFAULT_TRIPWIRES`. Now 3
+  defaults ship (was 2). Still pending: shell-destructive
+  baselines (rm -rf, format, dd, mkfs, fork bombs, shutdown)
+  at critical severity for the pre-authoring window. Possibly
+  unnecessary now that LLM authoring is consistently producing
+  these patterns; re-evaluate based on real-deck pre-authoring
+  exposure.
 - ✓ Safety Architecture Pass slice 2/4: Tripwire escalation chain
   (2026-04-30, late) — tripwires now have teeth. Severity-driven
   escalation: low→log; warning→brake hook denies next tool call
@@ -496,16 +522,35 @@ longer maintain their own listener fan-out paths.
 
 **Next priorities:**
 
-1. **🔥 SAFETY ARCHITECTURE PASS (in progress — 1/4 shipped).**
+1. **🚨 WEDGE-TIMEOUT DIAGNOSTIC GAP (real-deck-discovered
+   2026-05-01 early).** A LOT of constructs hitting 30s wedge
+   timeout in `fleet.py:421` `c.wait(timeout=30.0)`. Caught now
+   (kill_source field stamps it) but opaque about WHY each one
+   wedges — `Construct.wait()`'s TimeoutError handler doesn't
+   drain stderr before kill, so we discard the only diagnostic
+   signal claude subprocesses might have left. Three changes,
+   ~20 LOC total: (a) drain stderr with 2s timeout in
+   TimeoutError handler before kill, capture into
+   `self._stderr_buf`; (b) include `stderr_excerpt` (~500 chars)
+   in finalize payload when `kill_source == "fleet_wedge_
+   timeout"`; (c) make wedge timeout configurable in Limits
+   modal as `wedge_timeout_seconds`, default 30. After (a)+(b)
+   ship, future wedge kills come with claude's own error output
+   — reveals whether it's the suspected Windows-orphan / cmd-
+   wrapper pattern or model/network errors that should retry
+   rather than die. Jumps the queue ahead of slice 3 because
+   wedge frequency is degrading the deck's everyday usefulness.
+
+2. **🔥 SAFETY ARCHITECTURE PASS (in progress — 2.25/4 shipped).**
    Composable set of slices addressing the structural truths
    surfaced by 2026-04-30 late real-deck testing + log analysis:
-   **brake hook is doing 95% of safety work alone**; tripwires are
-   observation-only stubs (the escalation chain was the intended
-   design but never wired); profiles are pure prescription with
-   zero security weight; if brake misses a pattern nothing else
-   stops it. See `cyberdeck-state.md` "Safety architecture
-   analysis" section for the full layer breakdown + intended-vs-
-   today comparison.
+   **brake hook is doing 95% of safety work alone**; tripwires
+   were observation-only stubs until slice 2 wired the escalation
+   chain; profiles are pure prescription with zero security
+   weight; if brake misses a pattern nothing else stops it.
+   See `cyberdeck-state.md` "Safety architecture analysis"
+   section for the full layer breakdown + intended-vs-today
+   comparison.
 
    Slice progress:
 
@@ -524,7 +569,7 @@ longer maintain their own listener fan-out paths.
      prompt rewrite produced shell-destructive baselines with
      bad_enough flags. +~350 LOC across 6 files. See "Post-
      migration shipped" entry above.
-   - **🔥 Active: (c) Variable-outcome pause UX** (re-frame from
+   - **🔥 Active next: (c) Variable-outcome pause UX** (re-frame from
      netrunner). Brake state determines DEFAULT ACTION; pause
      window is netrunner's chance to OVERRIDE. YOLO → pause-
      before-allowing. Default → pause-before-denying-destructive.
@@ -538,17 +583,17 @@ longer maintain their own listener fan-out paths.
      during the pause) AND sticky tool-call surface (the panel
      IS the sticky surface). One mechanism, three problems
      solved.
-   - **(d) DEFAULT_TRIPWIRES expansion + authoring prompt fix.**
-     Default set must include shell-destructive baselines
-     (rm -rf on system roots, format, dd of=/dev, mkfs, fork
-     bombs, shutdown) regardless of brake — depth-of-defense,
-     not depth-of-elision. `TRIPWIRE_AUTHORING_SYSTEM_PROMPT`
-     explicitly forbids the "brake handles X so tripwire skips
-     X" antipattern (real-deck observed: authoring negative-
-     lookahead-EXCLUDED `rm -rf` because "brake will block
-     destructive shapes" — exactly the antipattern that defeats
-     layered defense). Composes with (b): tripwires fire AND
-     escalate with the right pattern coverage.
+   - **(d) DEFAULT_TRIPWIRES expansion + authoring prompt fix**
+     PARTIAL ✅. Authoring prompt antipattern guard shipped
+     with slice 2. `host_restart_command` (warning, with
+     suggestion) shipped 2026-05-01. Now 3 defaults ship.
+     Still pending: shell-destructive baselines (rm -rf,
+     format, dd, mkfs, fork bombs, shutdown) at critical
+     severity. Possibly unnecessary now — real-deck 2026-05-01
+     confirmed LLM authoring is consistently producing these
+     at critical+bad_enough on every goal-set, so the pre-
+     authoring window may be too short to matter. Re-evaluate
+     after slice 3.
 
    Plus discrete bugs / observations from log analysis to land
    alongside the cluster:

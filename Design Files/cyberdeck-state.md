@@ -27,16 +27,41 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** **SAFETY ARCHITECTURE PASS** (in progress — slice
-1/4 shipped 2026-04-30 late). Composable cluster addressing the
-structural truth surfaced by real-deck testing + log analysis:
-**the brake hook is doing 95% of real safety work; most other
-"safety" layers don't compose with it.** Tripwires are
-observation-only (the escalation chain was the intended design
-but never wired). Profiles are pure prescription (zero security
-weight). Watchdog has teeth only at spawn-time via Blacklist
-refusal. See the **Safety architecture analysis** section below
-for full layer breakdown.
+**Up next:** **🚨 WEDGE-TIMEOUT DIAGNOSTIC GAP** (real-deck
+discovered 2026-05-01 early). A LOT of constructs (and
+occasionally the watchdog) hit the 30s wedge-timeout in
+`fleet.py:421` `c.wait(timeout=30.0)` — caught now (✅
+`kill_source: "fleet_wedge_timeout"` lands on finalize) but
+opaque about WHY each one wedges. `Construct.wait()`'s
+`TimeoutError` handler doesn't drain stderr before calling
+`self.kill()` — we throw away the only diagnostic signal claude
+subprocesses might leave behind. Three tight changes (~20 LOC
+total): (a) drain stderr with 2s timeout in the TimeoutError
+handler before kill, capture into `self._stderr_buf`; (b)
+include `stderr_excerpt` (last ~500 chars) in the finalize meta
+payload when `kill_source == "fleet_wedge_timeout"` so file
+logger + chatlog carry the breadcrumbs; (c) make wedge timeout
+configurable in Limits modal as `wedge_timeout_seconds`, default
+30. After (a)+(b) ship, future wedge kills come with claude's
+own error output — likely the Windows-orphan / cmd-wrapper
+pattern, but possibly also model-error / network-timeout cases
+we'd want to handle differently (those should retry, not just
+die).
+
+**SAFETY ARCHITECTURE PASS** (in progress — 2.25/4 shipped):
+slice 1 (MCP gating), slice 2 (tripwire escalation chain), and
+quarter of slice 4 (host_restart_command in DEFAULT_TRIPWIRES)
+are landed. Slice 3 (variable-outcome pause UX) is the largest
+remaining piece. Composable cluster addressing the structural
+truth surfaced by real-deck testing + log analysis: **the brake
+hook is doing 95% of real safety work; most other "safety"
+layers don't compose with it.** Tripwires were observation-only
+until slice 2 wired the escalation chain. Profiles are pure
+prescription (zero security weight by design). Watchdog had
+teeth only at spawn-time via Blacklist refusal until slice 2
+gave its tripwires actual block-and-kill power. See the
+**Safety architecture analysis** section below for full layer
+breakdown.
 
 Four composable slices, current state:
 
@@ -131,19 +156,61 @@ Four composable slices, current state:
    the kill-flag check is one of the conditions the brake hook
    evaluates during the pause window.
 
-4. **DEFAULT_TRIPWIRES expansion + authoring prompt fix**. Default
-   set must include shell-destructive baselines (rm -rf on
-   system roots, format, dd of=/dev, mkfs, fork bombs, shutdown)
-   regardless of brake — depth-of-defense, not depth-of-elision.
-   `TRIPWIRE_AUTHORING_SYSTEM_PROMPT` explicitly forbids the
-   "brake handles X so tripwire skips X" antipattern (real-deck
-   observed: authoring negative-lookahead-EXCLUDED `rm -rf` with
-   regex `rm(?!\s+-rf)` because "brake will block destructive
-   shapes" — exactly the antipattern that defeats layered
-   defense). Composes with #2: tripwires fire AND escalate.
+4. **DEFAULT_TRIPWIRES expansion + authoring prompt fix** —
+   PARTIAL. Authoring prompt fix shipped with slice 2 (the
+   antipattern guard). Default-set expansion: ¼ shipped
+   2026-05-01 — `host_restart_command` (warning) lifted from a
+   construct-authored artifact (`cyberdeck-home/tripwire_restart_
+   commands.py`) into `DEFAULT_TRIPWIRES`. Now 3 defaults ship:
+   `keyword_credentials` (low), `keyword_destructive_sql`
+   (warning), `host_restart_command` (warning, with suggestion).
+   Still pending: shell-destructive baselines (rm -rf, format,
+   dd, mkfs, fork bombs, shutdown) at critical severity for the
+   pre-authoring-runs window. (Counterargument: real-deck
+   2026-05-01 confirmed LLM authoring is now consistently
+   producing these patterns at critical+bad_enough on every
+   goal-set — the authoring prompt fix may be sufficient. Pre-
+   authoring window is short. Re-evaluate if the gap matters in
+   practice.)
 
-Then: caliber selection (per-spawn model + effort + fast-mode);
-then daemon narrative fixes (mislabel + over-volunteer);
+**Also-shipped this session (kill audit cluster):**
+- ✅ Kill audit (commit 72ee5e9, 2026-04-30 late): every kill
+  site now passes a source/reason label that's stamped on the
+  finalize event's `kill_source` field + emitted as a real-time
+  `fleet.kill_requested` bus event. Sources: `netrunner_k`,
+  `netrunner_shift_k`, `inject_interrupt`, `tripwire_critical:
+  <name>`, `eject`, `fleet_shutdown`, `fleet_wedge_timeout`. The
+  ~36s mystery kills from earlier sessions are now explicable —
+  they're all `fleet_wedge_timeout`. Real-deck verified.
+- ✅ Tui dupe-pane fix (commit daf6f6d, 2026-04-30 late): every
+  call to `_drive_fleet` was accumulating bus subscriptions for
+  `_handle_event` and `_scan_for_tripwires` without unsubscribing
+  prior handles. Each post-EJECT `_drive_fleet` rerun added a
+  new pair, multiplying spawn-handler fires per fleet event and
+  mounting orphan ConstructPanes. Bug latent since Phase 8.
+  Fixed by tracking handles on `self._fleet_event_sub` /
+  `self._fleet_tripwire_scan_sub` + unsubscribe-before-resubscribe.
+  Defensive `_spawn_pane` check skips + chatlog-warns if the
+  cid already has a pane.
+
+**Filed for next session (post-wedge-diagnostic):**
+- `PendingOutcome` should carry `kill_source` so daemon can
+  reason about retries (today the daemon hedges in narrative —
+  "killed (likely by netrunner or timeout)" — because it can't
+  see the source). Daemon system-prompt + outcome-format change.
+- `deny_pending.json` overwrites on multi-fire — when multiple
+  tripwires fire simultaneously on the same call, only the last
+  writer's reason reaches the brake hook (chatlog shows all).
+  Acceptable for v1; could append to a list-shaped flag later.
+- Per-run workspace compartmentalization (build-plan item 8) —
+  bumped from "filed for later" to "ready to ship" priority
+  after real-deck-confirmed accumulation of construct artifacts
+  in flat `cyberdeck-home/` (e.g. the test_tripwire_restart.py
+  artifacts that surfaced this session).
+
+Then: slice 3 (variable-outcome pause UX, the largest safety-
+pass piece); caliber selection (per-spawn model + effort +
+fast-mode); daemon narrative fixes (mislabel + over-volunteer);
 log-readability overhaul; Mechanic v1.
 
 **Safety architecture analysis (2026-04-30, late):** explicit

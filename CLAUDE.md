@@ -110,54 +110,69 @@ Phase 8 bus subscriptions (every migrated path renders correctly
 in the chatlog), kill state transitions (k + Shift+K both move
 panes to `[KILLED]` + chatlog shows orange × glyph).
 
-**Next session picks up at: 🔥 SAFETY ARCHITECTURE PASS (2/4
-shipped, slice 3 next — but kill-site audit jumped the queue).** Real-deck testing + log analysis on
-2026-04-30 (late) revealed the structural truth: **the brake
+**Next session picks up at: 🚨 WEDGE-TIMEOUT DIAGNOSTIC GAP**
+(real-deck-discovered 2026-05-01 early). A LOT of constructs
+(and occasionally the watchdog) hitting the 30s wedge timeout
+in `fleet.py:421` `c.wait(timeout=30.0)`. The kill audit shipped
+this session means we now SEE these as
+`kill_source: "fleet_wedge_timeout"` on the finalize event —
+but `Construct.wait()`'s `TimeoutError` handler doesn't drain
+stderr before calling `self.kill()`, so we throw away the only
+diagnostic signal claude subprocesses might have left explaining
+why they wedged. Three tight changes (~20 LOC total):
+(a) drain stderr with 2s timeout in TimeoutError handler before
+kill, capture into `self._stderr_buf`;
+(b) include `stderr_excerpt` (~500 chars) in finalize payload
+when `kill_source == "fleet_wedge_timeout"`;
+(c) make wedge timeout configurable in Limits modal as
+`wedge_timeout_seconds`, default 30.
+After (a)+(b) ship, future wedge kills come with claude's own
+error output — likely the suspected Windows-orphan / cmd-wrapper
+pattern, but possibly also model-error / network-timeout cases
+we'd want to retry rather than kill. Jumps the queue ahead of
+slice 3 because wedge frequency is degrading the deck's
+everyday usefulness.
+
+**SAFETY ARCHITECTURE PASS** (in progress — 2.25/4 shipped).
+Slice 1 (MCP gating), slice 2 (tripwire escalation chain) and a
+quarter of slice 4 (host_restart_command in DEFAULT_TRIPWIRES)
+landed this session. Slice 3 (variable-outcome pause UX) is
+the largest piece remaining. Real-deck testing + log analysis
+on 2026-04-30 late revealed the structural truth: **the brake
 hook is doing 95% of real safety work alone, and most other
-"safety" layers don't compose with it.** Tripwires today are
-observation-only stubs (the severity-driven escalation chain was
-the intended design but was never wired). Profiles are pure
-prescription with zero security weight. Watchdog has teeth only
-at spawn-time via Blacklist refusal. See `cyberdeck-state.md`
-"Safety architecture analysis" section for full layer breakdown.
+"safety" layers don't compose with it.** Slice 2 wired the
+tripwire escalation chain so tripwires now have teeth (low→log;
+warning→brake denies next call + suggestion; critical→deny +
+auto-term; critical+bad_enough→same + blacklist proposal,
+deferred application). See `cyberdeck-state.md` "Safety
+architecture analysis" section for full layer breakdown.
 
 Pass progress:
 
 1. ~~**MCP gating in `brake_hook.py`**~~ ✅ SHIPPED 2026-04-30
-   (late). Verb-based pattern matching: default brake denies
-   destructive + unknown verbs, allows read-shaped (get/list/
-   search/etc.). Paranoid denies ALL `mcp__*`. +90 LOC; real-deck
-   verified across the netrunner's actual Supabase/Gmail/Drive/
-   Calendar connectors. The `execute_sql`-against-LOOM-production
-   surface is closed.
-2. ~~**Tripwire escalation chain**~~ ✅ SHIPPED 2026-04-30 (late).
-   Tripwires gained teeth: low→log; warning→brake denies next
-   call with description+suggestion in stderr; critical→deny +
-   tui handler kills construct via run_worker; critical+
-   bad_enough→same plus blacklist proposal (deferred application
-   to slice 3). TripwireEngine writes per-construct deny_pending
-   .json that brake_hook reads at every invocation. 100ms recheck
-   for write-class tools mitigates same-turn race. Authoring
-   prompt rewritten — depth-of-defense antipattern explicitly
-   forbidden. Real-deck verified via cx-279d4ae8 bait construct:
-   4 critical tripwires fired on one Bash echo, all logged,
-   brake denied with new message, construct auto-termed.
-3. **🚨 KILL AUDIT (mission critical, real-deck-surfaced
-   2026-04-30 late).** Constructs are getting killed without
-   identifiable cause in the log file. Two real-deck sessions
-   showed constructs going from spawn → 1 Read tool_use →
-   `state=killed`, denials=0, with no preceding tripwire.fire /
-   brake.deny / blacklist.added / mechanic event. Netrunner
-   confirms NOT them. Suspected timeout-driven kills among other
-   candidates. Action: grep every kill-invoking site (tui kill
-   actions, fleet timeouts, mechanic, EJECT, daemon outcomes,
-   c.wait timeouts, tripwire critical handler), ensure each emits
-   a `fleet.kill_requested` bus event with source/reason BEFORE
-   calling kill. Plus `kill_source` field on the finalize meta
-   payload populated from whoever called Construct.kill(). Until
-   this lands, kill behavior is fundamentally unobservable —
-   diagnostic constructs can't explain deaths, watchdog Q&A
-   can't either, the file logger doesn't know.
+   (late, commit 6510c5d). Verb-based pattern matching:
+   default brake denies destructive + unknown verbs, allows
+   read-shaped (get/list/search/etc.). Paranoid denies ALL
+   `mcp__*`. +90 LOC; real-deck verified across the netrunner's
+   actual Supabase/Gmail/Drive/Calendar connectors. The
+   `execute_sql`-against-LOOM-production surface is closed.
+2. ~~**Tripwire escalation chain**~~ ✅ SHIPPED 2026-04-30
+   (late, commit 22da9ad). TripwireEngine writes per-construct
+   deny_pending.json that brake_hook reads at every invocation.
+   100ms recheck for write-class tools mitigates same-turn race.
+   Authoring prompt rewritten — depth-of-defense antipattern
+   explicitly forbidden. Real-deck verified via cx-279d4ae8
+   bait construct: 4 critical tripwires fired on one Bash echo,
+   all logged, brake denied with new message, construct
+   auto-termed. Real-deck 2026-05-01 confirmed authoring
+   producing 12+ well-shaped patterns per goal, including
+   bad_enough flags on critical baselines.
+3. ~~**Kill audit**~~ ✅ SHIPPED 2026-04-30 (late, commit
+   72ee5e9). Every kill site passes a source/reason label →
+   `fleet.kill_requested` bus event + `kill_source` field on
+   finalize. The ~36s mystery kills that prompted the audit
+   are now explicable: they're all `fleet_wedge_timeout` (see
+   priority #1 above for the diagnostic next step).
 4. **Variable-outcome pause UX** (re-frame from netrunner).
    Brake state determines DEFAULT ACTION; pause window is the
    netrunner's chance to OVERRIDE. YOLO=pause-before-allowing,
@@ -168,15 +183,22 @@ Pass progress:
    original "review delay" filing AND parts of kill-deny-in-
    flight-tool-calls AND sticky tool-call surface — one
    mechanism, three problems.
-5. **DEFAULT_TRIPWIRES expansion** (slice 2 already shipped the
-   authoring-prompt fix). What's left: the deck-default tripwire
-   set (in `tripwires.py` `DEFAULT_TRIPWIRES`) still only ships
-   `keyword_credentials` + `keyword_destructive_sql`. The
-   authoring prompt now produces shell-destructive baselines per
-   goal, but they don't exist BEFORE the watchdog's first
-   authoring run completes. Add deck-default tripwires for rm-rf,
-   format, dd, mkfs, fork bombs, shutdown so coverage is non-zero
-   from the moment the deck launches, before any goal is set.
+5. **DEFAULT_TRIPWIRES expansion** ¼ ✅ SHIPPED 2026-05-01
+   (commit 2a53e0e). `host_restart_command` (warning, with
+   suggestion) added — promoted from a construct-authored
+   artifact. Now 3 defaults ship: `keyword_credentials` (low),
+   `keyword_destructive_sql` (warning), `host_restart_command`
+   (warning). The bigger expansion (rm-rf, format, dd, mkfs,
+   fork bombs, shutdown at critical) is possibly unnecessary
+   now that real-deck-confirmed LLM authoring consistently
+   produces these patterns. Re-evaluate after slice 3.
+
+**Also-shipped this session (not part of safety pass):**
+- ✅ Tui dupe-pane fix (commit daf6f6d) — `_drive_fleet` was
+  accumulating bus subscriptions on every invocation post-EJECT,
+  multiplying spawn-handler fires per fleet event and mounting
+  orphan ConstructPanes. Bug latent since Phase 8. Fixed via
+  subscription-handle tracking + unsubscribe-before-resubscribe.
 
 Plus discrete bugs / observations from log analysis to land
 alongside the cluster:
