@@ -170,6 +170,7 @@ class Fleet:
             Callable[[], "ConnectionState"]
         ] = None,
         bus: Optional["EventBus"] = None,
+        wedge_timeout_seconds: float = 30.0,
     ):
         self.run_id = f"run-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -234,6 +235,17 @@ class Fleet:
         # console-print path (when not quiet) is the only output. See
         # `Design Files/cyberdeck-event-stream-design.md`.
         self.bus = bus
+
+        # Upper bound for the post-stdout-close `c.wait()` in _consume's
+        # finally. Normal exits return in <1s; this ceiling exists so a
+        # wedged subprocess (Windows orphan, Node child holding stdout
+        # open after parent exit, claude wedged on a network call)
+        # escalates to force-kill instead of blocking shutdown. Mutable
+        # at runtime — the Limits modal writes straight to this attr,
+        # so changes take effect for the next finalize without a fleet
+        # rebuild. 0 disables the timeout (debug only — a real wedge
+        # will hold up shutdown indefinitely). Filed 2026-05-01.
+        self.wedge_timeout_seconds = wedge_timeout_seconds
 
         self._constructs: list[Construct] = []
         self._consumers: list[asyncio.Task] = []
@@ -420,11 +432,17 @@ class Fleet:
                 ))
         finally:
             try:
-                # 30s upper bound. Normal exits take <1s. If the
-                # subprocess is wedged (Windows orphan, etc.), this
-                # escalates to force-kill inside wait() rather than
-                # hanging in _consume's finally and blocking Ctrl-C.
-                await c.wait(timeout=30.0)
+                # Post-stdout-close upper bound. Normal exits take
+                # <1s. If the subprocess is wedged (Windows orphan,
+                # etc.), this escalates to force-kill inside wait()
+                # rather than hanging in _consume's finally and
+                # blocking Ctrl-C. Sourced from `self.wedge_timeout_
+                # seconds` (configurable via the Limits modal); 0 means
+                # "no timeout" (debug only — a real wedge will block
+                # shutdown). Read fresh each finalize so live edits
+                # apply on the next construct that exits.
+                _wt = self.wedge_timeout_seconds
+                await c.wait(timeout=(_wt if _wt > 0 else None))
                 self._pending_count = max(0, self._pending_count - 1)
                 self.total_finalized += 1
 
@@ -534,6 +552,23 @@ class Fleet:
                         # "fleet_shutdown", "fleet_wedge_timeout".
                         "kill_source": (
                             c._kill_reason if c._kill_reason else None
+                        ),
+                        # Wedge-timeout post-mortem (filed 2026-05-01).
+                        # When the kill came from the c.wait() timeout
+                        # branch, Construct.wait() drained stderr (with
+                        # a 2s ceiling) before signalling. Surface the
+                        # tail (~500 chars) here so DeckLogger persists
+                        # it on the bus event and the chatlog/Q&A path
+                        # can reach it without re-opening the construct.
+                        # Only populated when the wedge-timeout path
+                        # ran — every other kill source skipped the
+                        # drain, and clean exits already have their
+                        # stderr captured but it's rarely interesting.
+                        # None elsewhere to keep payloads tight.
+                        "stderr_excerpt": (
+                            (c.stderr or "")[-500:]
+                            if c._kill_reason == "fleet_wedge_timeout"
+                            else None
                         ),
                     },
                 ))

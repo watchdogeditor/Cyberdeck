@@ -110,28 +110,44 @@ Phase 8 bus subscriptions (every migrated path renders correctly
 in the chatlog), kill state transitions (k + Shift+K both move
 panes to `[KILLED]` + chatlog shows orange × glyph).
 
-**Next session picks up at: 🚨 WEDGE-TIMEOUT DIAGNOSTIC GAP**
-(real-deck-discovered 2026-05-01 early). A LOT of constructs
-(and occasionally the watchdog) hitting the 30s wedge timeout
-in `fleet.py:421` `c.wait(timeout=30.0)`. The kill audit shipped
-this session means we now SEE these as
-`kill_source: "fleet_wedge_timeout"` on the finalize event —
-but `Construct.wait()`'s `TimeoutError` handler doesn't drain
-stderr before calling `self.kill()`, so we throw away the only
-diagnostic signal claude subprocesses might have left explaining
-why they wedged. Three tight changes (~20 LOC total):
-(a) drain stderr with 2s timeout in TimeoutError handler before
-kill, capture into `self._stderr_buf`;
-(b) include `stderr_excerpt` (~500 chars) in finalize payload
-when `kill_source == "fleet_wedge_timeout"`;
-(c) make wedge timeout configurable in Limits modal as
-`wedge_timeout_seconds`, default 30.
-After (a)+(b) ship, future wedge kills come with claude's own
-error output — likely the suspected Windows-orphan / cmd-wrapper
-pattern, but possibly also model-error / network-timeout cases
-we'd want to retry rather than kill. Jumps the queue ahead of
-slice 3 because wedge frequency is degrading the deck's
-everyday usefulness.
+**✅ WEDGE-TIMEOUT DIAGNOSTIC** shipped 2026-05-01 (uncommitted
+working tree as of this CLAUDE.md update). Three tight changes
+addressing the real-deck-discovered wedge frequency that was
+degrading everyday usefulness:
+(a) `Construct.wait()`'s `TimeoutError` handler now drains
+stderr with a 2s `asyncio.wait_for` ceiling into `self._stderr_
+buf` BEFORE calling `self.kill()`. Previously we threw away the
+only diagnostic signal claude/node subprocesses left behind —
+kill() closes the pipes.
+(b) Fleet finalize meta payload carries `stderr_excerpt` (last
+500 chars) when `kill_source == "fleet_wedge_timeout"`; None
+on every other source. DeckLogger persists it on the bus event
+so wedge kills are now grep-able from `latest.log`.
+(c) Wedge timeout is configurable. Fleet.__init__ takes
+`wedge_timeout_seconds: float = 30.0` (mutable attribute; no
+fleet rebuild needed). Limits modal grew a fourth row; the
+handler writes straight to `fleet.wedge_timeout_seconds` so
+edits apply on the next finalize. CyberdeckApp.__init__ takes
+the parameter too; CLI flag deliberately skipped this round to
+keep diff tight.
++118 LOC across construct.py / fleet.py / tui.py. Compile-clean,
+signatures verified. Real-deck verification pending — next wedge
+fire should land with claude's own stderr output, finally
+disambiguating Windows-orphan vs model-error vs network-timeout
+wedges.
+
+**Next session picks up at: SAFETY ARCHITECTURE PASS slice 3 —
+variable-outcome pause UX.** Largest remaining safety-pass piece.
+Brake state determines DEFAULT ACTION; pause window is the
+netrunner's chance to OVERRIDE. YOLO=pause-before-allowing,
+Default=pause-before-denying-destructive, Paranoid=pause-before-
+anything. Bus-driven sticky panel shows pending tool-calls +
+countdown; Z-keybind negates the default. Configurable in Limits
+as `pause_window_seconds`, default 0. Subsumes original "review
+delay" filing AND kill-deny-in-flight-tool-calls AND sticky
+tool-call surface — one mechanism, three problems. See
+`cyberdeck-state.md` "Safety architecture analysis" + slice 4
+notes for full layer breakdown.
 
 **SAFETY ARCHITECTURE PASS** (in progress — 2.25/4 shipped).
 Slice 1 (MCP gating), slice 2 (tripwire escalation chain) and a
@@ -171,8 +187,9 @@ Pass progress:
    72ee5e9). Every kill site passes a source/reason label →
    `fleet.kill_requested` bus event + `kill_source` field on
    finalize. The ~36s mystery kills that prompted the audit
-   are now explicable: they're all `fleet_wedge_timeout` (see
-   priority #1 above for the diagnostic next step).
+   are now explicable: they're all `fleet_wedge_timeout`. The
+   wedge-timeout diagnostic shipped 2026-05-01 surfaces stderr
+   on those finalizes, closing the loop.
 4. **Variable-outcome pause UX** (re-frame from netrunner).
    Brake state determines DEFAULT ACTION; pause window is the
    netrunner's chance to OVERRIDE. YOLO=pause-before-allowing,

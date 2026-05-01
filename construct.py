@@ -552,6 +552,26 @@ class Construct:
             # ~36s = 30s wait timeout + ~6s for kill grace + escalation.
             # Without the reason, the finalize event just said
             # state=killed and nobody could explain why.
+            #
+            # Drain stderr BEFORE killing — claude/node subprocesses
+            # often leave a stack trace, model-error blob, or network
+            # error on stderr explaining why they wedged, but kill()
+            # closes the pipes and we lose it if we don't grab it
+            # first. 2s ceiling: any well-behaved process has flushed
+            # stderr long before this point; if it's still streaming,
+            # it's not signal we want to wait on. Captured into the
+            # same `_stderr_buf` the clean-exit path uses, so the
+            # `stderr` property surfaces it consistently. Filed
+            # 2026-05-01: the ~30s mystery wedges were diagnosed-
+            # blind until this drain went in.
+            if self._proc.stderr is not None:
+                try:
+                    self._stderr_buf = await asyncio.wait_for(
+                        self._proc.stderr.read(), timeout=2.0
+                    )
+                except (asyncio.TimeoutError, OSError,
+                        asyncio.IncompleteReadError):
+                    pass
             await self.kill(timeout=1.0, reason="fleet_wedge_timeout")
             # kill() now sets state = KILLED only on confirmed death.
             # If kill() didn't make it that far (e.g. the wait inside

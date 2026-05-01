@@ -1611,6 +1611,7 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         max_concurrent: int,
         max_total_spawns: int,
         pool_size: int,
+        wedge_timeout_seconds: float,
         current_live: int,
         current_spawned: int,
         cost_so_far: float,
@@ -1620,6 +1621,7 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         self.initial_max_concurrent = max_concurrent
         self.initial_max_total_spawns = max_total_spawns
         self.initial_pool_size = pool_size
+        self.initial_wedge_timeout_seconds = wedge_timeout_seconds
         self.current_live = current_live
         self.current_spawned = current_spawned
         self.cost_so_far = cost_so_far
@@ -1662,6 +1664,13 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                     id="input_pool_size",
                     type="integer",
                 )
+            with Horizontal(classes="limits_row"):
+                yield Label("wedge timeout (seconds):")
+                yield Input(
+                    value=str(int(self.initial_wedge_timeout_seconds)),
+                    id="input_wedge_timeout_seconds",
+                    type="integer",
+                )
             yield Label(
                 "[dim]No hard ceilings. max_concurrent and "
                 "max_total_spawns each accept 0 = 'no cap' (use with "
@@ -1670,7 +1679,14 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                 "subprocesses kept hot for snappy spawns; 0 disables "
                 "the pool. Raising pool_size mid-session tops up to "
                 "the new target; lowering leaves existing warm sessions "
-                "intact (they'll be consumed naturally).[/dim]"
+                "intact (they'll be consumed naturally). "
+                "wedge_timeout is how long fleet waits for a construct "
+                "to exit after its stdout closes before force-killing "
+                "(kill_source=fleet_wedge_timeout). Raise it if you're "
+                "seeing legitimate slow shutdowns get killed; lower it "
+                "for snappier shutdown at the cost of less stderr "
+                "post-mortem. 0 disables (debug only — a real wedge "
+                "will block deck shutdown).[/dim]"
             )
 
     def on_mount(self) -> None:
@@ -1693,9 +1709,11 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             mc_str = self.query_one("#input_max_concurrent", Input).value.strip()
             mts_str = self.query_one("#input_max_total_spawns", Input).value.strip()
             ps_str = self.query_one("#input_pool_size", Input).value.strip()
+            wt_str = self.query_one("#input_wedge_timeout_seconds", Input).value.strip()
             mc = int(mc_str)
             mts = int(mts_str)
             ps = int(ps_str)
+            wt = int(wt_str)
         except (ValueError, AttributeError):
             # Bad input — toast back via dismissal of None. Caller
             # will treat as cancel; user can re-open if desired.
@@ -1714,17 +1732,24 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         #   max_total_spawns: 0 = "no cap"; otherwise must be >= 0
         #   pool_size: 0 = "no warming" (pool effectively disabled);
         #     otherwise the target count of hot pre-warmed sessions
+        #   wedge_timeout_seconds: 0 = "no timeout" (debug only — a
+        #     real wedge will block fleet shutdown indefinitely);
+        #     otherwise the post-stdout-close ceiling before fleet
+        #     force-kills with kill_source="fleet_wedge_timeout".
         if mc < 1:
             mc = 1
         if mts < 0:
             mts = 0
         if ps < 0:
             ps = 0
+        if wt < 0:
+            wt = 0
 
         self.dismiss({
             "max_concurrent": mc,
             "max_total_spawns": mts,
             "pool_size": ps,
+            "wedge_timeout_seconds": float(wt),
         })
 
     def action_cancel(self) -> None:
@@ -3007,6 +3032,7 @@ class CyberdeckApp(App):
         streaming_mode: bool = True,
         use_pool: bool = True,
         pool_size: int = 5,
+        wedge_timeout_seconds: float = 30.0,
         home_dir: Optional[Path] = None,
         profiles_dir: Optional[Path] = None,
         default_profile_name: Optional[str] = None,
@@ -3094,6 +3120,12 @@ class CyberdeckApp(App):
         self.streaming_mode = streaming_mode
         self.use_pool = use_pool
         self.pool_size = pool_size
+        # Wedge-timeout ceiling for the post-stdout-close c.wait() in
+        # fleet's _consume finally. Threaded into Fleet at construction
+        # and editable live via the Limits modal — _handle_limits_
+        # submitted writes straight to fleet.wedge_timeout_seconds so
+        # changes apply on the next finalize, no fleet rebuild needed.
+        self.wedge_timeout_seconds = wedge_timeout_seconds
         self.fleet: Optional[Fleet] = None
         self.daemon: Optional[Daemon] = None
         self.session: Optional[DaemonSession] = None
@@ -3890,6 +3922,10 @@ class CyberdeckApp(App):
             # `add_listener` shim and made bus the only fan-out).
             # See `Design Files/cyberdeck-event-stream-design.md`.
             bus=self.bus,
+            # Wedge-timeout ceiling for the post-stdout-close wait.
+            # Limits modal mutates fleet.wedge_timeout_seconds in
+            # place; the wait-call site reads it fresh per finalize.
+            wedge_timeout_seconds=self.wedge_timeout_seconds,
         )
         # Phase 8: subscribe via the bus instead of fleet.add_listener.
         # `fleet.*` matches every dotted-namespace fleet kind
@@ -7990,6 +8026,7 @@ class CyberdeckApp(App):
                 max_concurrent=self.max_concurrent,
                 max_total_spawns=self.max_total_spawns,
                 pool_size=self.pool_size,
+                wedge_timeout_seconds=self.wedge_timeout_seconds,
                 current_live=live,
                 current_spawned=spawned,
                 cost_so_far=cost,
@@ -8023,6 +8060,9 @@ class CyberdeckApp(App):
         new_mc = result.get("max_concurrent", self.max_concurrent)
         new_mts = result.get("max_total_spawns", self.max_total_spawns)
         new_ps = result.get("pool_size", self.pool_size)
+        new_wt = result.get(
+            "wedge_timeout_seconds", self.wedge_timeout_seconds
+        )
 
         changes: list[str] = []
         if new_mc != self.max_concurrent:
@@ -8079,6 +8119,23 @@ class CyberdeckApp(App):
                             self.session_pool.start(),
                             exclusive=False,
                         )
+                except Exception:
+                    pass
+        if new_wt != self.wedge_timeout_seconds:
+            changes.append(
+                f"wedge_timeout: {self.wedge_timeout_seconds:g}s → "
+                f"{new_wt:g}s"
+            )
+            self.wedge_timeout_seconds = new_wt
+            # Apply live to the running fleet — fleet's _consume reads
+            # the attribute fresh on every finalize, so the new ceiling
+            # takes effect for the next construct that exits. No fleet
+            # rebuild needed (max_concurrent's "next session only"
+            # caveat doesn't apply here because no semaphore is bound
+            # to this value).
+            if self.fleet is not None:
+                try:
+                    self.fleet.wedge_timeout_seconds = new_wt
                 except Exception:
                     pass
 
