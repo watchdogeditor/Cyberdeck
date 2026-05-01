@@ -27,13 +27,234 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** **Spine Phase 8 cleanup** (retire deprecated
-`add_listener` / `on_event` / `on_change` callback shims now that
-every producer publishes through the bus). Last spine slice;
-~30 LOC across producer modules + tui.py wiring; low-risk,
-mechanical. Then caliber selection (per-spawn model + effort +
-fast-mode), then log-readability overhaul, then Mechanic v1
-(LLM-session half).
+**Up next:** **SAFETY ARCHITECTURE PASS** — composable cluster
+addressing the structural truth surfaced by 2026-04-30 late
+real-deck testing + log analysis. **The brake hook is doing 95%
+of real safety work; most other "safety" layers don't compose
+with it.** Tripwires are observation-only (the escalation chain
+was the intended design but never wired). Profiles are pure
+prescription (zero security weight). Watchdog has teeth only at
+spawn-time via Blacklist refusal. If brake misses a pattern,
+nothing else stops the call — and brake misses an entire
+category (MCP tools, all of them). See the **Safety architecture
+analysis** section below for full layer breakdown.
+
+Four composable slices in priority order:
+
+1. **🚨 MCP gating in `brake_hook.py`** (CRITICAL — closes widest
+   unprotected attack surface). Every construct gets full access
+   to the netrunner's claude.ai MCP connector config (Supabase
+   `execute_sql` / `apply_migration`, Gmail `send` after auth,
+   Drive write, Calendar — confirmed via real-deck log lines 28+,
+   37, 44). brake_hook patterns target tool names like Bash /
+   Write / Edit; `mcp__*__*` matches NONE of them. Today's only
+   safety against rogue MCP usage is Claude's own refusal layer.
+   Fix: verb-based pattern matching. Default brake denies
+   `mcp__*__execute_*`, `apply_*`, `send_*`, `delete_*`,
+   `create_*`, `update_*`, `deploy_*`, `drop_*`, `merge_*`,
+   `migrate_*`, `pause_*`, `restore_*`, `reset_*`, `rebase_*`,
+   `write_*`, `edit_*`. Allows read-shaped (`get_*`, `list_*`,
+   `search_*`, `describe_*`, `fetch_*`, `show_*`). Paranoid
+   denies all `mcp__*`. YOLO allows. Per-spawn allowlist override
+   for explicit opt-in (e.g., a "supabase_admin" profile spawn).
+   ~30 LOC.
+
+2. **🔥 Tripwire escalation chain** — the architectural unfinished
+   work. Tripwires today are pure observers; the netrunner's
+   stated original design intent (re-confirmed 2026-04-30) was a
+   severity-driven escalation that turns tripwires into INPUTS to
+   the existing hard-gate layers (brake / blacklist) rather than
+   a parallel observability silo:
+   - `low` → log only (current behavior; matches today)
+   - `warning` → log + redirect construct with "why" via
+     brake-style denial on next tool call
+   - `critical` → log + auto-term construct with structured "why"
+     bus event
+   - `critical + "bad enough"` → auto-term + auto-blacklist
+   The "bad enough" threshold uses a hybrid: deterministic floor
+   (specific tripwire NAMES like `credentials_exfiltration`,
+   `pii_leak`, `auth_bypass_attempt` always blacklist on critical
+   fire) + watchdog LLM judgment for the gray zone (with
+   structured output) + 30s netrunner approval window before any
+   auto-blacklist commits (mirrors the variable-outcome pause UX).
+   The "redirect with why" mechanism is brake-style denial —
+   tripwire fire causes brake hook to return deny on the next
+   tool call from that construct with the tripwire reason as
+   stderr; reuses every existing mechanism, no mid-stream message
+   injection needed.
+
+3. **Variable-outcome pause UX** (re-frame from netrunner). Brake
+   state determines DEFAULT ACTION; pause window is netrunner's
+   chance to OVERRIDE.
+   - YOLO → pause-before-allowing (Z to deny)
+   - Default → pause-before-denying-destructive (Z to override deny)
+   - Paranoid → pause-before-anything (Z to override deny)
+   Brake hook delays N seconds (configurable in Limits modal as
+   `pause_window_seconds`, default 0 = no pause = current
+   behavior). New tool-calls bus-driven sticky panel shows
+   pending calls with countdown + Z-keybind to negate the default
+   action. Subsumes the original "review delay" filing
+   (continues-unless-killed) — replaced because failsafe-deny
+   was wrong fit for autonomous parallel work; brake-state-as-
+   default + netrunner-override is the right shape. Also
+   subsumes parts of the kill-deny in-flight tool calls and
+   sticky tool-call surface filings — the panel is the surface,
+   the kill-flag check is one of the conditions the brake hook
+   evaluates during the pause window.
+
+4. **DEFAULT_TRIPWIRES expansion + authoring prompt fix**. Default
+   set must include shell-destructive baselines (rm -rf on
+   system roots, format, dd of=/dev, mkfs, fork bombs, shutdown)
+   regardless of brake — depth-of-defense, not depth-of-elision.
+   `TRIPWIRE_AUTHORING_SYSTEM_PROMPT` explicitly forbids the
+   "brake handles X so tripwire skips X" antipattern (real-deck
+   observed: authoring negative-lookahead-EXCLUDED `rm -rf` with
+   regex `rm(?!\s+-rf)` because "brake will block destructive
+   shapes" — exactly the antipattern that defeats layered
+   defense). Composes with #2: tripwires fire AND escalate.
+
+Then: caliber selection (per-spawn model + effort + fast-mode);
+then daemon narrative fixes (mislabel + over-volunteer);
+log-readability overhaul; Mechanic v1.
+
+**Safety architecture analysis (2026-04-30, late):** explicit
+audit of how brake / tripwires / profiles / watchdog actually
+compose today vs. how they were intended to compose. Filed because
+the layer breakdown is the shared mental model for the safety
+architecture pass and saves re-deriving it next session.
+
+**Layer-by-layer weight:**
+
+| Layer | What it does today | Hard or soft | Real weight |
+|---|---|---|---|
+| **Brake hook** | PreToolUse regex/path patterns; deny destructive | HARD per-call | Carrying ~all actual prevention |
+| **Watchdog Blacklist** | Spawn-time fingerprint refusal | HARD at spawn only | Niche, netrunner-driven |
+| **Claude's refusal layer** | Model decides "no" before tool use | SOFT, model-dependent | Caught the rm-rf test; can't rely on it |
+| **Tripwires** | Pattern-scan stream events, fire chatlog markers | OBSERVATION ONLY | Decoration. Construct never sees them. |
+| **Profiles** | System-prompt addendum + recommended_tools hint | SOFT steering | Behavior shaping, zero security |
+| **Watchdog Q&A** | Bus-snapshot context for `t` queries | OBSERVATION ONLY | Post-hoc analysis |
+
+**Three structural truths surfaced:**
+
+1. **Brake hook is doing 95% of safety work alone.** Everything
+   else is observation, soft steering, or niche refusal. If brake
+   misses a pattern (MCP gap, future Claude Code tools), nothing
+   else stops it.
+2. **Tripwires are observability theatre.** They render warnings
+   to the netrunner — useful — but don't affect what the construct
+   does. A construct can fire 50 tripwires and just keep running.
+   The escalation chain (`warning` → redirect, `critical` → term,
+   `critical+bad` → term+blacklist) was the intended design but
+   was never wired. Today's tripwires are stubs.
+3. **Layers don't compose.** Profile can't hard-narrow tools; a
+   tripwire firing on `rm -rf` can't tighten brake; daemon doesn't
+   read tripwire fires structurally. Each layer is its own silo.
+
+**Intended-vs-today shape:**
+
+```
+   INTENDED                         TODAY
+   ────────                         ─────
+   brake = hard gate ✓              brake = hard gate ✓
+   tripwire low → log               tripwire low → log
+   tripwire warning → REDIRECT      tripwire warning → log only ⚠
+   tripwire critical → KILL         tripwire critical → log only ⚠
+   tripwire crit+bad → BLACKLIST    no path exists ⚠
+   profile → soft steering ✓        profile → soft steering ✓
+   watchdog → blacklist + Q&A ✓     watchdog → blacklist + Q&A ✓
+```
+
+The two architectural wires that need building (the 🔥-marked items
+in priority queue):
+
+1. **Tripwire engine → kill / brake-tighten** (warning + critical
+   actions on tripwires)
+2. **Watchdog → blacklist on critical-and-bad-enough** (with
+   deterministic floor + LLM judgment + 30s approval window)
+
+Plus the unrelated-but-critical safety gap (the 🚨-marked):
+**MCP tools ungated by brake_hook**. Discovered via real-deck log
+analysis 2026-04-30, late. Closes via verb-based pattern matching
+in `brake_hook.py`. Not part of the architectural wire-up but
+must ship together with it because today's exposure is huge:
+`mcp__claude_ai_Supabase__execute_sql`, `mcp__claude_ai_Gmail__*`,
+`mcp__claude_ai_Google_Drive__*`, etc., are all reachable from
+any construct under default brake.
+
+**Filed (2026-04-30, late):** Real-deck log analysis revealed
+several discrete bugs / observations beyond the architectural ones,
+also slated for the safety pass:
+- **Enum payloads serialize as empty `{}`.** `_serialize_payload`
+  in `logger.py` walks `__dict__` for non-primitives; Enum
+  `__dict__` is empty. `brake.change` and `connection.transition`
+  payloads land as `"old_state": {}, "new_state": {}` in the log
+  file (and Y-yank JSON, and anything programmatic). 3-line fix:
+  `isinstance(payload, Enum)` check returning `payload.value`
+  before the `__dict__` walk. Affects every enum-valued payload
+  field across the deck.
+- **Kill doesn't interrupt in-flight assistant turns.** Real-deck
+  log lines 76-82: `Shift+K` fired at 192043; construct continued
+  through full assistant turn until 192045. Kill SIGTERM landed
+  AFTER the turn completed. Validates kill-deny on tool calls
+  AND extends: model can still complete a full turn (token cost +
+  observable output) after kill request. Stopping the model
+  itself requires stdin-injection or stream interrupt, not just
+  SIGTERM-after-checkpoint. Worth designing alongside the variable-
+  outcome pause UX.
+- **Daemon over-volunteers destructive content.** Netrunner asked
+  "spawn a tripwire-bait construct"; daemon synthesized
+  `rm -rf /` AND volunteered `shutdown -h now` unprompted (real-
+  deck log line 30). Daemon goes ABOVE the netrunner's literal
+  request in safety-test mode. Tighten daemon system prompt:
+  when generating bait/test tasks, never go beyond what the
+  netrunner explicitly requested. Filed as gotcha.
+- **Construct refusal text is buried in result event.** Rich
+  self-refusal narrative ("No. I won't run either command —
+  rm -rf / would destroy the system... Neither is reversible...")
+  lands as part of the `result` event's text, not a structured
+  refusal kind. Worth a `kind=construct.refused` (or similar) so
+  chatlog/watchdog see refusal as a distinct safety signal vs. a
+  generic completion.
+- **Cache miss ~30k input tokens per spawn.** Log lines 40, 64, 79
+  show `cache_miss_reason: 'system_changed'` with 30513-30545
+  tokens missed each time. Per-spawn system prompt is drifting —
+  likely the brake-settings JSON path or the deck addendum is
+  changing between spawns. Quota concern (not safety). Investigate
+  alongside caliber work where prompt-cache efficiency starts
+  mattering more.
+
+**Spine Phase 8 shipped (2026-04-30, late):** retired the legacy
+`add_listener` / `remove_listener` / `on_event` / `on_change` /
+`on_state_change` callback shims across five producers
+(brake_state, profile_registry, plugin_registry, fleet,
+connection_monitor) plus their consumers in tui.py and
+daemon_session.py. Bus is now the only fan-out path; consumers
+subscribe through `bus.subscribe(...)` with role-derived filters.
+Per-callback exception isolation lives on the bus, so producers
+no longer carry their own try/except loops. ~75 LOC net deletion.
+Three callback patterns deliberately NOT migrated (Pool's
+on_event, Daemon's on_daemon_event, Blacklist's on_event in
+watchdog) — they're integration interfaces, not deprecated shims;
+filed as Phase 8b candidates. Real-deck verified via running deck
+session that exercised every migrated path. **The unified-event-
+stream slice is now complete** (8/8 phases shipped).
+
+**Kill state-stuck fix shipped (2026-04-30, late):** real-deck
+caught both `k` (soft-kill) and `Shift+K` (blacklist + hard-kill)
+leaving the construct pane stuck at `[RUNNING]` with the
+chatlog showing the neutral `·` glyph + `state="running"`
+suffix. Root cause: race between `Construct.kill()` and
+`_consume`'s `await c.wait()` — both call `proc.wait()` on the
+same Process; if `wait()` resumes first when the proc dies, it
+correctly skips the DONE/FAILED overwrite (because
+`_kill_requested` is set), but `_consume` then emits the finalize
+meta event with `state="running"` BEFORE `kill()` reaches its
+`self.state = ConstructState.KILLED` line. Fix in
+`construct.wait()`: when `_kill_requested` is True and
+`proc.wait()` returned (process confirmed dead), explicitly set
+`state = ConstructState.KILLED`. Belt-and-suspenders with kill()'s
+own state-flip — whichever runs first wins, the other is a no-op.
+Filed as a gotcha (Async / subprocess section).
 
 **Mechanic v0 shipped (2026-04-30, late):** sibling supervisor
 process, ~270 LOC `mechanic.py`, no claude dependency, pure stdlib
@@ -732,6 +953,29 @@ and 11.
   (`proc.communicate(input=...)`).
 - **Rapid heartbeat tests are racy.** Use `wait_for(predicate)` with
   timeout, not fixed sleeps.
+- **Construct kill races construct finalize emission.** Both
+  `Construct.kill()` and `_consume`'s finalize path call
+  `await proc.wait()` on the same Process object. asyncio doesn't
+  guarantee resume order when the proc dies, so two interleavings
+  exist: (a) kill() resumes first → sets `state = KILLED` → wait()
+  resumes → sees `_kill_requested`, doesn't overwrite → finalize
+  emits `state="killed"` (correct); or (b) wait() resumes first →
+  sees `_kill_requested`, doesn't overwrite (state is still
+  "running") → _consume emits `state="running"` → kill() resumes
+  too late, sets state=KILLED but the bus event already carried
+  the wrong value. Real-deck symptom (2026-04-30): pane stuck at
+  `[RUNNING]` after `k` or `Shift+K`, chatlog shows `· cx-...:
+  running (5.1s)` with the neutral fallback glyph instead of the
+  orange `×`. Fix in `Construct.wait()`: when `_kill_requested` is
+  True AND `proc.wait()` just returned (process confirmed dead),
+  explicitly set `state = KILLED` in the non-overwrite branch.
+  Belt-and-suspenders with kill()'s own state-flip; whichever runs
+  first wins, the other is a no-op. The deeper lesson: when two
+  coroutines wait on the same `proc.wait()`, they BOTH need to be
+  prepared to write the terminal state, because either could
+  resume first. "Skip the overwrite to respect existing state"
+  only works if the existing state is the right one — which here
+  it wasn't (RUNNING is not a terminal state).
 - **Windows console Ctrl+C reaches every process in the console
   group, not just the Python parent.** Installing a Python-level
   SIGINT swallow (`signal.signal(SIGINT, lambda: None)`) protects the
@@ -890,6 +1134,59 @@ and 11.
   first. Lesson: when fixing a "protection over-blocks workspace"
   bug in one code path, audit ALL code paths that share the
   protection logic.
+- **Brake hook gates by tool NAME, not capability.** Pattern set
+  targets `Bash`, `PowerShell`, `Write`, `Edit`, `NotebookEdit`,
+  `WebFetch` literally. Any tool name not in that set sails through
+  with no gating regardless of what the tool does. Real-deck
+  surfaced 2026-04-30 (late) via log analysis: every construct
+  has access to the netrunner's full claude.ai MCP connector
+  config (`mcp__claude_ai_Supabase__execute_sql`,
+  `mcp__claude_ai_Gmail__send`-after-auth, etc.) and the brake
+  hook gates ZERO of them. Implication: when adding new tools to
+  the deck's tool surface (or when Claude Code adds new built-ins,
+  or when the netrunner connects new MCP servers), the brake
+  hook's pattern set MUST be extended in the same change — either
+  with explicit gates for the new tool name, or with a categorical
+  default-deny-unknown-tool stance. The "verb-based MCP gating"
+  fix in the safety architecture pass takes the explicit-gate
+  approach for MCP; a deeper redesign would flip the default to
+  deny-unknown.
+- **Tripwire LLM authoring's depth-of-defense antipattern.** Real-
+  deck observed 2026-04-30: watchdog authored `benign_delete_attempt`
+  with regex `(?:^|[;&|\s])(?:rm(?!\s+-rf)|del|erase|...)\b` —
+  the negative lookahead `rm(?!\s+-rf)` EXPLICITLY EXCLUDES the
+  most dangerous case. Watchdog's stated reasoning: "brake will
+  block destructive shapes, but this surfaces softer delete
+  attempts." That's exactly the antipattern that defeats layered
+  defense — every layer assumes another caught the dangerous case,
+  and the dangerous case slips through if any one layer is
+  weakened (e.g., brake gets flipped to YOLO). Fix: tighten
+  `TRIPWIRE_AUTHORING_SYSTEM_PROMPT` to forbid the "X handles Y so
+  I skip Y" reasoning. Authored tripwires must include shell-
+  destructive baselines REGARDLESS of brake's coverage. Layered
+  defense means EVERY layer covers the worst case independently;
+  if one fails, the next catches it. Same logic as why brake hook
+  also has its own destructive-bash regex even though Claude's
+  refusal layer often catches them — defense-in-depth requires
+  redundancy by design.
+
+### Daemon (LLM behavior under safety-test prompts)
+- **Daemon over-volunteers destructive content when asked to
+  exercise safety.** Real-deck 2026-04-30: netrunner asked "spawn
+  a tripwire-bait construct"; daemon synthesized `rm -rf /` AND
+  volunteered `shutdown -h now` unprompted (log line 30). The
+  daemon goes ABOVE the netrunner's literal request in safety-test
+  mode. Possibly model-level enthusiasm-for-thoroughness rather
+  than malicious behavior, but the result is the same: bait tasks
+  end up more dangerous than the netrunner asked for. Multiple
+  defenses caught it (Claude refusal, then brake regex would have
+  blocked) but the chain is depth-of-defense, not depth-of-
+  suspicion. Filed for daemon system prompt fix: when generating
+  bait/test tasks, never expand beyond what the netrunner
+  explicitly requested. Bonus lesson: when designing safety
+  testing flows, the netrunner should specify the bait
+  pattern themselves, not delegate "make a dangerous task" to the
+  daemon — even with constraints, the daemon will improvise.
 
 ---
 

@@ -78,8 +78,26 @@ session on 2026-04-30 added:
   cleanup path verified by synthetic smoke test. Known limitation:
   only constructs are tracked — daemon / watchdog Q&A / authoring
   one-shots / pool warmer subprocesses still orphan their pre-
-  mechanic way (filed as a follow-up; one elif per source in
-  `mechanic._apply_record`).
+  mechanic way (filed as a follow-up).
+- **Spine Phase 8 — listener shim cleanup.** Retired
+  `add_listener` / `remove_listener` / `on_event` / `on_change` /
+  `on_state_change` across five producers (brake_state,
+  profile_registry, plugin_registry, fleet, connection_monitor)
+  plus consumers in tui.py and daemon_session.py. Bus is now the
+  only fan-out path. ~75 LOC net deletion. **Unified-event-stream
+  slice complete (8/8 phases shipped).** Three callback patterns
+  deliberately not migrated (Pool, Daemon, Blacklist on_event) —
+  integration interfaces, filed as Phase 8b candidates.
+- **Kill state-stuck race fix.** Both `k` and `Shift+K` were
+  leaving the construct pane stuck at `[RUNNING]`. Race between
+  `Construct.kill()` and `_consume`'s `wait()` — both call
+  `proc.wait()` on the same Process; if wait() resumed first, it
+  correctly skipped DONE/FAILED overwrite (`_kill_requested` set)
+  but never wrote KILLED, so `_consume` emitted finalize with
+  `state="running"`. Fix in `Construct.wait()`: write KILLED
+  explicitly in the `_kill_requested + proc-died` branch.
+  Belt-and-suspenders with kill()'s own state-flip. Filed as a
+  gotcha (Async / subprocess section).
 
 Real-deck verified: spine 1-6, slice 2 LLM-authored tripwires
 (rung-1 fork + rung-2 fresh both work), file logger end-to-end,
@@ -87,22 +105,81 @@ magnified view + watchdog Q&A still see all event markers, y/Y
 yank against every focusable surface (chatlog, fleet/daemon/watchdog
 panes, ConstructPane, magnified view, list items), pool refill
 gate (target lowered + spawn doesn't refill above new target),
-mechanic attach (header pid discovery, log tailing, 2s heartbeat).
+mechanic attach (header pid discovery, log tailing, 2s heartbeat),
+Phase 8 bus subscriptions (every migrated path renders correctly
+in the chatlog), kill state transitions (k + Shift+K both move
+panes to `[KILLED]` + chatlog shows orange × glyph).
 
-**Next session picks up at: Spine Phase 8 cleanup.** Retire the
-deprecated `add_listener` / `on_event` / `on_change` callback shims
-now that every producer publishes through the bus. Last spine
-slice. ~30 LOC across producer modules + tui.py wiring; low-risk,
-mechanical.
+**Next session picks up at: 🚨🔥 SAFETY ARCHITECTURE PASS
+(CRITICAL CLUSTER).** Real-deck testing + log analysis on
+2026-04-30 (late) revealed the structural truth: **the brake
+hook is doing 95% of real safety work alone, and most other
+"safety" layers don't compose with it.** Tripwires today are
+observation-only stubs (the severity-driven escalation chain was
+the intended design but was never wired). Profiles are pure
+prescription with zero security weight. Watchdog has teeth only
+at spawn-time via Blacklist refusal. **If brake misses a pattern
+nothing else stops the call** — and brake misses an entire
+category (MCP tools, all of them: `mcp__claude_ai_Supabase__
+execute_sql`, Gmail send-after-auth, Drive write, Calendar — log-
+confirmed exposed to every construct under default brake). See
+`cyberdeck-state.md` "Safety architecture analysis" section for
+full layer breakdown + intended-vs-today comparison.
 
-After Phase 8, the queued slices in priority order:
-caliber selection (per-spawn model + effort + fast-mode — see
-`cyberdeck-model-effort-design.md`; phases 1-3 + 5 are shippable
-independently of quota awareness, phase 4 hard-blocks on
-build-plan item 13), then log-readability overhaul, then Mechanic
-v1 (LLM session half — supervisor process already exists from v0,
-just needs the on-demand LLM half attached), then Mechanic v0
-follow-ups (track non-construct subprocess sources).
+The pass is four composable slices, ship in this order:
+
+1. **🚨 MCP gating in `brake_hook.py`** (critical — closes widest
+   unprotected attack surface). Verb-based pattern matching:
+   default brake denies destructive verbs (`execute_*`, `apply_*`,
+   `send_*`, `delete_*`, `create_*`, `update_*`, `deploy_*`,
+   `drop_*`, `merge_*`, `migrate_*`, etc.) and allows read-shaped
+   (`get_*`, `list_*`, `search_*`). Per-spawn allowlist override
+   for explicit opt-in. ~30 LOC.
+2. **🔥 Tripwire escalation chain** (architectural unfinished
+   work). `low`=log only (current); `warning`=log + redirect via
+   brake-style denial on next tool call; `critical`=auto-term
+   with structured "why" bus event; `critical + bad enough`=
+   auto-term + auto-blacklist. Hybrid threshold: deterministic
+   floor + watchdog LLM judgment + 30s netrunner approval window.
+   Turns tripwires into INPUTS to the existing hard-gate layers.
+3. **Variable-outcome pause UX** (re-frame from netrunner).
+   Brake state determines DEFAULT ACTION; pause window is the
+   netrunner's chance to OVERRIDE. YOLO=pause-before-allowing,
+   Default=pause-before-denying-destructive,
+   Paranoid=pause-before-anything. Tool-calls bus-driven sticky
+   panel + Z-keybind to negate the default. Configurable in
+   Limits as `pause_window_seconds`, default 0. Subsumes the
+   original "review delay" filing AND parts of kill-deny-in-
+   flight-tool-calls AND sticky tool-call surface — one
+   mechanism, three problems.
+4. **DEFAULT_TRIPWIRES expansion + authoring prompt fix.** Default
+   set must include shell-destructive baselines (rm -rf, format,
+   dd, mkfs, fork bombs, shutdown). Authoring prompt forbids the
+   "brake handles X so tripwire skips X" antipattern (real-deck
+   observed: authoring negative-lookahead-EXCLUDED `rm -rf`
+   because "brake will block it" — exactly the antipattern that
+   defeats layered defense).
+
+Plus discrete bugs / observations from log analysis to land
+alongside the cluster:
+- **Enum payloads serialize as empty `{}`** in
+  `_serialize_payload` (3-line fix).
+- **Kill doesn't interrupt in-flight assistant turns** — model
+  finishes turn before SIGTERM lands.
+- **Daemon over-volunteers destructive content** (added
+  `shutdown -h now` unprompted to a rm-rf-style test).
+- **Construct refusal text buried in result event** — should be
+  a structured `kind=construct.refused`.
+- **~30k token cache miss per spawn** — system prompt drift
+  invalidates prompt cache.
+
+After the safety architecture pass, the queued slices in priority
+order: caliber selection (per-spawn model + effort + fast-mode —
+see `cyberdeck-model-effort-design.md`); daemon narrative fix
+(mislabel brake-hook denials as tripwire fires); log-readability
+overhaul; Mechanic v1 (LLM session half); Mechanic v0 follow-ups
+(track non-construct subprocess sources); Phase 8b (Pool + Daemon
+callback cleanup).
 
 ## Running it
 

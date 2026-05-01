@@ -412,26 +412,134 @@ natively, doesn't suffer chat context truncation.
   test verified the death-detect + cleanup path end-to-end.
   Known limitation: only constructs are tracked — daemon /
   watchdog Q&A / authoring one-shots / pool warmer subprocesses
-  still orphan their pre-mechanic way (filed as #5 in Next
-  Priorities). Full design at `cyberdeck-maintbot-design.md`.
+  still orphan their pre-mechanic way (filed as a follow-up in
+  Next Priorities). Full design at `cyberdeck-maintbot-design.md`.
+- ✓ Spine Phase 8 — cleanup (2026-04-30, late) — retired the
+  legacy `add_listener` / `remove_listener` / `on_event` /
+  `on_change` / `on_state_change` shims across five producers
+  (brake_state, profile_registry, plugin_registry, fleet,
+  connection_monitor) plus their consumers in tui.py and
+  daemon_session.py. Bus is now the only fan-out path; consumers
+  subscribe via `bus.subscribe(...)` with role-derived filters.
+  ~75 LOC net deletion. Three callback patterns deliberately NOT
+  migrated (Pool's on_event, Daemon's on_daemon_event, Blacklist's
+  on_event) — integration interfaces, not deprecated shims; filed
+  as Phase 8b candidates. **The unified-event-stream slice is now
+  complete (8/8 phases shipped).**
+- ✓ Kill state-stuck race fix (2026-04-30, late) — both `k` and
+  `Shift+K` were leaving the construct pane stuck at `[RUNNING]`.
+  Race between `Construct.kill()` and `_consume`'s `wait()`:
+  whichever resumed first when proc died determined whether the
+  finalize event carried `state="killed"` or `state="running"`.
+  Fix in `construct.wait()`: explicitly set `state=KILLED` in the
+  `_kill_requested + proc died` branch. Belt-and-suspenders with
+  kill()'s own state-flip. Real-deck verified.
 
-**Spine progress (2026-04-30): 7/8 phases shipped** — see
-`cyberdeck-event-stream-design.md`. Producer migration (Phase 1-5)
-plus chatlog reader migration (Phase 6) plus file logger + quit
-discipline (Phase 7a/7b). Cumulative result: every event source on
-the deck publishes through one canonical bus; bus.snapshot() is the
-single source of truth for chatlog readers; per-launch NDJSON files
-in `<deck source>/logs/` capture everything with self-describing
-header + footer; Ctrl+C-as-copy stops killing the deck (parent
-SIGINT swallow); smart Ctrl+Q with running-state guard. Phase 8
-(retire deprecated `add_listener`/`on_*` shims) is the last slice,
-queued behind Mechanic v0.
+**Spine progress (2026-04-30): 8/8 phases shipped (COMPLETE)** —
+see `cyberdeck-event-stream-design.md`. Producer migration (Phase
+1-5) plus chatlog reader migration (Phase 6) plus file logger +
+quit discipline (Phase 7a/7b) plus listener-shim cleanup (Phase 8).
+Cumulative result: every event source on the deck publishes
+through one canonical bus; bus.snapshot() is the single source of
+truth for chatlog readers; per-launch NDJSON files in `<deck
+source>/logs/` capture everything with self-describing header +
+footer; Ctrl+C-as-copy stops killing the deck (parent SIGINT
+swallow); smart Ctrl+Q with running-state guard; producers no
+longer maintain their own listener fan-out paths.
 
 **Next priorities:**
-1. **Spine phase 8 — cleanup.** Retire the deprecated `add_listener`
-   / `on_event` / `on_change` callback shims now that everyone
-   publishes through the bus. Last spine slice. ~30 LOC across the
-   producer modules + tui.py wiring. Low-risk, mechanical.
+
+1. **🚨🔥 SAFETY ARCHITECTURE PASS (CRITICAL CLUSTER).** Composable
+   set of slices addressing the structural truths surfaced by
+   2026-04-30 late real-deck testing + log analysis:
+   **brake hook is doing 95% of safety work alone**; tripwires are
+   observation-only stubs (the escalation chain was the intended
+   design but never wired); profiles are pure prescription with
+   zero security weight; if brake misses a pattern nothing else
+   stops it. See `cyberdeck-state.md` "Safety architecture
+   analysis" section for the full layer breakdown + intended-vs-
+   today comparison.
+
+   Four composable slices, ship in this order:
+
+   - **(a) 🚨 MCP gating in `brake_hook.py`** (closes critical
+     unprotected attack surface). Every construct currently
+     reaches the netrunner's full claude.ai MCP connector config
+     (Supabase `execute_sql` / `apply_migration`, Gmail `send`
+     after auth, Drive write, Calendar) — brake hook gates none
+     of them because patterns target tool NAMES (Bash/Edit/Write)
+     and `mcp__*__*` matches none. Verb-based pattern fix:
+     default brake denies destructive verbs (`execute_*`,
+     `apply_*`, `send_*`, `delete_*`, `create_*`, `update_*`,
+     `deploy_*`, `drop_*`, `merge_*`, `migrate_*`, `pause_*`,
+     `restore_*`, `reset_*`, `rebase_*`, `write_*`, `edit_*`),
+     allows read-shaped (`get_*`, `list_*`, `search_*`,
+     `describe_*`, `fetch_*`, `show_*`). Paranoid denies all
+     `mcp__*`. YOLO allows. Per-spawn allowlist override
+     (extend spawn-settings JSON with `mcp_allowed: [...]`) for
+     the explicit-opt-in case. ~30 LOC.
+   - **(b) 🔥 Tripwire escalation chain** (architectural
+     unfinished work; turns tripwires from observers into inputs
+     to brake/blacklist):
+     - `low` → log only (current behavior)
+     - `warning` → log + redirect construct with "why" via
+       brake-style denial on next tool call (reuses brake hook
+       mechanics; tripwire engine writes a denial-flag file the
+       hook reads)
+     - `critical` → log + auto-term construct; structured
+       `tripwire.auto_term` event published to bus carrying the
+       "why"
+     - `critical + "bad enough"` → auto-term + auto-blacklist
+     "Bad enough" threshold uses hybrid: deterministic floor
+     (specific tripwire NAMES like `credentials_exfiltration`,
+     `pii_leak`, `auth_bypass_attempt` always blacklist on
+     critical fire) + watchdog LLM judgment for gray zone (with
+     structured output) + 30s netrunner approval window before
+     any auto-blacklist commits (mirrors variable-outcome pause
+     UX in (c)).
+   - **(c) Variable-outcome pause UX** (re-frame from
+     netrunner). Brake state determines DEFAULT ACTION; pause
+     window is netrunner's chance to OVERRIDE. YOLO → pause-
+     before-allowing. Default → pause-before-denying-destructive.
+     Paranoid → pause-before-anything. Tool-calls bus-driven
+     sticky panel shows pending calls + countdown + Z-keybind to
+     negate the default. Brake hook delays N seconds
+     (configurable in Limits modal as `pause_window_seconds`,
+     default 0 = current behavior). Subsumes the original
+     "review delay" filing AND parts of kill-deny-in-flight-
+     tool-calls (kill-flag is one of the conditions evaluated
+     during the pause) AND sticky tool-call surface (the panel
+     IS the sticky surface). One mechanism, three problems
+     solved.
+   - **(d) DEFAULT_TRIPWIRES expansion + authoring prompt fix.**
+     Default set must include shell-destructive baselines
+     (rm -rf on system roots, format, dd of=/dev, mkfs, fork
+     bombs, shutdown) regardless of brake — depth-of-defense,
+     not depth-of-elision. `TRIPWIRE_AUTHORING_SYSTEM_PROMPT`
+     explicitly forbids the "brake handles X so tripwire skips
+     X" antipattern (real-deck observed: authoring negative-
+     lookahead-EXCLUDED `rm -rf` because "brake will block
+     destructive shapes" — exactly the antipattern that defeats
+     layered defense). Composes with (b): tripwires fire AND
+     escalate with the right pattern coverage.
+
+   Plus discrete bugs / observations from log analysis to land
+   alongside the cluster:
+   - **Enum payloads serialize as empty `{}`** in `_serialize_payload`
+     (3-line fix: `isinstance(payload, Enum)` check before
+     `__dict__` walk).
+   - **Kill doesn't interrupt in-flight assistant turns.** Kill
+     SIGTERM lands AFTER model finishes turn — token cost +
+     observable output continue post-kill. Stopping the model
+     itself requires stdin-injection or stream interrupt.
+   - **Daemon over-volunteers destructive content** (real-deck:
+     netrunner asked rm-rf-style test, daemon also added
+     `shutdown -h now` unprompted). Tighten daemon system prompt.
+   - **Construct refusal text buried in result event.** New
+     `kind=construct.refused` for distinct safety signal.
+   - **~30k token cache miss per spawn** (`cache_miss_reason:
+     system_changed`). Per-spawn system prompt drift; investigate
+     alongside caliber work.
 2. **Model + effort selection — "caliber" per spawn.** The daemon
    picks `--model` and `--effort` per construct based on task
    needs and remaining quota; the daemon's own caliber is markable
@@ -443,24 +551,35 @@ queued behind Mechanic v0.
    Five phases: phase 1 (caliber primitive + per-spawn plumbing),
    phase 2 (pool caliber + reuse), phase 3 (daemon caliber +
    override), phase 4 (quota-aware fallback — HARD-BLOCKED on
-   item 13 below), phase 5 (UI polish + introspection). Phases
+   item 14 below), phase 5 (UI polish + introspection). Phases
    1-3 + 5 are shippable independently of quota awareness. Full
    design at `cyberdeck-model-effort-design.md`.
-3. **Log-readability overhaul** — fleet/chatlog/watchdog/daemon
+3. **Daemon narrative fix — mislabels brake-hook denials as
+   tripwire fires.** Daemon's narrative conflates the two distinct
+   safety layers. Real-deck observed: daemon said "Tripwire fired
+   cleanly — PreToolUse hook denied the write" — when the actual
+   mechanism was the brake hook, no tripwires were involved.
+   Tighten daemon system prompt or outcome-format to distinguish
+   brake (`permission_denials` field on the result event,
+   rendered as `· brake blocked: Write×N`) from tripwires
+   (`tripwire.fire` events, rendered as `[tripwire]` chatlog
+   lines). Composable with the safety architecture pass — the
+   distinction matters more once tripwires actually escalate.
+4. **Log-readability overhaul** — fleet/chatlog/watchdog/daemon
    scattered across windows is hard to follow at a glance; needs
    structural thinking, not just CSS. Distinct from the file-log
    work in the spine slice (this is in-deck UI composition, not
    file shape). Composes better post-spine — display surfaces
    become "subscriber + filter + formatter" units, easier to
    rearrange.
-4. **Mechanic v1 — LLM session half.** Diagnose-only on-demand
+5. **Mechanic v1 — LLM session half.** Diagnose-only on-demand
    triage. Activates on heartbeat-fired unclean exit OR netrunner
    summon. Cloud Claude substrate; D1 eventual. Mechanic v0
    shipped 2026-04-30 — the supervisor process exists; v1 attaches
    the LLM session half to it. Ideally blocked on D1 (cost profile)
    but cloud Claude works as an interim substrate. Full design at
    `cyberdeck-maintbot-design.md`.
-5. **Mechanic v0 follow-ups — track non-construct subprocesses.**
+6. **Mechanic v0 follow-ups — track non-construct subprocesses.**
    Daemon, watchdog Q&A, watchdog authoring one-shots, and
    pool-warming subprocesses don't publish pids to the bus today;
    they orphan the same way they did before mechanic existed. One
@@ -468,14 +587,26 @@ queued behind Mechanic v0.
    `mechanic._apply_record` to track them. Trivial; defer until
    real-deck use surfaces a concrete orphan from one of those
    sources.
-6. Connection consequences round 2: daemon parking on connection-
+7. **Spine Phase 8b — Pool + Daemon callback cleanup.** Three
+   callback patterns survived Phase 8 because they're integration
+   interfaces, not deprecated shims: SessionPool's `on_event`
+   (publishes pool events to the bus from inside the handler —
+   migrating inverts producer/consumer), Daemon's
+   `on_daemon_event` (same shape), Blacklist's `on_event` in
+   watchdog.py (wired through the watchdog's own integration
+   surface). Migrating the first two to direct bus publishing
+   would complete the spine; Blacklist stays as the watchdog's
+   internal channel. Low-priority cleanup.
+8. Connection consequences round 2: daemon parking on connection-
    blocked spawns + recovery flow.
-7. Tripwires slice 3 — severity-aware rendering (critical pulls
+9. Tripwires slice 3 — severity-aware rendering (critical pulls
    focus, warning badges, low logs only). Severity tiers are
-   already in the DSL; just need the visual routing. Trivial under
-   the spine — one filter predicate per severity-bucket.
-8. Tools-research chat (from `cyberdeck-tools-research-seed.md`).
-9. Plugin sub-features: airgap `p`, quickfire `c`, picker `Shift+C`.
+   already in the DSL; just need the visual routing. Composes with
+   safety architecture pass item 1(b) — once tripwires escalate,
+   the visual tier matters more.
+10. Tools-research chat (from `cyberdeck-tools-research-seed.md`).
+11. Plugin sub-features: airgap `p`, quickfire `c`, picker
+    `Shift+C`.
 
 (Keymap revision pass was tee'd up here on 2026-04-27 but moved to
 deferred mid-design — needs more brain cells to do well than were
