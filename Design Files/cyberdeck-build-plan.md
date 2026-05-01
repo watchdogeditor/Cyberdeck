@@ -434,6 +434,26 @@ natively, doesn't suffer chat context truncation.
   Fix in `construct.wait()`: explicitly set `state=KILLED` in the
   `_kill_requested + proc died` branch. Belt-and-suspenders with
   kill()'s own state-flip. Real-deck verified.
+- ✓ Safety Architecture Pass slice 1/4: MCP gating in brake_hook
+  (2026-04-30, late) — verb-based pattern matching for `mcp__*`
+  tools. `MCP_READ_VERBS` (20 verbs: get, list, search, describe,
+  fetch, show, read, view, peek, check, validate, inspect, find,
+  query, lookup, count, exists, has, is, diff) allowed under
+  default. `MCP_DESTRUCTIVE_VERBS` (~70 verbs incl. execute,
+  apply, send, delete, create, update, deploy, drop, merge,
+  migrate, pause, restore, reset, rebase, authenticate, etc.)
+  denied under default. Unknown verbs default-deny (safer to
+  require explicit categorization than auto-allow new MCP tools).
+  Paranoid denies ALL `mcp__*` wholesale. YOLO unchanged (no
+  hook). +90 LOC in `brake_hook.py`. Real-deck verified end-to-
+  end across all five paths (default+read, default+write,
+  paranoid+read, yolo+read, yolo+write) against the netrunner's
+  actual connected Supabase/Gmail/Drive/Calendar MCP servers.
+  Per-spawn allowlist override deferred to follow-up — needs UI
+  design that composes with the variable-outcome pause UX. Closes
+  the widest unprotected attack surface; the LOOM v6 production
+  database in particular was reachable via execute_sql until
+  this slice shipped.
 
 **Spine progress (2026-04-30): 8/8 phases shipped (COMPLETE)** —
 see `cyberdeck-event-stream-design.md`. Producer migration (Phase
@@ -449,9 +469,9 @@ longer maintain their own listener fan-out paths.
 
 **Next priorities:**
 
-1. **🚨🔥 SAFETY ARCHITECTURE PASS (CRITICAL CLUSTER).** Composable
-   set of slices addressing the structural truths surfaced by
-   2026-04-30 late real-deck testing + log analysis:
+1. **🔥 SAFETY ARCHITECTURE PASS (in progress — 1/4 shipped).**
+   Composable set of slices addressing the structural truths
+   surfaced by 2026-04-30 late real-deck testing + log analysis:
    **brake hook is doing 95% of safety work alone**; tripwires are
    observation-only stubs (the escalation chain was the intended
    design but never wired); profiles are pure prescription with
@@ -460,24 +480,13 @@ longer maintain their own listener fan-out paths.
    analysis" section for the full layer breakdown + intended-vs-
    today comparison.
 
-   Four composable slices, ship in this order:
+   Slice progress:
 
-   - **(a) 🚨 MCP gating in `brake_hook.py`** (closes critical
-     unprotected attack surface). Every construct currently
-     reaches the netrunner's full claude.ai MCP connector config
-     (Supabase `execute_sql` / `apply_migration`, Gmail `send`
-     after auth, Drive write, Calendar) — brake hook gates none
-     of them because patterns target tool NAMES (Bash/Edit/Write)
-     and `mcp__*__*` matches none. Verb-based pattern fix:
-     default brake denies destructive verbs (`execute_*`,
-     `apply_*`, `send_*`, `delete_*`, `create_*`, `update_*`,
-     `deploy_*`, `drop_*`, `merge_*`, `migrate_*`, `pause_*`,
-     `restore_*`, `reset_*`, `rebase_*`, `write_*`, `edit_*`),
-     allows read-shaped (`get_*`, `list_*`, `search_*`,
-     `describe_*`, `fetch_*`, `show_*`). Paranoid denies all
-     `mcp__*`. YOLO allows. Per-spawn allowlist override
-     (extend spawn-settings JSON with `mcp_allowed: [...]`) for
-     the explicit-opt-in case. ~30 LOC.
+   - ~~**(a) MCP gating in `brake_hook.py`**~~ ✅ shipped
+     2026-04-30 (late). Verb-based pattern matching landed; +90
+     LOC; real-deck verified end-to-end. Per-spawn allowlist
+     override deferred to compose with slice (c). See "Post-
+     migration shipped" entry above.
    - **(b) 🔥 Tripwire escalation chain** (architectural
      unfinished work; turns tripwires from observers into inputs
      to brake/blacklist):

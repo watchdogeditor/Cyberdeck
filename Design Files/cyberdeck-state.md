@@ -27,37 +27,53 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** **SAFETY ARCHITECTURE PASS** — composable cluster
-addressing the structural truth surfaced by 2026-04-30 late
-real-deck testing + log analysis. **The brake hook is doing 95%
-of real safety work; most other "safety" layers don't compose
-with it.** Tripwires are observation-only (the escalation chain
-was the intended design but never wired). Profiles are pure
-prescription (zero security weight). Watchdog has teeth only at
-spawn-time via Blacklist refusal. If brake misses a pattern,
-nothing else stops the call — and brake misses an entire
-category (MCP tools, all of them). See the **Safety architecture
-analysis** section below for full layer breakdown.
+**Up next:** **SAFETY ARCHITECTURE PASS** (in progress — slice
+1/4 shipped 2026-04-30 late). Composable cluster addressing the
+structural truth surfaced by real-deck testing + log analysis:
+**the brake hook is doing 95% of real safety work; most other
+"safety" layers don't compose with it.** Tripwires are
+observation-only (the escalation chain was the intended design
+but never wired). Profiles are pure prescription (zero security
+weight). Watchdog has teeth only at spawn-time via Blacklist
+refusal. See the **Safety architecture analysis** section below
+for full layer breakdown.
 
-Four composable slices in priority order:
+Four composable slices, current state:
 
-1. **🚨 MCP gating in `brake_hook.py`** (CRITICAL — closes widest
-   unprotected attack surface). Every construct gets full access
-   to the netrunner's claude.ai MCP connector config (Supabase
-   `execute_sql` / `apply_migration`, Gmail `send` after auth,
-   Drive write, Calendar — confirmed via real-deck log lines 28+,
-   37, 44). brake_hook patterns target tool names like Bash /
-   Write / Edit; `mcp__*__*` matches NONE of them. Today's only
-   safety against rogue MCP usage is Claude's own refusal layer.
-   Fix: verb-based pattern matching. Default brake denies
-   `mcp__*__execute_*`, `apply_*`, `send_*`, `delete_*`,
-   `create_*`, `update_*`, `deploy_*`, `drop_*`, `merge_*`,
-   `migrate_*`, `pause_*`, `restore_*`, `reset_*`, `rebase_*`,
-   `write_*`, `edit_*`. Allows read-shaped (`get_*`, `list_*`,
-   `search_*`, `describe_*`, `fetch_*`, `show_*`). Paranoid
-   denies all `mcp__*`. YOLO allows. Per-spawn allowlist override
-   for explicit opt-in (e.g., a "supabase_admin" profile spawn).
-   ~30 LOC.
+1. **✅ MCP gating in `brake_hook.py`** — SHIPPED 2026-04-30 (late).
+   Verb-based pattern matching added: `MCP_READ_VERBS` (get, list,
+   search, describe, fetch, show, read, view, peek, check,
+   validate, inspect, find, query, lookup, count, exists, has,
+   is, diff) and `MCP_DESTRUCTIVE_VERBS` (execute, apply, send,
+   delete, create, update, deploy, drop, merge, migrate, pause,
+   restore, reset, rebase, write, edit, kill, terminate, cancel,
+   abort, remove, destroy, purge, clear, revoke, archive,
+   unarchive, transfer, move, rename, replace, override, add,
+   save, post, patch, put, push, publish, install, uninstall,
+   enable, disable, start, stop, run, invoke, authenticate,
+   authorize, login, logout, complete, confirm, approve, reject,
+   lock, unlock, grant, deny, subscribe, unsubscribe, schedule,
+   trigger, fire, build, compile, release, upload, download).
+   `extract_mcp_verb` parses `mcp__<server>__<verb>_<noun>` and
+   returns the verb. Default brake denies destructive + unknown
+   verbs (default-deny is intentional — new MCP servers should
+   require explicit categorization in brake_hook.py rather than
+   auto-flowing through). Paranoid denies ALL `mcp__*` wholesale
+   (even read-shaped MCP is a network query against an external
+   service). YOLO unchanged (no hook installed). +90 LOC, no
+   regressions on non-MCP tools. Real-deck verified against all
+   34 of the netrunner's connected MCP tools (Supabase / Gmail /
+   Drive / Calendar): 13 allow, 21 deny under default; all 34
+   deny under paranoid; all 34 allow under YOLO. End-to-end
+   construct-level test confirmed via the netrunner's actual
+   Supabase project (read calls executed, writes denied with
+   the new error message, paranoid mode blocked reads, YOLO
+   bypassed everything as designed).
+
+   Per-spawn allowlist override (netrunner explicitly opts a
+   construct into a normally-denied verb) is filed as a
+   follow-up — needs UI design (probably composes with the
+   variable-outcome pause UX in slice 3).
 
 2. **🔥 Tripwire escalation chain** — the architectural unfinished
    work. Tripwires today are pure observers; the netrunner's

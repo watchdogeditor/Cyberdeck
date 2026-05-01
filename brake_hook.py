@@ -158,6 +158,93 @@ WRITE_INDICATOR_TOKENS = (
 )
 
 
+# -- MCP tool gating ---------------------------------------------------------
+#
+# MCP tools (mcp__<server>__<verb>_<noun>) come from the netrunner's
+# claude.ai connector config — Supabase, Gmail, Drive, Calendar, etc.
+# The brake hook's existing patterns target tool NAMES (Bash, Edit,
+# Write, etc.) literally, so mcp__* tools matched none of them and
+# sailed through under default brake unrestricted. Real-deck-discovered
+# 2026-04-30 (late) via per-launch log analysis: any default-brake
+# construct could call mcp__claude_ai_Supabase__execute_sql,
+# mcp__claude_ai_Gmail__send (after auth), mcp__claude_ai_Google_Drive__*
+# etc. Today's only defense was Claude's own refusal layer; the brake
+# hook contributed nothing.
+#
+# This addition gates MCP tools by extracting the verb from the tool
+# name and bucketing into read-shaped (allow under default) vs.
+# destructive (deny). Unknown verbs default-deny: safer to require
+# explicit categorization than to allow new MCP tools implicitly as
+# the connector ecosystem evolves. Paranoid denies ALL mcp__* wholesale
+# (handled in check_paranoid below) — even read-shaped MCP is a
+# network-side-effecting query, which paranoid says no to.
+#
+# Per-spawn allowlist override (netrunner explicitly opts a construct
+# into a normally-denied MCP tool) is filed as a follow-up. v1 here is
+# the categorical defense.
+
+# Verbs that READ from the connected service. Allowed under default
+# brake. Conservative on purpose — when a verb is ambiguous (could be
+# read OR write), it does NOT go in this set; ambiguous lands as
+# "unknown" → deny.
+MCP_READ_VERBS = frozenset({
+    "get", "list", "search", "describe", "fetch", "show", "read",
+    "view", "peek", "check", "validate", "inspect", "find", "query",
+    "lookup", "count", "exists", "has", "is", "diff",
+})
+
+# Verbs that WRITE TO or otherwise CAUSE SIDE EFFECTS in the connected
+# service. Denied under default brake. Comprehensive on purpose: when
+# in doubt, it goes here. The cost of denying a legitimate-but-
+# uncategorized verb is "construct gets a tool error and the netrunner
+# sees the denial reason"; the cost of allowing one is potentially
+# arbitrary destructive action against a connected production service
+# (Supabase database, Gmail send, etc.).
+MCP_DESTRUCTIVE_VERBS = frozenset({
+    "execute", "apply", "send", "delete", "create", "update", "deploy",
+    "drop", "merge", "migrate", "pause", "restore", "reset", "rebase",
+    "write", "edit", "kill", "terminate", "cancel", "abort", "remove",
+    "destroy", "purge", "clear", "revoke", "archive", "unarchive",
+    "transfer", "move", "rename", "replace", "override", "add",
+    "save", "post", "patch", "put", "push", "publish", "install",
+    "uninstall", "enable", "disable", "start", "stop", "run", "invoke",
+    "authenticate", "authorize", "login", "logout", "complete",
+    "confirm", "approve", "reject", "lock", "unlock", "grant", "deny",
+    "subscribe", "unsubscribe", "schedule", "trigger", "fire",
+    "build", "compile", "release", "upload", "download",
+})
+
+
+def extract_mcp_verb(tool_name: str):
+    """Extract the verb from an mcp__<server>__<verb>_<noun>-style
+    tool name. Returns the verb (lowercased) or None if not an MCP
+    tool or if the structure doesn't yield a clear verb token.
+
+    Examples:
+      mcp__claude_ai_Supabase__execute_sql → 'execute'
+      mcp__claude_ai_Gmail__send_message   → 'send'
+      mcp__server__list_branches           → 'list'
+      mcp__server__authenticate            → 'authenticate'
+      Bash                                  → None
+
+    The tool-name format is established by Claude Code's MCP wiring:
+    `mcp__<server>__<verb>[_<rest>]`. The double-underscore segment
+    boundary is reliable; within the verb-and-rest tail, the first
+    single-underscore-bounded token is the verb.
+    """
+    if not tool_name.startswith("mcp__"):
+        return None
+    # Split on double-underscore. parts[0] = "mcp", parts[1] = server,
+    # parts[2] = verb_and_rest. Limit splits so server names containing
+    # double-underscores (unlikely but possible) don't break.
+    parts = tool_name.split("__", 2)
+    if len(parts) < 3 or not parts[2]:
+        return None
+    rest = parts[2]
+    verb = rest.split("_", 1)[0].lower()
+    return verb if verb else None
+
+
 def has_write_indicator(cmd: str) -> bool:
     """True if `cmd` contains a redirect operator or a known
     file-modifying utility/cmdlet token. Word-boundary matched on
@@ -370,12 +457,26 @@ def check_paranoid(tool: str, inp: dict) -> tuple[bool, str]:
     equivalent shells from a "construct can act on the system"
     perspective, and a construct denied one will silently route to
     the other unless both are gated. Don't let the brake be a soft
-    request that the construct can negotiate with."""
+    request that the construct can negotiate with.
+
+    All `mcp__*` tools are denied under paranoid regardless of verb.
+    Even read-shaped MCP (`get_*`, `list_*`, etc.) is a network query
+    against an external connected service — paranoid is "no external
+    side effects, no external traffic," and querying a Supabase
+    project is still talking to a Supabase project. Constructs can
+    still use Read/Glob/Grep/WebSearch on the local workspace and
+    reason about what they find."""
     if tool in PARANOID_DENY_TOOLS:
         return True, (
             f"PARANOID brake: {tool} is not permitted in this mode. "
             f"Switch to default brake (b key) if you need to act on "
             f"the system."
+        )
+    if tool.startswith("mcp__"):
+        return True, (
+            f"PARANOID brake: MCP tool {tool} denied (no external "
+            f"connector traffic permitted in paranoid mode). Switch "
+            f"to default brake (b key) for read-shaped MCP access."
         )
     return False, ""
 
@@ -383,7 +484,8 @@ def check_paranoid(tool: str, inp: dict) -> tuple[bool, str]:
 def check_default(tool: str, inp: dict) -> tuple[bool, str]:
     """Returns (deny, reason). Default is opinionated permissive: deny
     Write/Edit to OS roots and the deck source, deny destructive bash
-    patterns, allow everything else."""
+    patterns, gate MCP tools by verb (read-shaped allowed, destructive
+    denied, unknown denied), allow everything else."""
     if tool in ("Write", "Edit"):
         path = str(inp.get("file_path", ""))
         if path_is_protected(path):
@@ -414,6 +516,35 @@ def check_default(tool: str, inp: dict) -> tuple[bool, str]:
             return True, (
                 f"DEFAULT brake: {tool} command denied ({label}): {preview}"
             )
+    elif tool.startswith("mcp__"):
+        # MCP tool gating — verb-based bucketing. See the MCP_*_VERBS
+        # constants above for the rationale + categorization. Default-
+        # deny on unknown verbs is intentional: when a new MCP server
+        # gets connected to claude.ai, its tools should require explicit
+        # categorization in this file rather than auto-flowing through.
+        verb = extract_mcp_verb(tool)
+        if verb is None:
+            return True, (
+                f"DEFAULT brake: MCP tool {tool} denied (unrecognized "
+                f"name structure; cannot determine read vs. destructive). "
+                f"Expected mcp__<server>__<verb>_<noun> format."
+            )
+        if verb in MCP_DESTRUCTIVE_VERBS:
+            return True, (
+                f"DEFAULT brake: MCP tool {tool} denied (verb '{verb}' "
+                f"is destructive / side-effecting). Read-shaped MCP "
+                f"verbs (get_*, list_*, search_*, etc.) are allowed; "
+                f"this one isn't."
+            )
+        if verb not in MCP_READ_VERBS:
+            return True, (
+                f"DEFAULT brake: MCP tool {tool} denied (verb '{verb}' "
+                f"not in read-only allowlist; default-deny for unknown "
+                f"verbs). If this verb is genuinely read-only, add it "
+                f"to MCP_READ_VERBS in brake_hook.py."
+            )
+        # Verb is in MCP_READ_VERBS — allow. Fall through to the
+        # default-allow return at the bottom.
     return False, ""
 
 

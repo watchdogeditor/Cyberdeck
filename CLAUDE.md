@@ -110,31 +110,26 @@ Phase 8 bus subscriptions (every migrated path renders correctly
 in the chatlog), kill state transitions (k + Shift+K both move
 panes to `[KILLED]` + chatlog shows orange × glyph).
 
-**Next session picks up at: 🚨🔥 SAFETY ARCHITECTURE PASS
-(CRITICAL CLUSTER).** Real-deck testing + log analysis on
+**Next session picks up at: 🔥 SAFETY ARCHITECTURE PASS (1/4
+shipped, slice 2 next).** Real-deck testing + log analysis on
 2026-04-30 (late) revealed the structural truth: **the brake
 hook is doing 95% of real safety work alone, and most other
 "safety" layers don't compose with it.** Tripwires today are
 observation-only stubs (the severity-driven escalation chain was
 the intended design but was never wired). Profiles are pure
 prescription with zero security weight. Watchdog has teeth only
-at spawn-time via Blacklist refusal. **If brake misses a pattern
-nothing else stops the call** — and brake misses an entire
-category (MCP tools, all of them: `mcp__claude_ai_Supabase__
-execute_sql`, Gmail send-after-auth, Drive write, Calendar — log-
-confirmed exposed to every construct under default brake). See
-`cyberdeck-state.md` "Safety architecture analysis" section for
-full layer breakdown + intended-vs-today comparison.
+at spawn-time via Blacklist refusal. See `cyberdeck-state.md`
+"Safety architecture analysis" section for full layer breakdown.
 
-The pass is four composable slices, ship in this order:
+Pass progress:
 
-1. **🚨 MCP gating in `brake_hook.py`** (critical — closes widest
-   unprotected attack surface). Verb-based pattern matching:
-   default brake denies destructive verbs (`execute_*`, `apply_*`,
-   `send_*`, `delete_*`, `create_*`, `update_*`, `deploy_*`,
-   `drop_*`, `merge_*`, `migrate_*`, etc.) and allows read-shaped
-   (`get_*`, `list_*`, `search_*`). Per-spawn allowlist override
-   for explicit opt-in. ~30 LOC.
+1. ~~**MCP gating in `brake_hook.py`**~~ ✅ SHIPPED 2026-04-30
+   (late). Verb-based pattern matching: default brake denies
+   destructive + unknown verbs, allows read-shaped (get/list/
+   search/etc.). Paranoid denies ALL `mcp__*`. +90 LOC; real-deck
+   verified across the netrunner's actual Supabase/Gmail/Drive/
+   Calendar connectors. The `execute_sql`-against-LOOM-production
+   surface is closed.
 2. **🔥 Tripwire escalation chain** (architectural unfinished
    work). `low`=log only (current); `warning`=log + redirect via
    brake-style denial on next tool call; `critical`=auto-term
