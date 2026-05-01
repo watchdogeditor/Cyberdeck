@@ -3112,6 +3112,18 @@ class CyberdeckApp(App):
         # not observers. See `Design Files/cyberdeck-event-stream-
         # design.md` for the full migration plan.
         self.bus = EventBus()
+        # Subscription handles for the two _drive_fleet-scoped bus
+        # subscribers (_handle_event, _scan_for_tripwires). Stored on
+        # self so each new _drive_fleet invocation can unsubscribe the
+        # prior ones before re-subscribing. Without this, every
+        # _drive_fleet call (initial + post-EJECT respawn) accumulated
+        # a NEW subscription, so each fleet event fired the handler
+        # multiple times — visible as duplicate construct panes (one
+        # stuck at [STARTING] forever per ghost subscription) and
+        # double-fired tripwire scans. Bug latent since Phase 8;
+        # caught real-deck 2026-04-30 late.
+        self._fleet_event_sub: Optional[Any] = None
+        self._fleet_tripwire_scan_sub: Optional[Any] = None
         # Phase 7 file logger gets instantiated at the end of __init__
         # (after brake_state_store has loaded from disk) so the header
         # captures the real brake state, not a placeholder. We
@@ -3882,10 +3894,28 @@ class CyberdeckApp(App):
         # Phase 8: subscribe via the bus instead of fleet.add_listener.
         # `fleet.*` matches every dotted-namespace fleet kind
         # (fleet.spawn, fleet.finalize, fleet.event, fleet.run_start,
-        # fleet.run_end, fleet.spawn_blocked, fleet.spawn_failed).
-        # Both handlers receive a DeckEvent whose payload is the
-        # FleetEvent.
-        self.bus.subscribe(
+        # fleet.run_end, fleet.spawn_blocked, fleet.spawn_failed,
+        # fleet.kill_requested). Both handlers receive a DeckEvent
+        # whose payload is the FleetEvent.
+        #
+        # Unsubscribe prior handles before re-subscribing — _drive_fleet
+        # is called once at startup AND again after EJECT respawn.
+        # Without this, accumulated subscriptions caused the spawn
+        # handler to fire N times per event, mounting N panes per
+        # construct (the others stuck at [STARTING] forever as
+        # orphans because self.panes[cid] gets overwritten). Real-
+        # deck-caught 2026-04-30 late.
+        if self._fleet_event_sub is not None:
+            try:
+                self._fleet_event_sub.unsubscribe()
+            except Exception:
+                pass
+        if self._fleet_tripwire_scan_sub is not None:
+            try:
+                self._fleet_tripwire_scan_sub.unsubscribe()
+            except Exception:
+                pass
+        self._fleet_event_sub = self.bus.subscribe(
             self._handle_event,
             filter=["fleet.*"],
             name="tui.fleet_event",
@@ -3895,7 +3925,7 @@ class CyberdeckApp(App):
         # the main event handler so the engine can be wrapped/replaced
         # without touching chatlog rendering. Per spec, the watchdog
         # owns the engine; Fleet stays ignorant of tripwires.
-        self.bus.subscribe(
+        self._fleet_tripwire_scan_sub = self.bus.subscribe(
             self._scan_for_tripwires,
             filter=["fleet.*"],
             name="tui.fleet_tripwire_scan",
@@ -5193,6 +5223,25 @@ class CyberdeckApp(App):
         injected_from: Optional[str] = None,
         profile_name: Optional[str] = None,
     ) -> None:
+        # Defensive idempotency: if a pane already exists for this
+        # construct_id, don't create another. Belt-and-suspenders
+        # against accumulated bus subscriptions firing _handle_event
+        # multiple times for the same spawn (real-deck-caught
+        # 2026-04-30 late — Phase 8 subscriptions were leaking on
+        # _drive_fleet re-runs, fixed at the subscribe site too).
+        # Surface the duplicate via the chatlog so any future
+        # accidental double-fire is immediately visible rather than
+        # silently mounting orphan panes.
+        if construct_id in self.panes:
+            try:
+                self._chatlog_write(
+                    f"[red]× double-spawn detected[/red] for "
+                    f"[cyan]{construct_id}[/cyan] — pane reused; "
+                    f"investigate bus subscription accumulation"
+                )
+            except Exception:
+                pass
+            return
         pane = ConstructPane(
             construct_id, task,
             injected_from=injected_from,
