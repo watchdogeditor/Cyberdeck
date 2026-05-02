@@ -592,19 +592,21 @@ longer maintain their own listener fan-out paths.
      out. ~600 LOC across construct.py is untouched, brake_state.py,
      brake_hook.py, brake_delay.py (new), tui.py.
 
-   - **(c) Phase 1.5: persist delay_window_seconds across deck
-     restarts.** Real-deck-caught 2026-05-01: netrunner set
-     delay=N, deck restarted (intentionally for second test),
-     delay reset to 0. Brake ran in pure pre-slice-3 mode for
-     the second test; netrunner had to remember to re-set the
-     delay. Same shape as brake_state.json — persist
-     `delay_window_seconds` in the same `<home>/.cyberdeck/state.
-     json` file (or alongside) so the netrunner's last setting
-     survives a launch. Tiny addition (~30 LOC: extend
-     BrakeStateStore.load/save or add a similar mechanism).
-     Pairs with the wedge_timeout_seconds setting which has the
-     same property — both are runtime tunables that should
-     persist. Could land alongside this or as a follow-up.
+   - ~~**(c) Phase 1.5: persist limits tunables across deck
+     restarts**~~ ✅ SHIPPED 2026-05-01. Both `delay_window_
+     seconds` and `wedge_timeout_seconds` now persist in the
+     same `<home>/.cyberdeck/state.json` file as brake state,
+     under a sibling `limits` namespace. New helpers in
+     `brake_state.py`: `load_limits(state_path) -> dict` reads
+     the namespace at App startup; `save_limits(state_path,
+     **values)` does a read-merge-write on Limits modal submit.
+     BrakeStateStore._save extended to preserve sibling keys
+     so brake saves and limits saves don't clobber each other.
+     Round-trip tested. max_concurrent / max_total_spawns /
+     pool_size deliberately NOT persisted — they're session-
+     scoped (netrunner sets caps for this goal; next session
+     may want different caps). +~80 LOC across brake_state.py
+     + tui.py.
 
    - **(c) Phase 2: blacklist-proposal composition + attention-
      needed area** — DEFERRED. Two pieces that compose naturally:

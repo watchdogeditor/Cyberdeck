@@ -66,7 +66,10 @@ from logger import DeckLogger
 from connection_monitor import (
     ConnectionMonitor, ConnectionState, StateChangeEvent,
 )
-from brake_state import BrakeState, BrakeStateStore, BrakeChangeEvent
+from brake_state import (
+    BrakeState, BrakeStateStore, BrakeChangeEvent,
+    load_limits, save_limits,
+)
 from brake_delay import (
     DelayEntry, DelayResolution, DelayMonitor,
     write_delay_override,
@@ -3445,6 +3448,28 @@ class CyberdeckApp(App):
         # any spawn (including the initial pool warm-up) sees the
         # netrunner's last-set brake from disk, not the cold default.
         self.brake_state_store.load()
+        # Phase 1.5 of the safety architecture pass: persist the
+        # runtime tunables (delay_window_seconds, wedge_timeout_
+        # seconds) so a deck restart doesn't lose the netrunner's
+        # last-set values. Loaded from the same state.json file as
+        # brake; missing keys leave the App-init values (= the
+        # CyberdeckApp.__init__ defaults of 0.0 and 30.0
+        # respectively) in place. No-op on a fresh install — the
+        # file doesn't exist yet, so we use the defaults.
+        try:
+            persisted = load_limits(
+                self.home_dir / ".cyberdeck" / "state.json"
+            )
+            dw = persisted.get("delay_window_seconds")
+            if isinstance(dw, (int, float)) and dw >= 0:
+                self.delay_window_seconds = float(dw)
+            wt = persisted.get("wedge_timeout_seconds")
+            if isinstance(wt, (int, float)) and wt >= 0:
+                self.wedge_timeout_seconds = float(wt)
+        except Exception:
+            # load_limits is already best-effort, but wrap one more
+            # layer here so a malformed entry can't break startup.
+            pass
         # Phase 8 of the unified-event-stream slice: subscribe via the
         # bus instead of the legacy `on_change=` callback. The handler
         # receives a DeckEvent whose payload is the BrakeChangeEvent.
@@ -8610,6 +8635,22 @@ class CyberdeckApp(App):
 
         if not changes:
             return
+
+        # Phase 1.5: persist the runtime tunables so a deck restart
+        # doesn't lose the netrunner's just-submitted values. Only
+        # delay_window_seconds + wedge_timeout_seconds are persisted —
+        # max_concurrent / max_total_spawns / pool_size are
+        # session-scoped (the netrunner sets caps for THIS goal; the
+        # next session might want different caps). save_limits is
+        # best-effort; failures don't block the in-session apply.
+        try:
+            save_limits(
+                self.home_dir / ".cyberdeck" / "state.json",
+                delay_window_seconds=self.delay_window_seconds,
+                wedge_timeout_seconds=self.wedge_timeout_seconds,
+            )
+        except Exception:
+            pass
 
         # Surface changes in the fleet log so the netrunner has a
         # record of when caps moved and what they moved to.

@@ -204,19 +204,133 @@ class BrakeStateStore:
         still authoritative for the current session, and the next
         successful set() will retry the save.
 
-        Schema is namespaced under a 'brake' key so other deck-global
-        state can join state.json later without a format break.
+        Preserves any other top-level keys in state.json (e.g. the
+        'limits' namespace populated by save_limits) so the brake
+        save doesn't clobber sibling state. Read-merge-write
+        pattern; safe against concurrent writers because the deck
+        is single-writer per home dir.
         """
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = {}
+            if self.state_path.is_file():
+                try:
+                    with self.state_path.open("r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        existing = loaded
+                except (OSError, json.JSONDecodeError):
+                    # Corrupted file — overwrite cleanly. The brake
+                    # is the only key we care about preserving on a
+                    # corrupt read; sibling namespaces are best-effort.
+                    pass
+            existing["brake"] = self._state.value
             with self.state_path.open("w", encoding="utf-8") as f:
-                json.dump({"brake": self._state.value}, f, indent=2)
+                json.dump(existing, f, indent=2)
         except OSError as exc:
             print(
                 f"brake_state: could not save {self.state_path}: "
                 f"{exc!r} — state will not persist across restart",
                 file=sys.stderr,
             )
+
+
+# ---- limits persistence ----------------------------------------------------
+#
+# Phase 1.5 of the safety architecture pass (filed 2026-05-01 after
+# real-deck friction): runtime tunables set via the Limits modal —
+# `delay_window_seconds`, `wedge_timeout_seconds` — should survive
+# deck restarts. Without this, the netrunner has to re-set the delay
+# every launch, and a one-off restart (EJECT, crash, manual quit) loses
+# the configuration entirely.
+#
+# Lives in the same `state.json` file as brake to keep the deck-global
+# config surface in one place. Schema:
+#
+#   {
+#     "brake": "default",
+#     "limits": {
+#       "delay_window_seconds": 10.0,
+#       "wedge_timeout_seconds": 30.0,
+#       ... (future tunables go here)
+#     }
+#   }
+#
+# Free functions rather than a sibling class because the limits don't
+# need a listener fan-out — the Limits modal calls save_limits()
+# directly when it commits, and the App reads load_limits() once at
+# startup. Keeping the surface tiny lets future tunables join the
+# `limits` dict without designing a generic store.
+
+
+def load_limits(state_path: Path) -> dict:
+    """Read the limits namespace from state.json. Returns an empty
+    dict if the file is missing, unreadable, malformed, or doesn't
+    have a 'limits' key — caller falls back to whatever defaults the
+    App was constructed with.
+
+    Best-effort: limits are non-essential for boot. A corrupt file
+    means "use defaults," not "refuse to launch."
+    """
+    state_path = Path(state_path)
+    if not state_path.is_file():
+        return {}
+    try:
+        with state_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        limits = data.get("limits")
+        return limits if isinstance(limits, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"brake_state: could not load limits from {state_path}: "
+            f"{exc!r} — using App defaults for this session",
+            file=sys.stderr,
+        )
+        return {}
+
+
+def save_limits(state_path: Path, **values) -> None:
+    """Update the limits namespace in state.json. Reads-merges-writes
+    so the brake key + any future siblings survive. `values` are
+    written into the limits dict; pass only the keys the netrunner
+    just changed (caller decides — full overwrite vs delta is up to
+    them; this function just does an in-place dict.update).
+
+    Best-effort: failures log to stderr but never raise. The in-memory
+    values still apply for the current session; the next successful
+    save retries.
+    """
+    state_path = Path(state_path)
+    if not values:
+        return
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        if state_path.is_file():
+            try:
+                with state_path.open("r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (OSError, json.JSONDecodeError):
+                # Same handling as BrakeStateStore._save: overwrite
+                # cleanly on corrupt read. Limits are best-effort.
+                pass
+        limits = existing.get("limits")
+        if not isinstance(limits, dict):
+            limits = {}
+        limits.update(values)
+        existing["limits"] = limits
+        with state_path.open("w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2)
+    except OSError as exc:
+        print(
+            f"brake_state: could not save limits to {state_path}: "
+            f"{exc!r} — values will not persist across restart",
+            file=sys.stderr,
+        )
 
 
 # ---- spawn-settings generation ------------------------------------------------

@@ -186,6 +186,18 @@ make_spawn_settings; YOLO short-circuit lifted), brake_hook.py
 + handlers + refresh timer + X keybind + Limits field). All compile-
 clean, signatures verified. Real-deck verification pending.
 
+**✅ SLICE 3 PHASE 1.5 — limits persistence** shipped 2026-05-01
+(uncommitted as of this CLAUDE.md update). Both `delay_window_
+seconds` and `wedge_timeout_seconds` now survive deck restarts.
+New `brake_state.load_limits` / `save_limits` helpers store under
+a `limits` namespace in the same state.json that holds brake;
+read-merge-write so brake + limits saves don't clobber each
+other. Round-trip tested. max_concurrent / max_total_spawns /
+pool_size stay session-scoped (different rationale: netrunner
+sets caps per goal, not per deck install). +~80 LOC across
+brake_state.py + tui.py. Real-deck verification: set delay,
+restart deck, delay value should still be there.
+
 **Next session picks up at: SLICE 3 PHASE 2.** Two pieces compose:
 1. **Slice 2 deferred composition: blacklist proposal as approval
    prompt.** When a critical+bad_enough tripwire fires, the proposed
