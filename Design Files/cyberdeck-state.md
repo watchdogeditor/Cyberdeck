@@ -1019,6 +1019,27 @@ and 11.
   underscore-prefixed method on a Widget subclass should be checked
   against Textual's API before being added — Textual treats
   underscore-prefix names as protected, not private.
+- **A widget render-crash can leave the tree in a state that
+  silently breaks unrelated mutations.** Real-deck observed
+  2026-05-01 (post-fix of the `_render` shadowing above): after
+  the crashed deck was restarted, finalized construct panes
+  stopped moving to the bottom of `#main` even though
+  `_compact_pane_after_delay` was running and `pane.compact`
+  was being set. Restarting the deck a second time cleared it
+  ("heisenbug"). Hypothesis: the prior session's render crash
+  corrupted some Textual-side widget bookkeeping that survived
+  into the next launch via `cyberdeck-home/` state or process-
+  group quirks; or asyncio worker scheduling got starved by a
+  backlog of crashed widgets. Mitigation pattern: when a
+  Textual widget crashes during render, restart the deck
+  before trusting any subsequent UI behavior. Diagnostic
+  pattern: surface widget-mutation calls via `fleet_log.write`
+  AND a bus event so the file logger captures both
+  "scheduled" and "fired" lifecycle markers — without bus
+  visibility, "did the timer fire?" requires netrunner-screen
+  observation. See `_schedule_compact_pane` /
+  `_compact_pane_after_delay` in tui.py for the diagnostic
+  pattern (shipped in commit e33ec75 after the heisenbug).
 - **`shift+space`, `ctrl+space`, `ctrl+i`, `ctrl+m`** rarely transmit
   distinctly in real terminals. Trust pilot for binding wiring; trust
   real terminal for capability.
