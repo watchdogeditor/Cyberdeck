@@ -142,7 +142,31 @@ watchdog blindfold. Personal use doesn't need it.
 
 Roughly ordered by likely appeal:
 
-1. **Plugin scaffolding** — ✓ shipped (v1: stateless, screenshot
+0. **README restructure for public GitHub repo** (filed 2026-05-02
+   by netrunner). The repo is now public at
+   github.com/watchdogeditor/Cyberdeck. Current README is light
+   and dev-facing — pitch + status + run commands + design-doc
+   index. Public-facing readers landing on the repo cold need a
+   structured walkthrough: what is this, who's it for, what does
+   the screenshot look like, how do I run it, what's the
+   architecture in one paragraph, where do I read more (link to
+   the canon docs in `Design Files/`), what's the current
+   stability story (active personal project, not a packaged
+   product). Tee up sections: **Pitch** (one paragraph + GIF/
+   screenshot of the TUI mid-flight); **What it is** (TUI
+   orchestrating Claude Code subprocesses; daemon decomposes,
+   constructs execute, watchdog observes); **Run it**
+   (prerequisites + commands, currently scattered across
+   CLAUDE.md and existing README); **Architecture sketch**
+   (the four runtime entities + the spine + the brake; one
+   paragraph each); **Design canon** (links to spec /
+   philosophy / state / build-plan / orientation, with a
+   one-line "what to read first" hint for each); **Status**
+   (active solo dev, Windows-first, breaking changes likely);
+   **License + contributing** (single-author project, no PRs
+   solicited but issues welcome). Don't include LOC stats —
+   they go stale fast. Don't write API docs — there's no API.
+   Sub-day session of focused writing; no code changes.
    plugin as first example, brake hook gates invocations naturally
    via existing bash/path patterns). Sub-features still deferred:
    plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`),

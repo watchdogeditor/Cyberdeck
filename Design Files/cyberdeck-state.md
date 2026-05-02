@@ -1552,6 +1552,14 @@ and 11.
 
 ## Not implemented (deferred features)
 
+- **README restructure for public GitHub repo** (filed 2026-05-02).
+  Repo is now public at github.com/watchdogeditor/Cyberdeck;
+  current README is light and dev-facing. Cold readers need
+  structured sections: pitch + screenshot, what-it-is, run-it,
+  architecture sketch, design-canon links, status (active solo
+  dev, Windows-first), license/contributing. See build-plan
+  item 0 in the deferred list for the full section outline.
+  Sub-day session, no code changes.
 - **Plugins** — third leg of tool registry
 - **Watchdog tripwires + blacklist** — DSL, deterministic matcher
 - **Connection consequences** — spawn-blocking, daemon parking
