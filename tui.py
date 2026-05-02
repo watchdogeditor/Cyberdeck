@@ -3623,6 +3623,21 @@ class CyberdeckApp(App):
         # (e.g. a stray bus event landing during startup) finds the
         # field and the helper no-ops cleanly rather than AttributeError.
         self.attention_panel: Optional[AttentionPanel] = None
+
+        # Tripwire-authoring spawn gate (filed 2026-05-02 after real-
+        # deck race observed: fast constructs were finishing in ~7-15s,
+        # tripwire authoring took ~25s, so the entire spawn batch ran
+        # without authored coverage). Initial state is SET ("ok to
+        # spawn") because no authoring is in progress at startup.
+        # _kick_off_tripwire_authoring clears the event when starting
+        # an authoring pass; _author_tripwires_wrapper sets it again
+        # in its finally block (always — success, failure, or crash).
+        # DaemonSession awaits this event before dispatching each
+        # spawn action so the first batch of spawns gets authored
+        # tripwire coverage from event 1, not from event N where N
+        # is whenever authoring happens to land.
+        self._tripwire_authoring_complete = asyncio.Event()
+        self._tripwire_authoring_complete.set()
         # Default window for blacklist proposals — long enough that
         # the netrunner has time to read the proposal and decide,
         # short enough that proposals don't pile up if they walk
@@ -5154,6 +5169,16 @@ class CyberdeckApp(App):
             # DaemonSession means callsites stay unchanged — every
             # existing emission picks up bus publish for free.
             bus=self.bus,
+            # 2026-05-02 race fix: gate spawn dispatch on tripwire
+            # authoring completion. Event is SET ("ok to spawn") in
+            # the App's __init__ and re-set by the authoring
+            # wrapper's finally block; cleared by _kick_off_tripwire_
+            # authoring on each authoring kickoff. DaemonSession
+            # awaits this event in _execute_action before
+            # dispatching each spawn — first batch waits for
+            # authoring; subsequent batches within the same goal find
+            # it set and proceed immediately.
+            tripwire_authoring_complete=self._tripwire_authoring_complete,
         )
 
         if self.daemon_pane is not None:
@@ -7864,15 +7889,40 @@ class CyberdeckApp(App):
     ) -> None:
         """Fire-and-forget the watchdog's tripwire authoring pass for
         the current goal. Goal-set / goal-update flow doesn't block on
-        the LLM call; the result lands in the chatlog when ready.
+        the LLM call directly; the daemon's spawn dispatch DOES block
+        on it via _tripwire_authoring_complete (see filed-2026-05-02
+        race fix below).
 
         Skips if there's no goal or no watchdog. Defensive — neither
         condition should hit in practice (callers gate before calling)
-        but the no-ops keep this safe to invoke from anywhere."""
+        but the no-ops keep this safe to invoke from anywhere.
+
+        Race-fix wiring (2026-05-02): real-deck-observed that fast
+        constructs (echo-style test spawns, ~7s end-to-end) were
+        finishing before authoring landed (~25s), so authored
+        tripwires never had a chance to fire on them. Fix: clear the
+        _tripwire_authoring_complete event when authoring starts;
+        DaemonSession awaits this event before dispatching each spawn
+        action; wrapper sets it again on completion. This delays the
+        first batch of spawns by however long authoring takes (~25s
+        typical), but ensures every daemon-driven spawn has authored
+        coverage from the moment its first event streams in. Re-
+        authoring on goal-update follows the same pattern but only
+        skips the gate when LLM_AUTHORED tripwires are already
+        registered (existing rules still cover during re-authoring;
+        no need to block).
+        """
         if not self.goal:
             return
         if self.watchdog is None:
             return
+        # Clear the gate before launching the worker. The worker's
+        # finally block sets it again whether authoring succeeds,
+        # fails, or crashes — never leaves the gate stuck closed.
+        try:
+            self._tripwire_authoring_complete.clear()
+        except Exception:
+            pass
         self.run_worker(
             self._author_tripwires_wrapper(
                 goal=self.goal,
@@ -7922,24 +7972,37 @@ class CyberdeckApp(App):
             pass
 
         try:
-            result = await self.watchdog.author_tripwires(
-                goal,
-                classification=classification,
-                old_goal=old_goal,
-                brake_label=brake_label,
-                blacklist_summary=blacklist_summary,
-            )
-        except Exception as e:
             try:
-                self._chatlog_write(
-                    f"[red]\\[watchdog] tripwire authoring crashed:[/red] "
-                    f"[dim]{e}[/dim]"
+                result = await self.watchdog.author_tripwires(
+                    goal,
+                    classification=classification,
+                    old_goal=old_goal,
+                    brake_label=brake_label,
+                    blacklist_summary=blacklist_summary,
                 )
+            except Exception as e:
+                try:
+                    self._chatlog_write(
+                        f"[red]\\[watchdog] tripwire authoring "
+                        f"crashed:[/red] [dim]{e}[/dim]"
+                    )
+                except Exception:
+                    pass
+                return
+
+            self._render_tripwire_authoring_result(result)
+        finally:
+            # ALWAYS release the spawn gate, regardless of outcome.
+            # If authoring succeeded → spawns proceed with the new
+            # rules. If authoring failed → spawns proceed under
+            # whatever rules WERE registered (defaults at minimum).
+            # If authoring crashed → same. Filed 2026-05-02 race fix:
+            # under no condition should the gate stay closed forever
+            # and starve the daemon of the ability to dispatch spawns.
+            try:
+                self._tripwire_authoring_complete.set()
             except Exception:
                 pass
-            return
-
-        self._render_tripwire_authoring_result(result)
 
     def _render_tripwire_authoring_result(
         self, result: "TripwireAuthoringResult",

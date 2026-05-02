@@ -51,6 +51,7 @@ class DaemonSession:
         profile_lookup: Optional[Callable[[str], Optional["Profile"]]] = None,
         blacklist: Optional["Blacklist"] = None,
         bus: Optional["EventBus"] = None,
+        tripwire_authoring_complete: Optional[asyncio.Event] = None,
     ) -> None:
         self.daemon = daemon
         self.fleet = fleet
@@ -97,6 +98,22 @@ class DaemonSession:
         # blacklist gating is a no-op — daemon spawns proceed
         # unimpeded.
         self.blacklist = blacklist
+
+        # Spawn gate for tripwire authoring lifecycle (filed
+        # 2026-05-02 race fix). Real-deck-observed: fast constructs
+        # were finishing in ~7-15s while LLM tripwire authoring took
+        # ~25s, so the entire batch ran without authored coverage —
+        # only the deck-wide DEFAULT_TRIPWIRES applied. Fix: each
+        # spawn action awaits this event before dispatching. Event
+        # is SET ("ok to spawn") by default; the App clears it when
+        # _kick_off_tripwire_authoring fires and re-sets it when the
+        # authoring wrapper's finally block runs (success OR failure
+        # OR crash — never leaves the gate stuck closed).
+        # When None (tests, headless CLI without authoring), spawns
+        # proceed without waiting. When provided but already set,
+        # await returns immediately (no overhead in the common case
+        # where authoring already finished or never started).
+        self.tripwire_authoring_complete = tripwire_authoring_complete
 
         # Track task-per-construct so we can report useful outcomes
         # (the finalized event doesn't carry the original task text).
@@ -312,6 +329,38 @@ class DaemonSession:
             # `_strip_markdown_autolinks` for the real-deck case
             # this fixes.
             task = _strip_markdown_autolinks(task)
+
+            # Tripwire-authoring spawn gate (filed 2026-05-02 race
+            # fix). Block this spawn until LLM-authored tripwires are
+            # registered. In practice this only blocks the FIRST batch
+            # of spawns after a goal-set or qualifying goal-update,
+            # because the event is SET by default + re-set in the
+            # authoring wrapper's finally block. Subsequent spawns
+            # within the same goal find the event already set and
+            # return immediately from `await`.
+            #
+            # Without this: fast constructs (~7-15s) finished before
+            # authoring (~25s) landed, running entirely under deck-
+            # wide DEFAULT_TRIPWIRES with zero goal-specific coverage.
+            # Real-deck observed in cyberdeck-2026-05-02-011339.log.
+            if self.tripwire_authoring_complete is not None:
+                if not self.tripwire_authoring_complete.is_set():
+                    # Surface the wait to the netrunner so they know
+                    # why the daemon's first spawn is stalling.
+                    if self.on_daemon_event is not None:
+                        import time as _time
+                        self.on_daemon_event(DaemonEvent(
+                            timestamp=_time.time(),
+                            kind="status",
+                            payload={
+                                "text": (
+                                    "[dim]waiting for tripwire "
+                                    "authoring to complete before "
+                                    "first spawn…[/dim]"
+                                ),
+                            },
+                        ))
+                    await self.tripwire_authoring_complete.wait()
 
             # Blacklist gate. Checked before any other spawn gating
             # because blacklist refusal means "we will never run this,

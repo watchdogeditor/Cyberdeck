@@ -211,12 +211,38 @@ drops silently. Deck-owned timers (no hook polling — distinct from
 brake-hook delay flow). New `attention.py` module: AttentionItem +
 AttentionKind + AttentionResolved + AttentionResolution. ~400 LOC.
 
-**Next session picks up at: DISCRETE BUGS** (per netrunner direction
-2026-05-01: "that shit is expensive"). Token-cost wins:
-1. **~30k token cache miss per spawn** (`cache_miss_reason:
-   system_changed`). Per-spawn system prompt drift invalidates the
-   prompt cache. Diagnose the source (likely the deck addendum or
-   per-spawn settings JSON path varying); fix saves real money.
+**✅ CACHE COST FIX shipped 2026-05-02** (commit 1dea7f7). Real-deck
+verified via cyberdeck-2026-05-02-011339.log: pre-fix every spawn
+showed `cache_miss_reason: 'system_changed'` with ~34k tokens missed;
+post-fix the only miss reason is `previous_message_not_found` (benign,
+expected for fresh non-resume spawns). cache_creation per spawn
+dropped from invalidate-and-rebuild to a steady ~19k of ephemeral_1h
+cache writes (likely framework-side; remaining drift is in Anthropic's
+court). Real money saved per spawn.
+
+Mechanism: per-spawn settings file (`<cid>.json` with construct_id
+in the hook command) was the drift surface. Fixed by stabilizing to
+a shared `<home>/.cyberdeck/spawn_settings.json` with construct_id
+removed from argv. Hook now resolves cid at runtime via session_id
+from stdin → `<session_id>.cid` lookup file written by Fleet on
+system_init capture.
+
+**✅ TRIPWIRE-AUTHORING SPAWN-RACE FIX shipped 2026-05-02**.
+Real-deck observed via the same log: tripwire authoring took ~25s
+while fast constructs finished in ~7-15s, so the entire batch ran
+without authored coverage. Fix: spawn dispatch in DaemonSession now
+awaits a `tripwire_authoring_complete` asyncio.Event before each
+spawn action. Event is SET by default; cleared on
+_kick_off_tripwire_authoring; re-set in the wrapper's finally
+block (always — success/failure/crash). First batch of spawns
+waits for authoring; subsequent spawns within the same goal find
+the event set and proceed immediately. Netrunner sees a "[dim]
+waiting for tripwire authoring to complete before first spawn…
+[/dim]" status when the gate engages.
+
+**Next session picks up at: REMAINING DISCRETE BUGS** (per netrunner
+direction 2026-05-01: "that shit is expensive"). Token-cost +
+correctness wins:
 2. **Daemon over-volunteers destructive content.** Real-deck:
    netrunner asked "spawn rm-rf-style test"; daemon also added
    `shutdown -h now` unprompted. Tighten daemon system prompt:
