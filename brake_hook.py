@@ -889,13 +889,18 @@ def run_delay_window(
 def main() -> int:
     """Read stdin, dispatch on brake, emit stderr + exit code."""
     brake = sys.argv[1] if len(sys.argv) > 1 else "default"
-    construct_id = sys.argv[2] if len(sys.argv) > 2 else ""
-    # Slice 3: delay_window_seconds is the third argv arg. Float so
-    # the deck can express sub-second delays if it ever wants. 0 =
-    # no delay = pre-slice-3 behavior. Bad input → 0.0 (fail safe;
-    # don't punish the construct for our argv parsing).
+    # Argv shape changed 2026-05-02 (cache-cost fix). Pre-fix:
+    # `python <hook> <brake> <construct_id> <delay_window>`. Post-fix:
+    # `python <hook> <brake> <delay_window>`. construct_id is now
+    # resolved at runtime from the stdin payload's session_id via
+    # a deck-managed lookup file. The settings file that drives this
+    # hook command is now stable across spawns (same path, same
+    # content for a given brake+delay combo); per-spawn variation in
+    # argv was bleeding ~30k tokens of `system_changed` cache misses
+    # per spawn. See brake_state.make_spawn_settings docstring for
+    # the full rationale.
     try:
-        delay_window_seconds = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+        delay_window_seconds = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
     except ValueError:
         delay_window_seconds = 0.0
 
@@ -921,6 +926,36 @@ def main() -> int:
     inp = payload.get("tool_input") or {}
     if not isinstance(inp, dict):
         inp = {}
+
+    # Resolve construct_id from session_id (stdin) → cid lookup file.
+    # Claude Code's PreToolUse hook payload includes a `session_id`
+    # field (the claude-side session uuid). Fleet writes
+    # `<home>/.cyberdeck/spawns/<session_id>.cid` containing the
+    # deck-side construct_id when it captures the system_init event.
+    # Empty string when:
+    #   - session_id absent from stdin (shouldn't happen on real
+    #     claude — every PreToolUse has it)
+    #   - lookup file doesn't exist yet (race: hook fired before
+    #     Fleet recorded the mapping. Rare but possible on the very
+    #     first tool call of a fresh spawn — the deny_pending /
+    #     delay_pending checks just skip in that case)
+    #   - lookup file unreadable (corruption / permissions)
+    # Empty cid degrades gracefully: brake patterns still apply,
+    # tripwire deny_pending and delay_pending lookups skip cleanly.
+    construct_id = ""
+    session_id = str(payload.get("session_id", ""))
+    if session_id:
+        cid_path = (
+            cyberdeck_home_dir() / ".cyberdeck" / "spawns"
+            / f"{session_id}.cid"
+        )
+        try:
+            if cid_path.exists():
+                construct_id = cid_path.read_text(
+                    encoding="utf-8"
+                ).strip()
+        except OSError:
+            pass
 
     # Slice 2 of the safety architecture pass: tripwire deny_pending
     # check. The watchdog's TripwireEngine writes the flag when a

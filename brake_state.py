@@ -354,24 +354,41 @@ def make_spawn_settings(
     construct_id: str,
     delay_window_seconds: float = 0.0,
 ) -> Optional[Path]:
-    """Generate a transient `claude --settings` JSON file for a spawn.
+    """Generate (or reuse) a `claude --settings` JSON file for a spawn.
 
-    Returns the path to the written file, or None if no settings are
-    needed (YOLO brake AND no delay window — the deck installs no hook,
+    Returns the path to the file, or None if no settings are needed
+    (YOLO brake AND no delay window — the deck installs no hook,
     claude runs unrestricted save for --permission-mode).
 
-    The hook command is computed from this module's location: brake_hook.py
-    sits next to brake_state.py in the deck source dir. The constructed
-    JSON has a single PreToolUse hook with matcher "*" so every tool
-    call routes through it; the hook itself is dumb and consults the
-    brake state passed via argv to decide allow/deny.
+    `construct_id` is accepted for backwards-compatibility with the
+    callsite signature but is NO LONGER used in the file path or in
+    the hook command. As of 2026-05-02 (cache-cost fix) the spawn
+    settings file is STABLE across spawns — same path, same content,
+    given the same brake + delay configuration. Per-spawn variation
+    (which the hook still needs for tripwire deny_pending and delay_
+    pending lookups) is resolved at hook-runtime via a session_id →
+    construct_id mapping written by Fleet when the construct's first
+    `system_init` event lands. See `write_session_cid_lookup` below
+    and brake_hook.py's stdin-driven cid resolution.
 
-    `delay_window_seconds` is the variable-outcome pause UX (slice 3
-    of the safety architecture pass). When > 0, the hook pauses
-    interesting calls for up to that many seconds, watching for a
-    netrunner X-keypress override. The hook installs even under YOLO
-    when delay > 0 — that's the "pause-before-allowing" lane in the
-    delay matrix (X interrupts; otherwise the call goes through).
+    Why the change: Anthropic's prompt cache was missing ~30k tokens
+    per spawn with `cache_miss_reason: 'system_changed'`. The most
+    likely culprit is the per-spawn `--settings <cid>.json` flag —
+    different path AND different content per spawn means Claude Code
+    treats each spawn as a fresh setup, invalidating the cached
+    system prompt portion. Stabilizing the settings file removes that
+    drift surface. Architectural side benefit: cleaner separation
+    between "what the deck tells claude about its config" (stable)
+    and "what the deck does per-construct" (looked up at hook time).
+
+    Same hook command for every spawn under a given (brake, delay)
+    pair. Different (brake, delay) pairs produce different content,
+    but those changes are infrequent (netrunner toggles brake/limits
+    rarely vs. construct spawns). Within a stable window, the file
+    content doesn't shift — Anthropic's cache should hit cleanly.
+
+    The hook installs even under YOLO when delay > 0 — that's the
+    "pause-before-allowing" lane in the delay matrix.
     """
     # Hook installs unless: (YOLO brake AND no delay window). With
     # delay > 0 under YOLO, we still need the hook running so the
@@ -390,24 +407,10 @@ def make_spawn_settings(
     # tried to open it). Forward slashes + double quotes survives the
     # shell pass cleanly. Same fix the dispatcher uses elsewhere.
     hook_path_str = str(hook_path).replace("\\", "/")
-    # Slice 2 of the safety architecture pass: construct_id is now
-    # passed to brake_hook.py as a second argv arg. The hook reads
-    # `<home>/.cyberdeck/spawns/<construct_id>.deny_pending.json`
-    # written by the watchdog's TripwireEngine on warning/critical
-    # fires — that's how tripwires get teeth (they extend brake by
-    # writing per-construct flags the hook reads). Without this
-    # arg, the hook can't identify which spawn it's enforcing
-    # against, and tripwire-based denies wouldn't work.
-    #
-    # Slice 3 of the safety architecture pass: delay_window_seconds
-    # is the third argv arg. When > 0, the hook holds interesting
-    # calls for up to that many seconds, watching for a netrunner
-    # X-keypress override file. Default 0 = no delay = pre-slice-3
-    # behavior. Threaded through Fleet at construction; the deck
-    # mutates Fleet.delay_window_seconds via the Limits modal so
-    # changes apply to the next spawn (existing in-flight spawns
-    # baked their value into per-spawn settings already — same
-    # propagation model as brake state itself).
+    # Hook command shape (stable across spawns within a brake+delay
+    # window): `python <hook> <brake> <delay_seconds>`. Construct_id
+    # is NOT in this command — see docstring + brake_hook.py for the
+    # session_id → cid runtime resolution path.
     settings = {
         "hooks": {
             "PreToolUse": [
@@ -418,8 +421,7 @@ def make_spawn_settings(
                             "type": "command",
                             "command": (
                                 f'python "{hook_path_str}" '
-                                f'{brake.value} {construct_id} '
-                                f'{delay_window_seconds:g}'
+                                f'{brake.value} {delay_window_seconds:g}'
                             ),
                         },
                     ],
@@ -428,18 +430,23 @@ def make_spawn_settings(
         },
     }
 
-    spawns_dir = Path(home_dir) / ".cyberdeck" / "spawns"
+    cyberdeck_dir = Path(home_dir) / ".cyberdeck"
     try:
-        spawns_dir.mkdir(parents=True, exist_ok=True)
+        cyberdeck_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         print(
-            f"brake_state: could not create {spawns_dir}: {exc!r} — "
+            f"brake_state: could not create {cyberdeck_dir}: {exc!r} — "
             f"spawn will run without brake hook",
             file=sys.stderr,
         )
         return None
 
-    settings_path = spawns_dir / f"{construct_id}.json"
+    # Stable path — same for every spawn under the same (brake,
+    # delay) config. Content is idempotent for the same config; if
+    # brake or delay flip, the next spawn rewrites the same file
+    # with the new content. Multiple concurrent spawns writing the
+    # same content are safe (last-writer-wins; content is identical).
+    settings_path = cyberdeck_dir / "spawn_settings.json"
     try:
         settings_path.write_text(
             json.dumps(settings, indent=2), encoding="utf-8",
@@ -455,15 +462,98 @@ def make_spawn_settings(
     return settings_path
 
 
-def cleanup_spawn_settings(settings_path: Optional[Path]) -> None:
-    """Remove a transient spawn-settings file. Idempotent — silent
-    if the file is already gone or `settings_path` is None.
+def write_session_cid_lookup(
+    home_dir: Path,
+    session_id: str,
+    construct_id: str,
+) -> None:
+    """Record the session_id → construct_id mapping the brake_hook
+    needs to resolve its per-construct context (deny_pending /
+    delay_pending file keys).
 
-    Failures are swallowed: a stale file is unhelpful but not harmful,
-    and we don't want cleanup errors to bubble up into the construct
-    finalization path (where they'd trip up Fleet shutdown).
+    Called from Fleet's _consume when a construct's `system_init`
+    event lands, exposing the claude-side session_id. Before this,
+    the hook's per-spawn argv carried the cid directly — which was
+    causing per-spawn cache-key drift on the `--settings` flag and
+    bleeding ~30k tokens of cache misses per spawn (filed 2026-05-02
+    after real-deck cost analysis). Now: settings file is stable;
+    cid is resolved at hook runtime via stdin's session_id + this
+    lookup file.
+
+    Best-effort — write failures don't break anything; the hook
+    falls back to "no cid known" and skips the deny_pending /
+    delay_pending checks (degraded mode, but the brake patterns
+    still apply).
+
+    Lookup file lives at `<home>/.cyberdeck/spawns/<session_id>.cid`
+    (one tiny text file per active session). Cleaned up by
+    `cleanup_session_cid_lookup` on construct finalize.
+    """
+    if not session_id or not construct_id:
+        return
+    spawns_dir = Path(home_dir) / ".cyberdeck" / "spawns"
+    try:
+        spawns_dir.mkdir(parents=True, exist_ok=True)
+        path = spawns_dir / f"{session_id}.cid"
+        path.write_text(construct_id, encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"brake_state: could not write session lookup "
+            f"{session_id} → {construct_id}: {exc!r}",
+            file=sys.stderr,
+        )
+
+
+def cleanup_session_cid_lookup(
+    home_dir: Path,
+    session_id: Optional[str],
+) -> None:
+    """Remove the session_id → cid lookup file. Idempotent — silent
+    if the file doesn't exist or `session_id` is None. Called from
+    Fleet's _consume on construct finalize.
+
+    Failures are swallowed: a stale lookup file is harmless (next
+    launch can purge the spawns dir at startup if desired) and we
+    don't want cleanup errors bubbling into the construct
+    finalization path.
+    """
+    if not session_id:
+        return
+    path = Path(home_dir) / ".cyberdeck" / "spawns" / f"{session_id}.cid"
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def cleanup_spawn_settings(settings_path: Optional[Path]) -> None:
+    """Idempotent — silent if the file is already gone, `settings_
+    path` is None, or the path points at the new stable shared
+    spawn_settings.json (which lives across spawns and must NOT be
+    cleaned up — see make_spawn_settings docstring for the cache-
+    cost rationale).
+
+    Pre-2026-05-02 behavior: per-spawn settings files (`<cid>.json`)
+    got deleted here on construct finalize. Post-cache-fix: the
+    settings file is shared across all spawns; deleting it on each
+    finalize would force every NEW spawn to re-write it, causing
+    spurious mtime updates and (more importantly) potentially racing
+    with concurrent spawns reading the file mid-rewrite.
+
+    Backwards-compat: still cleans up legacy per-cid files if any
+    remain on disk from a pre-fix session that crashed mid-run
+    without finalizing.
+
+    Failures are swallowed: a stale file is unhelpful but not
+    harmful, and we don't want cleanup errors to bubble up into the
+    construct finalization path (where they'd trip up Fleet shutdown).
     """
     if settings_path is None:
+        return
+    # Guard the stable shared file. Filename is the unambiguous test
+    # — it sits in <home>/.cyberdeck/, NOT under <home>/.cyberdeck/
+    # spawns/ where the legacy per-cid files lived.
+    if settings_path.name == "spawn_settings.json":
         return
     try:
         settings_path.unlink(missing_ok=True)

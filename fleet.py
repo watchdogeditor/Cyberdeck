@@ -51,6 +51,8 @@ from brake_state import (
     BrakeState,
     make_spawn_settings,
     cleanup_spawn_settings,
+    write_session_cid_lookup,
+    cleanup_session_cid_lookup,
 )
 from connection_monitor import ConnectionState
 
@@ -408,6 +410,25 @@ class Fleet:
                         task_preview=c.task,
                     )
                     recorded_session = True
+                    # Cache-cost fix (2026-05-02): drop the cid →
+                    # session_id lookup file the brake_hook reads at
+                    # runtime to resolve its per-construct context.
+                    # Pre-fix the cid was passed in argv; post-fix
+                    # the settings file is stable and the hook
+                    # resolves cid via stdin's session_id + this
+                    # lookup. Best-effort write — failures degrade
+                    # the hook to "no cid known" mode, which still
+                    # enforces brake patterns but skips deny_pending
+                    # / delay_pending checks.
+                    if self.home_dir is not None:
+                        try:
+                            write_session_cid_lookup(
+                                self.home_dir,
+                                c.session_id,
+                                c.id,
+                            )
+                        except Exception:
+                            pass
 
                 # Opportunistically scrape cost, tokens, and brake-hook
                 # permission_denials from result events. All three live
@@ -598,9 +619,29 @@ class Fleet:
                 # side, after the subprocess actually exits — keeping
                 # the settings file alive for the construct's full
                 # lifetime is the simple semantic.
+                # Post-2026-05-02 cache-cost fix: cleanup_spawn_
+                # settings no-ops on the new shared spawn_settings.
+                # json (stable across spawns); only legacy per-cid
+                # files get unlinked here. See brake_state.cleanup_
+                # spawn_settings docstring.
                 cleanup_spawn_settings(
                     Path(c.settings_path) if c.settings_path else None,
                 )
+                # Cleanup the session_id → cid lookup file the
+                # brake_hook reads. Per-spawn (one file per session),
+                # written when system_init landed earlier in this
+                # _consume. Best-effort; stale lookups are harmless
+                # (worst case: a future session reuses the id and
+                # gets the wrong cid — extremely unlikely with uuids,
+                # and the cid would just be invalid → degraded mode
+                # in the hook).
+                if self.home_dir is not None and c.session_id is not None:
+                    try:
+                        cleanup_session_cid_lookup(
+                            self.home_dir, c.session_id,
+                        )
+                    except Exception:
+                        pass
 
     # ---- construct management ------------------------------------------
 
