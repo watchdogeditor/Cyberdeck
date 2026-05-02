@@ -1823,14 +1823,14 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                 "post-mortem. 0 disables (debug only — a real wedge "
                 "will block deck shutdown). "
                 "delay_window is the variable-outcome pause UX (slice "
-                "3): brake hook holds interesting tool calls for N "
-                "seconds, watching for an X-press override. Under YOLO "
-                "every side-effect call gets the delay (default=allow, "
-                "X=block); under default only would-deny calls (default"
-                "=deny, X=approve); paranoid same as default. 0 = no "
-                "delay = pre-slice-3 behavior. Applies to NEW spawns "
-                "only (existing in-flight constructs keep what they "
-                "spawned with).[/dim]"
+                "3, default 5s): brake hook holds interesting tool "
+                "calls for N seconds, watching for an X-press override. "
+                "Under YOLO every side-effect call gets the delay "
+                "(default=allow, X=block); under default only would-deny "
+                "calls (default=deny, X=approve); paranoid same as "
+                "default. 0 = no delay = pre-slice-3 behavior. Applies "
+                "to NEW spawns only (existing in-flight constructs keep "
+                "what they spawned with). Persisted across restarts.[/dim]"
             )
 
     def on_mount(self) -> None:
@@ -3191,7 +3191,7 @@ class CyberdeckApp(App):
         use_pool: bool = True,
         pool_size: int = 5,
         wedge_timeout_seconds: float = 30.0,
-        delay_window_seconds: float = 0.0,
+        delay_window_seconds: float = 5.0,
         home_dir: Optional[Path] = None,
         profiles_dir: Optional[Path] = None,
         default_profile_name: Optional[str] = None,
