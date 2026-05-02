@@ -198,24 +198,43 @@ sets caps per goal, not per deck install). +~80 LOC across
 brake_state.py + tui.py. Real-deck verification: set delay,
 restart deck, delay value should still be there.
 
-**Next session picks up at: SLICE 3 PHASE 2.** Two pieces compose:
-1. **Slice 2 deferred composition: blacklist proposal as approval
-   prompt.** When a critical+bad_enough tripwire fires, the proposed
-   BlacklistEntry surfaces as an X-pressable approval. Same pattern
-   as the brake-hook delay but driven by TripwireEngine on the deck
-   side (deck owns the timer + cleanup; no hook polling). X = apply
-   blacklist; expiry = drop proposal.
-2. **"Attention needed" UI surface** (netrunner direction 2026-05-01).
-   Dedicated area consolidating every construct that requires
-   netrunner action: open delay windows, blacklist proposals, future
-   daemon-requested captures. Per netrunner: "an attention needed area
-   for constructs that require approval or have hit a tripwire." Both
-   pieces share the X-press resolution shape — one UI surface, multi-
-   ple sources. The blacklist-proposal flow is structurally different
-   from the brake-hook delay (deck-owned timer vs hook polling), so
-   phase 1 stayed focused on the brake-hook path. The attention-needed
-   area is the proper home for proposal-shaped UX. Filed in
-   `cyberdeck-build-plan.md` slice progress.
+**✅ SLICE 3 PHASE 2 — blacklist proposals + attention area** shipped
+2026-05-01 (uncommitted as of this CLAUDE.md update). When a critical
++bad_enough tripwire fires (slice 2's deferred application path),
+deck builds a BlacklistEntry from the construct's context and files
+it as an attention item with a 30s window. New AttentionPanel
+widget at the top of #main (heavy magenta border, hidden when empty,
+EJECT-style countdown bars per item). X-press dispatch extended:
+focused-pane delay → sole-pending delay → most-recent attention item.
+Approve adds the entry to the watchdog's session blacklist; expiry
+drops silently. Deck-owned timers (no hook polling — distinct from
+brake-hook delay flow). New `attention.py` module: AttentionItem +
+AttentionKind + AttentionResolved + AttentionResolution. ~400 LOC.
+
+**Next session picks up at: DISCRETE BUGS** (per netrunner direction
+2026-05-01: "that shit is expensive"). Token-cost wins:
+1. **~30k token cache miss per spawn** (`cache_miss_reason:
+   system_changed`). Per-spawn system prompt drift invalidates the
+   prompt cache. Diagnose the source (likely the deck addendum or
+   per-spawn settings JSON path varying); fix saves real money.
+2. **Daemon over-volunteers destructive content.** Real-deck:
+   netrunner asked "spawn rm-rf-style test"; daemon also added
+   `shutdown -h now` unprompted. Tighten daemon system prompt:
+   never go beyond what the netrunner explicitly requested.
+3. **Enum payloads serialize as `{}`** in `_serialize_payload`
+   (`logger.py`). 3-line fix: `isinstance(payload, Enum)` check
+   before `__dict__` walk. Affects every enum-valued bus event
+   payload (brake.change, connection.transition).
+4. **Construct refusal text buried in result event.** When claude
+   refuses (its own model layer, not brake hook), the rich refusal
+   prose lands as result.text rather than a structured `kind=
+   construct.refused`. Worth a distinct event so chatlog/Q&A see
+   refusal as a safety signal vs. a generic completion.
+5. **Kill doesn't interrupt in-flight assistant turns.** SIGTERM
+   lands AFTER model finishes turn — token cost + observable
+   output continues post-kill. Stopping the model itself requires
+   stdin-injection or stream interrupt. Worth designing alongside
+   future inject-and-interrupt v2.
 
 **Filed for Mechanic v0→v1 bridge (2026-05-01):** liveness heartbeat.
 Currently Mechanic v0 watches the deck PID — proves the process

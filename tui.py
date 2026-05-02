@@ -74,6 +74,9 @@ from brake_delay import (
     DelayEntry, DelayResolution, DelayMonitor,
     write_delay_override,
 )
+from attention import (
+    AttentionItem, AttentionKind, AttentionResolved, AttentionResolution,
+)
 from logger import _serialize_payload
 import clipboard
 import json
@@ -392,6 +395,104 @@ class GoalPane(Static, can_focus=True):
             )
         except Exception:
             pass  # widget may not be mounted yet
+
+
+class AttentionPanel(Static, can_focus=False):
+    """Pending approval prompts the netrunner can resolve with X.
+
+    Phase 2 of safety architecture pass slice 3 — consolidates
+    proposal-shaped events that need a netrunner X-press to approve
+    before they auto-expire. Today renders blacklist proposals
+    (critical+bad_enough tripwires file these); future kinds plug
+    in via the AttentionItem.kind dispatch on the App side.
+
+    Sits at the top of #main, above the construct pool. When no
+    items are pending it collapses to height 0 + display: none so
+    it costs nothing visually. When items appear, the panel grows
+    auto-height with one row per item: a colored exclamation glyph,
+    the title (e.g. "blacklist: cx-... (rm_rf_destructive)"),
+    countdown bar, and "press X to approve" hint.
+
+    Not focusable — X dispatch goes through App.action_x_focused
+    which checks attention items as a fallback after pane-delay
+    matches. Multi-item resolution: if there's only one open item,
+    X always lands on it. If there are multiple, X lands on the
+    most recent (top of the panel).
+
+    Re-renders fully on every refresh tick (every 100ms via the
+    existing _refresh_delay_countdowns timer) so countdown bars
+    drain smoothly. Cheap because the panel is small (1-3 items
+    typical) and re-rendering a Static is just an update() call.
+    """
+
+    DEFAULT_CSS = """
+    AttentionPanel {
+        height: 0;
+        display: none;
+        padding: 0 1;
+        margin-bottom: 0;
+    }
+    /* `.-active` flips on whenever there's at least one open item.
+     * Heavy magenta border matches the per-pane delay overlay's
+     * "this is time-sensitive" semantic — same color for the same
+     * meaning, so the netrunner reads both surfaces uniformly. */
+    AttentionPanel.-active {
+        height: auto;
+        display: block;
+        border: heavy magenta;
+        margin-bottom: 1;
+    }
+    """
+
+    BAR_CELLS = 20
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self._items: list[AttentionItem] = []
+
+    def update_items(self, items: list[AttentionItem]) -> None:
+        """Replace the panel's contents. Caller passes the current
+        full list of pending items; the panel renders all of them.
+        Empty list → collapse via .-active class removal."""
+        self._items = list(items)
+        self.set_class(bool(self._items), "-active")
+        self._paint()
+
+    def refresh_countdown(self) -> None:
+        """Re-render with current remaining_seconds/progress. Called
+        by the App's 100ms refresh tick. No-op when empty."""
+        if self._items:
+            self._paint()
+
+    def _paint(self) -> None:
+        # Method name `_paint` (NOT `_render`) so we don't shadow
+        # Textual's Widget._render. Same gotcha that caught
+        # DelayListItem in the slice 3 phase 1 first attempt; filed
+        # in cyberdeck-state.md.
+        if not self._items:
+            self.update("")
+            return
+        lines = ["[b magenta]ATTENTION NEEDED[/b magenta]"]
+        for item in self._items:
+            remaining = item.remaining_seconds
+            progress = item.progress
+            filled = max(0, self.BAR_CELLS - int(round(self.BAR_CELLS * progress)))
+            bar = "█" * filled + "░" * (self.BAR_CELLS - filled)
+            # Title is the kind-specific summary; detail is the
+            # longer explanation (truncated). The X hint mirrors
+            # the per-pane delay overlay's wording.
+            detail = item.detail
+            if len(detail) > 80:
+                detail = detail[:77] + "..."
+            lines.append(
+                f"[b]{item.title}[/b]  "
+                f"[magenta]{bar}[/magenta]  "
+                f"[b]{remaining:.1f}s[/b]"
+            )
+            lines.append(
+                f"[dim]{detail}  ·  press [b]X[/b] to approve[/dim]"
+            )
+        self.update("\n".join(lines))
 
 
 class PoolMeter(Static, can_focus=False):
@@ -3509,6 +3610,28 @@ class CyberdeckApp(App):
         # after the UI mounts; see on_mount.
         self._delay_refresh_timer = None
 
+        # Slice 3 phase 2: attention items (blacklist proposals today;
+        # future kinds plug in via AttentionItem.kind). Open items live
+        # here keyed by item_id. _attention_timers holds the asyncio
+        # task that fires expiry; cancelled on approve. The 100ms
+        # refresh tick that drives delay countdowns also re-renders
+        # the AttentionPanel from this dict so the bar drains smoothly.
+        self._attention_items: dict[str, AttentionItem] = {}
+        self._attention_timers: dict[str, asyncio.Task] = {}
+        # AttentionPanel widget — set in compose(), used by _repaint_
+        # attention. Initialized to None here so any pre-compose call
+        # (e.g. a stray bus event landing during startup) finds the
+        # field and the helper no-ops cleanly rather than AttributeError.
+        self.attention_panel: Optional[AttentionPanel] = None
+        # Default window for blacklist proposals — long enough that
+        # the netrunner has time to read the proposal and decide,
+        # short enough that proposals don't pile up if they walk
+        # away. Same scale as the EJECT confirmation gesture (3s)
+        # but generous because blacklist decisions deserve more
+        # consideration than "press space to halt." Mutable at
+        # runtime if a future Limits-modal field exposes it.
+        self.blacklist_proposal_window_seconds: float = 30.0
+
         # Phase 7 — instantiate the file logger now that brake_state has
         # loaded from disk so the header records the real value. Built
         # best-effort: a disk-write failure (read-only fs, no
@@ -3634,7 +3757,17 @@ class CyberdeckApp(App):
             # separation comes from the .-compact CSS class, not from
             # a separate container.
             with VerticalScroll(id="main", can_focus=False):
-                pass  # construct panes added dynamically on spawn
+                # AttentionPanel is the first child — pinned at the
+                # top of the construct pool. Hidden when empty, pops
+                # out with a magenta border + countdown bars when
+                # blacklist proposals (or future attention kinds)
+                # are pending. The promote-to-top + compact-to-
+                # bottom move_child code paths skip non-ConstructPane
+                # children, so this static panel doesn't interfere
+                # with construct ordering.
+                self.attention_panel = AttentionPanel(id="attention_panel")
+                yield self.attention_panel
+                # construct panes added dynamically on spawn
 
             # RIGHT: files/tools tabs. Always mounted; the active tab's
             # content list is the focus target. Tab/Shift+Tab within
@@ -4510,11 +4643,20 @@ class CyberdeckApp(App):
                 # already looking. Best-effort — if the move fails
                 # (race against mount), the magenta border alone is
                 # still the attention signal.
+                #
+                # Filter to ConstructPane children — #main now also
+                # hosts the AttentionPanel (phase 2) at index 0.
+                # We want "first construct pane," not literally
+                # "first child of #main."
                 try:
                     main = self.query_one("#main", VerticalScroll)
-                    children = list(main.children)
-                    if children and children[0] is not pane:
-                        main.move_child(pane, before=children[0])
+                    first_pane = next(
+                        (c for c in main.children
+                         if isinstance(c, ConstructPane)),
+                        None,
+                    )
+                    if first_pane is not None and first_pane is not pane:
+                        main.move_child(pane, before=first_pane)
                 except Exception:
                     pass
         except Exception:
@@ -4574,12 +4716,230 @@ class CyberdeckApp(App):
         """100ms timer tick: walk every active pane, refresh the
         countdown rendering on any with an open delay. Cheap (no-op
         for panes without a delay; one label.update() for those with
-        one). Started in on_mount, runs for the life of the app."""
+        one). Started in on_mount, runs for the life of the app.
+
+        Phase 2: also refreshes the AttentionPanel so blacklist-
+        proposal countdowns drain smoothly. The panel is a single
+        Static; one update() call repaints all rows."""
         for pane in self.panes.values():
             try:
                 pane.refresh_delay_countdown()
             except Exception:
                 pass
+        try:
+            if self.attention_panel is not None:
+                self.attention_panel.refresh_countdown()
+        except Exception:
+            pass
+
+    # ---- attention items (slice 3 phase 2) ----------------------------
+
+    def _open_attention(self, item: AttentionItem) -> None:
+        """Register a new attention item. Stores it, schedules an
+        expiry timer, repaints the panel, publishes the bus event so
+        chatlog + future subscribers see it.
+
+        Idempotent on item_id: if an item with the same id is already
+        open, it gets replaced (timer cancelled + reissued). In
+        practice item_ids are uuid-fresh per call so collisions don't
+        happen, but the safety net keeps state consistent if a caller
+        re-uses an id."""
+        old = self._attention_items.get(item.item_id)
+        if old is not None:
+            t = self._attention_timers.pop(item.item_id, None)
+            if t is not None and not t.done():
+                t.cancel()
+        self._attention_items[item.item_id] = item
+        # Schedule expiry. Using run_worker rather than create_task
+        # so it shows up in Textual's worker registry alongside the
+        # compact workers — consistent with how the rest of the
+        # deck schedules sleeps.
+        async def _expire_after(item_id: str, delay: float) -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            # Re-check; approve may have run + cleaned up while we slept.
+            if item_id in self._attention_items:
+                self._resolve_attention(item_id, AttentionResolution.EXPIRED)
+
+        worker = self.run_worker(
+            _expire_after(item.item_id, item.window_seconds),
+            name=f"attention-{item.item_id}",
+            exclusive=False,
+        )
+        # run_worker returns a Worker, not a Task; we can call
+        # .cancel() on either. Stored so approve can cancel.
+        self._attention_timers[item.item_id] = worker
+
+        # Repaint the panel.
+        self._repaint_attention()
+
+        # Bus event for chatlog + future subscribers.
+        try:
+            self.bus.publish(DeckEvent(
+                kind="attention.opened",
+                source="tui.attention",
+                timestamp=time.time(),
+                construct_id=item.construct_id,
+                severity="warning",
+                text=(
+                    f"attention: {item.title} "
+                    f"[{item.window_seconds:g}s window]"
+                ),
+                payload=item,
+            ))
+        except Exception:
+            pass
+
+    def _approve_attention(self, item_id: str) -> bool:
+        """Apply the item's payload + clean up. Returns True on
+        success, False if the item is unknown (already resolved or
+        never existed). Called from action_x_focused when an
+        attention item is the X-press target.
+
+        Per-kind dispatch lives here. Today: blacklist_proposal applies
+        the BlacklistEntry to the watchdog's session blacklist."""
+        item = self._attention_items.get(item_id)
+        if item is None:
+            return False
+        if item.kind == AttentionKind.BLACKLIST_PROPOSAL:
+            try:
+                if self.watchdog is not None and self.watchdog.blacklist is not None:
+                    self.watchdog.blacklist.add(item.payload)
+            except Exception as exc:
+                # Surface the failure but still clean up — the
+                # netrunner pressed X, the proposal shouldn't sit
+                # there forever just because the apply failed.
+                try:
+                    self.query_one("#fleet_log", RichLog).write(
+                        f"[red]attention apply failed:[/red] {exc!r}"
+                    )
+                except Exception:
+                    pass
+        # Future kinds dispatch here.
+        self._resolve_attention(item_id, AttentionResolution.APPROVED)
+        return True
+
+    def _resolve_attention(self, item_id: str, reason: str) -> None:
+        """Internal: remove the item from state, cancel any timer,
+        repaint, emit attention.resolved bus event. Called from both
+        the approve path (reason=approved) and the expiry path
+        (reason=expired). Safe to call with a stale item_id."""
+        item = self._attention_items.pop(item_id, None)
+        if item is None:
+            return
+        timer = self._attention_timers.pop(item_id, None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        self._repaint_attention()
+        try:
+            resolved = AttentionResolved(
+                item_id=item_id,
+                kind=item.kind,
+                reason=reason,
+                construct_id=item.construct_id,
+            )
+            self.bus.publish(DeckEvent(
+                kind="attention.resolved",
+                source="tui.attention",
+                timestamp=time.time(),
+                construct_id=item.construct_id,
+                severity="info",
+                text=(
+                    f"attention resolved: {item.title} ({reason})"
+                ),
+                payload=resolved,
+            ))
+        except Exception:
+            pass
+
+    def _repaint_attention(self) -> None:
+        """Push the current items list to the panel. Cheap — one
+        update() call. Sorted by opened_at descending so newest
+        items appear at the top (matches the netrunner's eye flow:
+        most recent thing demanding attention is first)."""
+        try:
+            if self.attention_panel is None:
+                return
+            items = sorted(
+                self._attention_items.values(),
+                key=lambda i: i.opened_at,
+                reverse=True,
+            )
+            self.attention_panel.update_items(items)
+        except Exception:
+            pass
+
+    def _open_blacklist_proposal(self, fire) -> None:
+        """Build a BlacklistEntry from the firing construct's context
+        and file it as an attention item. Mirrors the entry shape
+        action_hard_kill_focused builds — same fingerprint scheme,
+        same context fields — so a netrunner-approved auto-blacklist
+        proposal is indistinguishable from a Shift+K-driven blacklist
+        once applied.
+
+        If the construct or watchdog is missing (race against fleet
+        teardown, headless test path), no-op cleanly. The auto-term
+        + chatlog marker still fired upstream."""
+        if self.fleet is None or self.watchdog is None:
+            return
+        if self.watchdog.blacklist is None:
+            return
+        construct = self.fleet.get_construct(fire.construct_id)
+        if construct is None:
+            return
+        try:
+            entry = BlacklistEntry(
+                fingerprint=_blacklist_fingerprint(construct.task),
+                full_task=construct.task,
+                source_construct_id=fire.construct_id,
+                source_construct_state=construct.state.value,
+                source_final_output=construct.final_output[:500],
+                source_files_written=tuple(construct._files_written),
+                reason=f"tripwire_critical+bad_enough:{fire.tripwire_name}",
+            )
+        except Exception:
+            return
+        # Title: short, scan-friendly. Detail: longer context the
+        # netrunner can read while deciding. Truncations match the
+        # delay overlay's pattern.
+        task_preview = construct.task or "(no task)"
+        if len(task_preview) > 60:
+            task_preview = task_preview[:57] + "..."
+        title = (
+            f"blacklist proposal: {fire.construct_id} "
+            f"(tripwire {fire.tripwire_name})"
+        )
+        detail = (
+            f"task: {task_preview}  ·  "
+            f"approve to refuse future spawns matching this fingerprint"
+        )
+        item = AttentionItem.new(
+            kind=AttentionKind.BLACKLIST_PROPOSAL,
+            title=title,
+            detail=detail,
+            window_seconds=self.blacklist_proposal_window_seconds,
+            payload=entry,
+            construct_id=fire.construct_id,
+        )
+        self._open_attention(item)
+        # Chatlog marker — same shape as the delay-opened marker so
+        # the timeline reads uniformly.
+        try:
+            self._chatlog_write(
+                f"[magenta]⚠[/magenta] blacklist proposal: "
+                f"[cyan]{fire.construct_id}[/cyan] "
+                f"[dim]({fire.tripwire_name})[/dim] "
+                f"[dim]· press X within "
+                f"{self.blacklist_proposal_window_seconds:g}s "
+                f"to approve[/dim]"
+            )
+        except Exception:
+            pass
 
     def _start_daemon_task(self) -> None:
         """Kick off a daemon session worker for the current goal.
@@ -5732,11 +6092,19 @@ class CyberdeckApp(App):
         # child widget state — important because the pane's log content
         # (everything the construct produced) lives in a child RichLog
         # that we want to keep around for autopsy.
+        #
+        # Filter to ConstructPane children — #main now also hosts the
+        # AttentionPanel at index 0 (phase 2). "Last construct pane"
+        # is what we want to move past, not literally last child.
         try:
             main = self.query_one("#main", VerticalScroll)
-            children = list(main.children)
-            if children and children[-1] is not pane:
-                main.move_child(pane, after=children[-1])
+            last_pane = next(
+                (c for c in reversed(list(main.children))
+                 if isinstance(c, ConstructPane)),
+                None,
+            )
+            if last_pane is not None and last_pane is not pane:
+                main.move_child(pane, after=last_pane)
         except Exception as exc:
             # SURFACE the failure (not silent) — real-deck-observed
             # 2026-05-01 that compact-to-bottom stopped working with
@@ -7257,7 +7625,7 @@ class CyberdeckApp(App):
         )
 
     def action_x_focused(self) -> None:
-        """Slice 3 X-press: override the delay window's default action.
+        """Universal deck-wide approval / execute keypress.
 
         Resolution order (first match wins):
           1. A focused ConstructPane with an open delay → use that
@@ -7265,47 +7633,76 @@ class CyberdeckApp(App):
              promoted to the top of #main with a magenta border, so
              "find the construct that needs attention, focus it, X"
              is the everyday flow.)
-          2. Single open delay anywhere → use it. (Convenience: if
+          2. Single open brake-hook delay anywhere → use it. (If
              only one delay is pending, X always lands on it
-             regardless of focus — netrunner can be anywhere on
-             screen and still respond.)
-          3. Nothing → toast "no delay to override".
+             regardless of focus.)
+          3. Most-recent open AttentionItem → approve it. (Phase 2:
+             blacklist proposals from critical+bad_enough tripwires
+             land here. Items render in the AttentionPanel above the
+             construct pool with their own countdown bars.)
+          4. Nothing → toast "no pending action".
 
-        For each match we:
-          - Note the override in DelayMonitor (so the resolution event
-            attributes the close to "override" not "expired").
-          - Write the override file via brake_delay.write_delay_override.
-          - The brake hook's polling loop picks it up within ~100ms
-            and applies the flipped action.
-
-        X-press is universal "approve / interrupt the default" — same
-        key for every brake state's matrix. Under default+paranoid (X
-        approves a deny); under YOLO (X interrupts an allow). The
-        per-pane overlay shows the netrunner what X means BEFORE they
-        press, so it's never ambiguous.
+        X-press semantic per surface:
+          - Brake delay (default/paranoid → deny default): X = approve
+          - Brake delay (YOLO → allow default):           X = interrupt
+          - Attention item (blacklist proposal):          X = approve
+        The per-pane overlay / panel always shows what X will do
+        BEFORE the netrunner presses, so it's never ambiguous.
         """
         if self.fleet is None or self.delay_monitor is None:
             return
 
-        target_entry = None
+        # 1. Focused pane's open delay.
         focused_pane = self._focused_pane()
         if (focused_pane is not None
                 and focused_pane.delay_entry is not None):
-            target_entry = focused_pane.delay_entry
-
-        # Single-pending-delay convenience.
-        if target_entry is None:
-            try:
-                active = list(self.delay_monitor._active.values())
-                if len(active) == 1:
-                    target_entry = active[0]
-            except Exception:
-                pass
-
-        if target_entry is None:
-            self._toast("no delay to override")
+            self._x_resolve_delay(focused_pane.delay_entry)
             return
 
+        # 2. Single-pending-brake-delay convenience.
+        try:
+            active_delays = list(self.delay_monitor._active.values())
+        except Exception:
+            active_delays = []
+        if len(active_delays) == 1:
+            self._x_resolve_delay(active_delays[0])
+            return
+
+        # 3. Most-recent attention item. Sorted-by-opened-at-desc means
+        # the first iter value is newest. Single item case is also
+        # handled here by virtue of "most recent of one is the one."
+        if self._attention_items:
+            newest = max(
+                self._attention_items.values(),
+                key=lambda i: i.opened_at,
+            )
+            ok = self._approve_attention(newest.item_id)
+            if ok:
+                try:
+                    fleet_log = self.query_one("#fleet_log", RichLog)
+                    fleet_log.write(
+                        f"[green]X[/green] approved: "
+                        f"[magenta]{newest.kind}[/magenta] "
+                        f"[dim]{newest.title}[/dim]"
+                    )
+                except Exception:
+                    pass
+                return
+
+        # 4. Nothing pending — bail with toast. Multiple delays open +
+        # no focused-pane match also lands here (netrunner needs to
+        # focus the specific construct). Same UX as the prior
+        # "no delay to override" message; widened wording.
+        if len(active_delays) > 1:
+            self._toast(
+                "multiple delays open — focus a construct's pane to choose"
+            )
+        else:
+            self._toast("no pending action for X")
+
+    def _x_resolve_delay(self, target_entry) -> None:
+        """Common path for X-press on a brake-hook delay. Extracted
+        from action_x_focused so the dispatch above stays readable."""
         cid = target_entry.construct_id
         action = target_entry.override_action
         # Note before write so the resolution event is attributed
@@ -7431,6 +7828,22 @@ class CyberdeckApp(App):
                 # finalize on its own; the deny_pending flag still
                 # blocks its next call.
                 pass
+
+            # Slice 3 phase 2 of safety architecture pass: when the
+            # tripwire was authored with bad_enough=True, file an
+            # auto-blacklist proposal. The construct is already being
+            # auto-termed (above); this proposal asks the netrunner
+            # to ALSO blacklist the task fingerprint so future
+            # spawns matching it get refused at spawn time. X to
+            # approve within blacklist_proposal_window_seconds; expiry
+            # drops it silently (cheap mistake — netrunner can always
+            # Shift+K a future occurrence to blacklist on demand).
+            #
+            # Slice 2 deferred this application path waiting on the
+            # variable-outcome pause UX from slice 3; this is where
+            # it lands.
+            if fire.bad_enough:
+                self._open_blacklist_proposal(fire)
 
     # ---- slice 2: LLM-authored tripwires --------------------------------
     #

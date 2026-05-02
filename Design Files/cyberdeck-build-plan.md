@@ -608,26 +608,27 @@ longer maintain their own listener fan-out paths.
      may want different caps). +~80 LOC across brake_state.py
      + tui.py.
 
-   - **(c) Phase 2: blacklist-proposal composition + attention-
-     needed area** — DEFERRED. Two pieces that compose naturally:
-     (i) when a critical+bad_enough tripwire fires (slice 2's
-     deferred application), surface the proposed BlacklistEntry
-     as an X-pressable approval — same pattern as the brake-hook
-     delay but driven by TripwireEngine on the deck side (no hook
-     polls; deck owns the timer + cleanup). (ii) Dedicated
-     "attention needed" area in the main column (or as a sticky
-     header) consolidating every construct that requires netrunner
-     action: open delay windows, blacklist proposals, future daemon-
-     requested captures. Per netrunner direction 2026-05-01: "an
-     attention needed area for constructs that require approval
-     or have hit a tripwire." Both pieces share the X-press
-     resolution shape; one UI surface, multiple sources. The
-     blacklist-proposal flow is structurally different from the
-     brake-hook delay (deck owns the timer, no hook polling,
-     different cleanup) — phase 1 deliberately stayed focused on
-     the brake-hook path so the abstraction stayed clean. The
-     attention-needed area is the proper home for proposal-shaped
-     UX.
+   - ~~**(c) Phase 2: blacklist-proposal composition + attention-
+     needed area**~~ ✅ SHIPPED 2026-05-01. New `attention.py`
+     module: AttentionItem dataclass + AttentionKind / Attention
+     Resolution constants. New AttentionPanel widget at the top
+     of #main (heavy magenta border matching the per-pane delay
+     overlay's "time-sensitive" semantic; collapses to height 0
+     when empty). App-level state + lifecycle helpers (_open_
+     attention, _approve_attention, _resolve_attention) with
+     deck-owned asyncio timers (no hook polling — distinct from
+     the brake-hook delay flow). _handle_tripwire_fire extended:
+     critical+bad_enough fires now build a BlacklistEntry from
+     the firing construct's context (mirroring action_hard_kill_
+     focused) and file it as an attention item. action_x_focused
+     extended with a third resolution rule: focused-pane delay →
+     sole-pending delay → most-recent attention item → toast.
+     Default proposal window: 30s (long enough to read + decide,
+     short enough to not pile up). Bus events:
+     attention.opened / attention.resolved with reason field
+     (approved | expired | dropped). Both x and Shift+X bound to
+     the same action_x_focused. ~400 LOC across attention.py
+     (new) + tui.py.
    - **(d) DEFAULT_TRIPWIRES expansion + authoring prompt fix**
      PARTIAL ✅. Authoring prompt antipattern guard shipped
      with slice 2. `host_restart_command` (warning, with
