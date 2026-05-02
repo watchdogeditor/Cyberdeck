@@ -50,6 +50,7 @@ import shutil
 import sys
 import time
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
@@ -94,6 +95,21 @@ def _serialize_payload(payload: Any, *, depth: int = 0) -> Any:
         return None
     if isinstance(payload, (str, int, float, bool)):
         return payload
+    # Enum → its value. Without this, enum-valued payload fields hit
+    # the __dict__ probe below — and Enum instances have an empty
+    # __dict__, so they'd serialize as `{}` (silent data loss). Real-
+    # deck-observed: brake.change events landed as
+    # `"old_state": {}, "new_state": {}` in the per-launch .log
+    # files (and y/Y JSON yank). Filed in the discrete bugs queue
+    # 2026-05-01; fixed 2026-05-02.
+    #
+    # `payload.value` rather than `payload.name` because the deck's
+    # enums (BrakeState, ConnectionState) define values as the
+    # human-readable lowercase strings ("default", "online") that
+    # we already use as wire format for state.json + bus event text.
+    # Consistent encoding across the deck.
+    if isinstance(payload, Enum):
+        return payload.value
     # pathlib.Path → str. Avoids `WindowsPath('...')` / `PosixPath('...')`
     # repr leaking into JSON output. Checked before dict/list since
     # Path doesn't match those, but ahead of the __dict__ probe because
