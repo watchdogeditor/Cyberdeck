@@ -99,6 +99,16 @@ Reading the chatlog, here's the legend you'll see:
     that construct. Tool names indicate what was attempted. Worth
     noting in your answers when the netrunner asks about a specific
     construct, especially if it produced no useful output.
+  - `· refused: "I won't run rm -rf..."` (yellow, tail of finalized
+    line) — the construct's MODEL itself declined to proceed with
+    the task. Distinct from brake blocked: brake blocked is
+    deterministic gating of tool calls; refused is the model
+    deciding the request is something it shouldn't do at all. The
+    quoted excerpt is the leading sentence of the model's refusal
+    narrative; the full refusal text lands in the construct's
+    final_output. When the netrunner asks why a construct produced
+    no useful artifact, a refused suffix is often the answer —
+    quote it directly.
 You don't have to reverse-engineer who initiated a spawn from the
 absence of preceding daemon thinking lines — the badge is
 authoritative.

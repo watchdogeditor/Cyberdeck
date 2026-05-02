@@ -89,6 +89,16 @@ _META_TYPE_TO_KIND = {
     # surfaced 2026-04-30 late where ~36s wedge-timeout kills had
     # zero upstream cause in the log file.
     "kill_requested": "fleet.kill_requested",
+    # Construct-refusal marker (2026-05-02). Emitted right after the
+    # finalize meta event when the construct's final output leads with
+    # a refusal-shaped phrase ("No. I won't run rm -rf — it would
+    # destroy the system…"). The finalize event still fires normally;
+    # this is an ADDITIONAL marker so subscribers (chatlog renderers,
+    # the watchdog Q&A path, the file logger, future automation) can
+    # filter on `construct.refused` without drilling into payloads.
+    # Distinct from brake-hook denials (those are tool-call gating);
+    # this is the model itself deciding not to proceed.
+    "refused":        "construct.refused",
 }
 
 
@@ -123,6 +133,14 @@ def _fleet_event_to_deck_event(fevent: FleetEvent):
         # content-agnostic; subscribers either match it or don't.
         kind = f"fleet.{fevent.kind}"
 
+    # Severity escalation: only `construct.refused` bumps to WARNING
+    # today. Refusal is a meaningful safety signal — the model decided
+    # not to proceed — and subscribers gating on `severity >= warning`
+    # should catch it without inspecting payloads. Other fleet kinds
+    # stay INFO until a subscriber actually needs the gradient.
+    from event_bus import Severity
+    severity = Severity.WARNING if kind == "construct.refused" else Severity.INFO
+
     return DeckEvent(
         kind=kind,
         source="fleet",
@@ -132,10 +150,7 @@ def _fleet_event_to_deck_event(fevent: FleetEvent):
             if fevent.construct_id != "fleet"  # the run_start/run_end synthetic id
             else None
         ),
-        # Severity stays INFO across all fleet events for now. Future
-        # phases may escalate spawn_blocked / spawn_failed to WARNING,
-        # finalize-with-failed-state to WARNING, etc. — leave at INFO
-        # until a subscriber actually needs the gradient.
+        severity=severity,
         payload=fevent,
     )
 
@@ -550,6 +565,19 @@ class Fleet:
                     f for f in c.files_written if _kept(f)
                 ]
 
+                # Detect model-layer refusal once at finalize. Computed
+                # off the final assistant text / result field — same
+                # signal the daemon sees in `final_output`. Cached on
+                # the construct via the property; reading it here is
+                # cheap (regex match against ~300 chars). Surfaced on
+                # the finalize payload AND as a separate construct.
+                # refused marker event below — the suffix is for the
+                # finalize chatlog line, the marker event is for
+                # programmatic consumers (file logger, watchdog Q&A
+                # bus snapshot, future automation) that want to filter
+                # on `construct.refused` without inspecting payloads.
+                refusal_excerpt = c.refusal_excerpt
+
                 await self._queue.put(FleetEvent(
                     timestamp=time.time(),
                     kind="meta",
@@ -606,8 +634,44 @@ class Fleet:
                             if c._kill_reason == "fleet_wedge_timeout"
                             else None
                         ),
+                        # Refusal suffix for the chatlog finalize line.
+                        # None when the construct ran or completed
+                        # normally; a short excerpt of the leading
+                        # refusal sentence when the model itself
+                        # declined to proceed (clean exit, leading
+                        # "I won't" / "No. I cannot" / etc.). Display
+                        # composes this with the brake-blocked suffix
+                        # so a construct that was BOTH brake-gated and
+                        # refused-text shows both signals.
+                        "refusal_excerpt": refusal_excerpt,
                     },
                 ))
+
+                # Construct-refused marker event. Emitted ONLY when a
+                # refusal was detected; otherwise no event fires (no
+                # need to spam the bus with a "did not refuse" signal).
+                # Lives alongside the finalize event, not in place of
+                # it — subscribers that want all completions filter on
+                # `fleet.finalize`; subscribers that want refusals
+                # specifically (watchdog Q&A, file logger, possible
+                # future tripwire input) filter on `construct.refused`.
+                if refusal_excerpt:
+                    await self._queue.put(FleetEvent(
+                        timestamp=time.time(),
+                        kind="meta",
+                        construct_id=c.id,
+                        payload={
+                            "type": "refused",
+                            "excerpt": refusal_excerpt,
+                            "task": c.task,
+                            # Full final output (already truncated
+                            # to ~2KB above) so consumers wanting the
+                            # whole refusal narrative don't have to
+                            # cross-reference the finalize event.
+                            "final_output": final,
+                            "state": c.state.value,
+                        },
+                    ))
             finally:
                 # Always release the slot, even on crash. If we didn't,
                 # one buggy construct could starve the fleet permanently.

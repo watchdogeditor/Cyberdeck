@@ -172,6 +172,53 @@ when the gate engages. Real-deck verified 2026-05-02 (cyberdeck-
     instructing daemon to stay within explicit ask, treat
     netrunner instructions as ceiling not floor.
 
+**✅ Construct-refusal as structured event** (uncommitted as of
+this CLAUDE.md update). Closes the "construct refusal text is
+buried in result event" item from the discrete-bugs list. New
+`construct.refused` bus kind (severity=WARNING) emitted alongside
+the existing `fleet.finalize` event whenever the model itself
+declines the task (clean exit, leading "I won't" / "No. I cannot"
+/ "Sorry, but I can't"). Distinct from brake-hook denials —
+brake denials gate individual tool calls; refusal is the model
+deciding the request is something it shouldn't do at all.
+
+  - **Detection** lives in `construct.py`. Module-level
+    `REFUSAL_PATTERNS` (5 conservative regex anchored at start of
+    text); `_detect_refusal(text)` scans the leading 300 chars and
+    carves an excerpt (first 1-2 sentences, capped 120 chars).
+    `Construct.refusal_excerpt` / `Construct.is_refusal` properties
+    expose it. Scans `_result_field` first then `_last_assistant_
+    text` — same priority order `final_output` uses, so the
+    daemon-facing narrative and the surfaced excerpt always agree.
+  - **Wiring**: `fleet.py` populates `refusal_excerpt` on the
+    finalize meta payload AND emits a separate `meta` event with
+    `type="refused"` when an excerpt was detected. `_META_TYPE_TO_
+    KIND` maps `refused` → `construct.refused`. Translator escalates
+    severity to WARNING for that one kind only — other fleet kinds
+    stay INFO.
+  - **Chatlog**: `display.chatlog_format_fleet` appends a yellow
+    `· refused: "..."` suffix to the finalize line (composes with
+    the existing brake-blocked suffix; constructs that hit BOTH
+    show both). Standalone `construct.refused` event returns None
+    from the formatter — the suffix on finalize is the netrunner-
+    facing surface; the marker event is for programmatic consumers
+    (file logger, watchdog Q&A bus snapshot, future automation).
+  - **Watchdog awareness**: WATCHDOG_SYSTEM_PROMPT grew a
+    `refused:` suffix paragraph distinguishing it from `brake
+    blocked` so Q&A like "why did construct X produce nothing?"
+    routes to the right answer.
+
+  Detection patterns are conservative — false negatives are fine
+  (the construct's output still flows through the normal finalize
+  path). Real-deck-observed canonical refusals all match: "No. I
+  won't run rm -rf — it would destroy the system. Neither is
+  reversible." Negative cases ("The function won't work without
+  proper auth") correctly skip. Touches construct.py (~120 LOC),
+  fleet.py (~30 LOC), event_bus.py (~10 LOC), display.py (~25
+  LOC), watchdog.py (~10 LOC system-prompt addition). Real-deck
+  verification pending — next claude-refusal in the wild lands
+  with the new chatlog suffix and bus event.
+
 **Other shipped this session:**
   - Tools/plugins/profiles retool design doc (commit de22d58).
     Three-way split — tools = registered CLI binaries / scripts;
@@ -193,15 +240,19 @@ when the gate engages. Real-deck verified 2026-05-02 (cyberdeck-
     branch deleted from remote (its content was superseded by
     e4f722f on main).
 
-**Next session picks up at: REMAINING DISCRETE BUGS** (per
-netrunner direction "that shit is expensive"):
-  - Construct refusal text → structured `kind=construct.refused`
-    bus event (when claude's own model layer refuses, not brake-
-    hook denial — currently buried in result event text)
+**Next session picks up at: BUILD-PLAN PIVOT.** Discrete-bugs list
+worked through to the practical floor. Two remaining items aren't
+fixable today:
   - Kill doesn't interrupt in-flight assistant turns — design
-    alongside future inject-and-interrupt v2
+    alongside future inject-and-interrupt v2; not a quick fix
   - Silent wedge investigation (cx-796e0468 case — empty
     stderr_excerpt; needs more real-deck data points)
+Pivoting back to the build plan: caliber selection (per-spawn
+model + effort + fast-mode — see `cyberdeck-model-effort-design.
+md`) is queued, with Mechanic v0 follow-ups (track non-construct
+subprocess sources) and Phase 8b (Pool/Daemon callback cleanup)
+on deck. Tools/plugins/profiles retool design also waiting at
+phase 1 (tools registry + hot-reload + missing-tool grey-out).
 
 **Big design doc waiting**: tools/plugins/profiles retool. Filed
 2026-05-02; not implemented. 4-5 sessions of focused work. Pick

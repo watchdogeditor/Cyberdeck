@@ -241,27 +241,31 @@ the event set and proceed immediately. Netrunner sees a "[dim]
 waiting for tripwire authoring to complete before first spawn…
 [/dim]" status when the gate engages.
 
-**Next session picks up at: REMAINING DISCRETE BUGS** (per netrunner
-direction 2026-05-01: "that shit is expensive"). Token-cost +
-correctness wins:
-2. **Daemon over-volunteers destructive content.** Real-deck:
-   netrunner asked "spawn rm-rf-style test"; daemon also added
-   `shutdown -h now` unprompted. Tighten daemon system prompt:
-   never go beyond what the netrunner explicitly requested.
-3. **Enum payloads serialize as `{}`** in `_serialize_payload`
-   (`logger.py`). 3-line fix: `isinstance(payload, Enum)` check
-   before `__dict__` walk. Affects every enum-valued bus event
-   payload (brake.change, connection.transition).
-4. **Construct refusal text buried in result event.** When claude
-   refuses (its own model layer, not brake hook), the rich refusal
-   prose lands as result.text rather than a structured `kind=
-   construct.refused`. Worth a distinct event so chatlog/Q&A see
-   refusal as a safety signal vs. a generic completion.
+**✅ DISCRETE BUGS — worked through to the practical floor.**
+Items 2 + 3 shipped 2026-05-02 in commit 60b91aa (daemon over-
+volunteers + enum payload serialization). Item 4 (construct
+refusal as structured event) shipped 2026-05-02, uncommitted as
+of this CLAUDE.md update — see "Construct-refusal as structured
+event" entry in cyberdeck-state.md for the full delivery.
+
+Items 5 + silent-wedge investigation aren't fixable today and
+stay deferred:
 5. **Kill doesn't interrupt in-flight assistant turns.** SIGTERM
-   lands AFTER model finishes turn — token cost + observable
-   output continues post-kill. Stopping the model itself requires
-   stdin-injection or stream interrupt. Worth designing alongside
-   future inject-and-interrupt v2.
+   lands AFTER model finishes turn. Stopping the model itself
+   requires stdin-injection or stream interrupt — worth designing
+   alongside future inject-and-interrupt v2, not a quick fix.
+6. **Silent wedge investigation (cx-796e0468 case)** — empty
+   stderr_excerpt; needs more real-deck data points before
+   it's actionable.
+
+**Next session picks up at: BUILD-PLAN PIVOT.** With discrete-
+bugs at the practical floor, queue is back to design-led work.
+Top of the priority queue: caliber selection (per-spawn model +
+effort + fast-mode — see `cyberdeck-model-effort-design.md`).
+Mechanic v0 follow-ups (track non-construct subprocess sources)
+and Phase 8b (Pool/Daemon callback cleanup) on deck. Tools/
+plugins/profiles retool design also waiting at phase 1 (tools
+registry + hot-reload + missing-tool grey-out).
 
 **Filed for Mechanic v0→v1 bridge (2026-05-01):** liveness heartbeat.
 Currently Mechanic v0 watches the deck PID — proves the process

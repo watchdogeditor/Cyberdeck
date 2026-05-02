@@ -356,17 +356,36 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
                 denial_suffix = f" [yellow]· brake blocked: {summary}[/yellow]"
             else:
                 denial_suffix = ""
+            # Refusal suffix (2026-05-02). Distinct from brake blocked:
+            # brake denials gate individual tool calls; refusal is the
+            # model itself declining to proceed. Both can appear on
+            # the same line in theory; rendered as separate dot-
+            # prefixed segments for visual scanning. Excerpt is the
+            # leading sentence of the model's refusal narrative,
+            # capped at ~120 chars by Construct.refusal_excerpt.
+            refusal_excerpt = payload.get("refusal_excerpt")
+            if refusal_excerpt:
+                # Escape brackets so refusal narratives that mention
+                # things like "[ERROR]" or "[/usr/bin/...]" don't get
+                # parsed as Rich markup.
+                safe = (
+                    str(refusal_excerpt)
+                    .replace("[", "\\[")
+                )
+                refusal_suffix = f' [yellow]· refused: "{safe}"[/yellow]'
+            else:
+                refusal_suffix = ""
             if state == "done":
                 return (
                     f"[cyan]✓[/cyan] [b]{cid}[/b] done "
                     f"[dim]({runtime:.1f}s{file_suffix})[/dim]"
-                    f"{denial_suffix}"
+                    f"{denial_suffix}{refusal_suffix}"
                 )
             if state == "failed":
                 return (
                     f"[red]✗[/red] [b]{cid}[/b] failed "
                     f"[dim]({runtime:.1f}s)[/dim]"
-                    f"{denial_suffix}"
+                    f"{denial_suffix}{refusal_suffix}"
                 )
             if state == "killed":
                 # Slice-2-followup: append kill_source so the netrunner
@@ -385,11 +404,14 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
                     f"[orange1]×[/orange1] [b]{cid}[/b] killed "
                     f"[dim]({runtime:.1f}s)[/dim]"
                     f"{source_suffix}"
-                    f"{denial_suffix}"
+                    f"{denial_suffix}{refusal_suffix}"
                 )
             # Unknown terminal state — render the literal so we
             # notice if Construct grows a new state.
-            return f"[dim]{cid} finalized: {state}[/dim]{denial_suffix}"
+            return (
+                f"[dim]{cid} finalized: {state}[/dim]"
+                f"{denial_suffix}{refusal_suffix}"
+            )
 
         if ptype == "spawn_failed":
             err = payload.get("error", "?")
@@ -431,6 +453,17 @@ def chatlog_format_fleet(fevent, *, untruncated: bool = False) -> "Optional[str]
                 f"[{color}]×[/{color}] kill: [cyan]{cid}[/cyan] "
                 f"[dim]({source})[/dim]"
             )
+
+        if ptype == "refused":
+            # The construct.refused marker event fires alongside the
+            # finalize event, not in place of it. The netrunner-facing
+            # surface is the suffix on the finalize line ("· refused:
+            # 'I won't run rm -rf...'") — rendering this event too
+            # would double-line every refusal in the chatlog. Return
+            # None to suppress; the marker event is still on the bus
+            # for programmatic consumers (file logger, watchdog Q&A
+            # bus snapshot, future automation).
+            return None
 
         # Other meta types (run_start, run_end, etc) come through but
         # we don't need them in the chatlog right now.

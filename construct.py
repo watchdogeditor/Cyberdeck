@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import time
 import uuid
@@ -66,6 +67,106 @@ DEFAULT_TOOLS: tuple[str, ...] = (
     "Bash", "Read", "Write", "Edit", "Glob", "Grep",
     "WebSearch", "WebFetch", "TodoWrite",
 )
+
+
+# Construct-level refusal detection. When Claude's own model layer
+# decides not to do what the daemon asked (distinct from the brake
+# hook denying a tool call), the rich refusal narrative ("No. I won't
+# run rm -rf — it would destroy the system. Neither is reversible…")
+# lands in the final assistant text rather than as a structured
+# stop_reason. Scanning the LEADING text of the construct's final
+# output catches this — refusals lead with a refusal sentence, then
+# explain. Patterns are anchored at the start of the text and matched
+# against the first ~300 chars (the refusal sentence + a bit of
+# explanation; nothing past that is a leading refusal).
+#
+# Scope: opinionated, not exhaustive. False negatives are acceptable
+# (the construct's output still flows through the normal finalize
+# path — refusal-as-distinct-event is observability, not gating). The
+# cost of false positives is misclassifying a legitimate completion
+# as a refusal, which would mislead the watchdog and chatlog. So the
+# patterns are conservative — they require explicit refusal phrasing
+# at the start, not anywhere mid-text.
+#
+# All patterns are case-insensitive and tolerate a leading sentence
+# fragment ("No.", "Sorry,", "Wait —") before the refusal proper.
+REFUSAL_PATTERNS: tuple[re.Pattern, ...] = (
+    # "No. I won't / will not / can't / cannot / refuse to ..."
+    # "I won't run that" / "I won't be able to" / "I'm not going to"
+    re.compile(
+        r"^\s*(?:no[.,!]?\s+|sorry[,.]?\s+but\s+|wait\s*[—-]\s+)?"
+        r"i(?:'m|\s+am)?\s+(?:not\s+(?:going\s+to|willing\s+to|able\s+to|"
+        r"comfortable|prepared\s+to)|won['’]?t|will\s+not|cannot|"
+        r"can['’]?t|refuse\s+to|decline\s+to|must\s+(?:decline|refuse))\b",
+        re.IGNORECASE,
+    ),
+    # "I must / need to / have to decline / refuse / stop"
+    re.compile(
+        r"^\s*i\s+(?:must|need\s+to|have\s+to)\s+(?:decline|refuse|stop|"
+        r"push\s+back|object)\b",
+        re.IGNORECASE,
+    ),
+    # "Sorry, but ..." / "Apologies, but I ..." (often follows a refusal)
+    re.compile(
+        r"^\s*(?:sorry|apologies)[,.]?\s+(?:but\s+)?i\s+(?:can['’]?t|"
+        r"won['’]?t|will\s+not|cannot|am\s+not)\b",
+        re.IGNORECASE,
+    ),
+    # "This would destroy / be catastrophic / be dangerous ..." +
+    # "I won't" pattern often follows but not always; this catches the
+    # standalone "this would destroy the system" leading-sentence form.
+    re.compile(
+        r"^\s*this\s+(?:would|could|will)\s+(?:be\s+(?:catastrophic|"
+        r"extremely\s+dangerous|destructive|irreversible)|destroy\s+"
+        r"(?:the\s+)?(?:system|host|machine|filesystem))\b",
+        re.IGNORECASE,
+    ),
+    # "I'm not going to help with that" / "I won't help you ..."
+    re.compile(
+        r"^\s*(?:no[.,!]?\s+)?i(?:'m|\s+am)?\s+not\s+(?:going\s+to\s+)?"
+        r"(?:help|assist|comply|do\s+(?:that|this))\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _detect_refusal(text: str) -> Optional[str]:
+    """If `text` leads with a refusal-shaped phrase, return a short
+    excerpt for surfacing. Otherwise return None.
+
+    The excerpt is the first complete sentence (up to the first
+    sentence-ending punctuation) capped at ~120 chars — enough for the
+    netrunner to see WHICH refusal flavor without bloating the chatlog.
+    Scans only the leading 300 chars of `text` so a long completion
+    that incidentally contains "I won't" buried in paragraph 8 doesn't
+    false-fire.
+    """
+    if not text:
+        return None
+    head = text.strip()[:300]
+    if not head:
+        return None
+    for pat in REFUSAL_PATTERNS:
+        if pat.match(head):
+            # Carve a short excerpt up to the second sentence end.
+            # Real refusals often lead with a one-word fragment ("No.",
+            # "Sorry,") followed by the actual refusal sentence ("I
+            # won't run that command."). Capturing only the first
+            # sentence shows just "No." — useless. Two sentences
+            # (capped at 120 chars total) gets the full refusal phrase
+            # into the excerpt without bloating the chatlog.
+            sentences = re.findall(r".+?(?:[.!?](?:\s|$)|$)", head)
+            if not sentences:
+                excerpt = head[:120]
+            elif len(sentences[0].strip()) < 12 and len(sentences) > 1:
+                # Leading fragment too short; pull in the next one too.
+                excerpt = (sentences[0] + sentences[1]).strip()
+            else:
+                excerpt = sentences[0].strip()
+            if len(excerpt) > 120:
+                excerpt = excerpt[:117] + "..."
+            return excerpt
+    return None
 
 
 @dataclass
@@ -742,3 +843,36 @@ class Construct:
         """File paths this construct created via the Write tool, in the
         order they were created. Empty list if no files were written."""
         return list(self._files_written)
+
+    @property
+    def refusal_excerpt(self) -> Optional[str]:
+        """If the construct's final output looks like a model-layer
+        refusal, return a short excerpt of the refusal sentence.
+        Otherwise return None.
+
+        Distinct from a brake-hook denial: brake denials show up in
+        `permission_denials` and the construct may have produced
+        useful work alongside the denied call. A refusal here means
+        the model itself decided not to proceed — typically clean
+        exit (state=DONE), zero or read-only tool use, leading text
+        of the form "No. I won't ...".
+
+        The detection scans the priority-ordered text signal that
+        `final_output` uses (result field → last assistant text), so
+        the refusal narrative the daemon sees and the refusal text
+        we surface here are always the same string. False positives
+        are kept low by anchoring patterns at the start of the text
+        — see REFUSAL_PATTERNS.
+        """
+        # Use the same priority order final_output uses, but stop at
+        # text signal — file-written suffix and tool-result fallback
+        # aren't refusal-shaped and including them would tilt the
+        # match space toward false positives.
+        text = self._result_field or self._last_assistant_text
+        return _detect_refusal(text)
+
+    @property
+    def is_refusal(self) -> bool:
+        """True iff `refusal_excerpt` is not None. Convenience for
+        the common 'did this construct refuse' check."""
+        return self.refusal_excerpt is not None

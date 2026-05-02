@@ -400,6 +400,13 @@ class Kind:
     FLEET_SPAWN_BLOCKED = "fleet.spawn_blocked"
     FLEET_SPAWN_FAILED = "fleet.spawn_failed"
     FLEET_EVENT = "fleet.event"  # per-construct streaming events
+    # Construct-refused marker (2026-05-02). Emitted alongside the
+    # finalize event when the model itself declined to proceed (clean
+    # exit, leading "I won't" / "No. I cannot" / etc.). Distinct from
+    # brake-hook denials, which gate individual tool calls. Severity
+    # is bumped to WARNING in the translator so subscribers can react
+    # without inspecting payloads. See fleet.py's _META_TYPE_TO_KIND.
+    CONSTRUCT_REFUSED = "construct.refused"
 
     # Daemon (Phase 3). DaemonEvent.kind enumerates: thinking, chat,
     # action, status, error, raw. Each maps to a daemon.<kind> bus
