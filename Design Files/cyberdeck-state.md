@@ -27,32 +27,197 @@ listing on Windows path normalization, focus traversal trap with empty
 main, Windows ProactorEventLoop shutdown noise) and we've been fixing
 them. Most of these would not have been caught by the test harness.
 
-**Up next:** **🚨 WEDGE-TIMEOUT DIAGNOSTIC GAP** (real-deck
-discovered 2026-05-01 early). A LOT of constructs (and
-occasionally the watchdog) hit the 30s wedge-timeout in
-`fleet.py:421` `c.wait(timeout=30.0)` — caught now (✅
-`kill_source: "fleet_wedge_timeout"` lands on finalize) but
-opaque about WHY each one wedges. `Construct.wait()`'s
-`TimeoutError` handler doesn't drain stderr before calling
-`self.kill()` — we throw away the only diagnostic signal claude
-subprocesses might leave behind. Three tight changes (~20 LOC
-total): (a) drain stderr with 2s timeout in the TimeoutError
-handler before kill, capture into `self._stderr_buf`; (b)
-include `stderr_excerpt` (last ~500 chars) in the finalize meta
-payload when `kill_source == "fleet_wedge_timeout"` so file
-logger + chatlog carry the breadcrumbs; (c) make wedge timeout
-configurable in Limits modal as `wedge_timeout_seconds`, default
-30. After (a)+(b) ship, future wedge kills come with claude's
-own error output — likely the Windows-orphan / cmd-wrapper
-pattern, but possibly also model-error / network-timeout cases
-we'd want to handle differently (those should retry, not just
-die).
+**SESSION ARC 2026-05-01 → 2026-05-02 — eleven commits shipped:**
+the safety architecture pass is now 4/4 complete (with phase 1.5
++ phase 2 sub-slices). Cache-cost and tripwire-race fixes also
+landed. All real-deck verified. Branch
+`claude/admiring-sutherland-91f342` pushed to origin; merge to
+main is the netrunner's call.
 
-**SAFETY ARCHITECTURE PASS** (in progress — 2.25/4 shipped):
-slice 1 (MCP gating), slice 2 (tripwire escalation chain), and
-quarter of slice 4 (host_restart_command in DEFAULT_TRIPWIRES)
-are landed. Slice 3 (variable-outcome pause UX) is the largest
-remaining piece. Composable cluster addressing the structural
+**✅ Wedge-timeout diagnostic** (commit f3f6f2d). Construct.wait()'s
+TimeoutError handler now drains stderr with a 2s ceiling before
+kill; `stderr_excerpt` lands on the finalize meta payload when
+`kill_source == "fleet_wedge_timeout"`; configurable via Limits
+modal as `wedge_timeout_seconds`, default 30s. Real-deck verified
+2026-05-01 (cx-796e0468 wedged silently with empty stderr — useful
+negative info: the wedge isn't a Python/Node trace pattern, it's
+claude's stream stalling).
+
+**SAFETY ARCHITECTURE PASS — 4/4 SHIPPED.**
+
+**✅ Slice 3 phase 1: variable-outcome delay UX** (commit e4981b0).
+Renamed pause→delay (pause is reserved for the deferred daemon-
+pause feature; this is a timed-default thing). Z→**X** as the
+deck-wide approval/execute key (mnemonic: X-ecute), bidirectional
+by context — under default/paranoid X approves a deny-default,
+under YOLO X interrupts an allow-default. Both x and Shift+X
+bound to action_x_focused. Filed in cyberdeck-keymap-revision.md
+as a spec constant.
+
+Per-brake matrix (when delay_window_seconds > 0):
+  YOLO     — every side-effect call delayed; default=allow; X=deny
+  Default  — only would-deny calls delayed; default=deny;  X=approve
+  Paranoid — only would-deny calls delayed; default=deny;  X=approve
+
+YOLO + delay needs the hook installed even though brake gating is
+a no-op there; brake_state.make_spawn_settings lifts the YOLO
+short-circuit when delay_window_seconds > 0. Tripwire-driven
+denies (deny_pending.json from slice 2) BYPASS the delay — those
+are hard-stop signals from the watchdog, not negotiable.
+
+Mechanism (file-protocol, mirrors slice 2's deny_pending.json):
+  - Hook writes `<cid>.delay_pending.json` when an interesting
+    call enters the delay window.
+  - Hook polls every 100ms for `<cid>.delay_override.json`. If
+    present, reads action, deletes both files, applies override.
+    Otherwise applies default at deadline.
+  - Deck-side DelayMonitor (new module brake_delay.py) polls the
+    spawns dir every 50ms, publishes brake.delay_opened /
+    brake.delay_resolved bus events on file appearance /
+    disappearance.
+
+UI: ConstructPane gets a delay overlay row pinned at the top of
+the pane: EJECT-style 20-cell countdown bar + bold "(Running |
+Redirecting) in Xs" verb chosen by default action + "press X to
+(block | approve)" hint. Pane gets promoted to the top of #main
+on delay open (mirror of compact-to-bottom). Heavy magenta
+border (.-delaying CSS class) — distinct from yellow $warning,
+red $error, green success, default $accent. Magenta is the
+deck-wide "time-sensitive, act on it or it auto-resolves" color.
+
+Initial design had a Delays right-panel tab (DelayListItem in a
+ListView). Real-deck testing 2026-05-01 caught that the tab
+"isn't selectable and is in a weird place" — promote-to-top +
+magenta border replaces it. DelayListItem class dropped before
+commit; per-pane overlay is the only surface.
+
+Files: brake_delay.py (new, ~280 LOC), brake_state.py (delay_
+window_seconds threaded through make_spawn_settings + YOLO
+short-circuit lift), brake_hook.py (should_delay + run_delay_
+window + main() integration), fleet.py (kwarg + threading),
+tui.py (overlay + handlers + refresh timer + X keybind + Limits
+field + magenta border + promote-to-top).
+
+**✅ Slice 3 phase 1.5: persist limits across restarts** (commit
+f97d1af). Both `delay_window_seconds` and `wedge_timeout_seconds`
+now survive deck restarts via a `limits` namespace in the same
+state.json file as brake. New helpers `brake_state.load_limits()`
++ `save_limits()`; read-merge-write so brake + limits saves don't
+clobber each other. max_concurrent / max_total_spawns / pool_size
+deliberately NOT persisted — they're session-scoped (netrunner
+sets caps per goal, not per deck install).
+
+**✅ Default delay_window_seconds bumped to 5s** (commit 6c6de8e)
+on CyberdeckApp.__init__. Fleet's __init__ default stays at 0.0
+since fleet.py console mode has no TUI to render the overlay.
+Existing installs that have opened Limits keep their persisted
+value; fresh installs and never-opened-Limits installs see the
+new default.
+
+**✅ Slice 3 phase 2: blacklist proposals + attention area** (commit
+2ed51c9). Closes slice 2's deferred application path. When a
+critical+bad_enough tripwire fires, deck builds a BlacklistEntry
+from the construct's context and files it as a 30s X-pressable
+approval prompt. New `attention.py` module: AttentionItem +
+AttentionKind + AttentionResolved + AttentionResolution. New
+AttentionPanel widget at the top of #main (heavy magenta border,
+hidden when empty, EJECT-style countdown bars per item).
+action_x_focused dispatch extended: focused-pane delay → sole-
+pending delay → most-recent attention item → toast. Approve
+adds the entry to the watchdog's session blacklist; expiry drops
+silently. Deck-owned timers (no hook polling — distinct from
+brake-hook delay). Bus events: attention.opened / attention.
+resolved (with reason field: approved | expired | dropped).
+
+**✅ Cache-cost fix** (commit 1dea7f7). Real-deck-observed: every
+spawn was hitting `cache_miss_reason: 'system_changed'` with
+~34k tokens missed, ~$0.07/spawn of avoidable cost. Diagnosis:
+per-spawn `<cid>.json` settings file (different path AND
+different content per spawn — construct_id was in the hook
+command) was the drift surface. Fix: stable `<home>/.cyberdeck/
+spawn_settings.json` with cid removed from argv. Hook now
+resolves cid at runtime via session_id from stdin → `<session_
+id>.cid` lookup file written by Fleet on system_init capture.
+Real-deck verified 2026-05-02: `system_changed` gone; remaining
+miss reason is `previous_message_not_found` (benign for fresh
+non-resume spawns). cache_read jumped from ~19k/spawn to
+~137k–219k/spawn — massive prefix-cache hit improvement.
+
+**✅ Tripwire-authoring spawn-race fix** (commit 8632b00). Real-
+deck observed in cyberdeck-2026-05-01-220027.log: tripwire
+authoring took ~25s while fast constructs finished in ~7-15s, so
+the entire spawn batch ran without authored coverage. Fix:
+DaemonSession._execute_action awaits a tripwire_authoring_
+complete asyncio.Event before each spawn action. Event is SET
+("ok to spawn") by default; cleared on _kick_off_tripwire_
+authoring; re-set in the wrapper's finally block (always —
+success/failure/crash). First spawn batch waits for authoring;
+subsequent batches in the same goal find event already set and
+proceed without delay. Netrunner sees a "[dim]waiting for
+tripwire authoring to complete before first spawn…[/dim]" status
+when the gate engages. Real-deck verified 2026-05-02 (cyberdeck-
+2026-05-02-012912.log): gate held 18s, all 6 spawns fired within
+100ms of authoring landing.
+
+**✅ Discrete bugs cluster** (commit 60b91aa).
+  - Enum payloads serialized as `{}` in `logger._serialize_
+    payload` because Enum.__dict__ is empty. Fix: isinstance
+    check before __dict__ probe; return payload.value. Affects
+    every brake.change / connection.transition log entry going
+    forward.
+  - Daemon over-volunteers destructive content: real-deck
+    observed daemon synthesizing `shutdown -h now` unprompted
+    when asked for an rm-rf test. Fix: new SAFETY-TEST
+    DISCIPLINE + GENERAL RULE sections in DAEMON_SYSTEM_PROMPT
+    instructing daemon to stay within explicit ask, treat
+    netrunner instructions as ceiling not floor.
+
+**Other shipped this session:**
+  - Tools/plugins/profiles retool design doc (commit de22d58).
+    Three-way split — tools = registered CLI binaries / scripts;
+    plugins = deck-extended capability bundles in deck source
+    (NOT home — brake hook protects deck source from constructs);
+    profiles = recipes (default prompt + tools list, plugins
+    daemon-wide). Implementation queued behind future sessions;
+    ~600 LOC across 4-5 phases. See `Design Files/cyberdeck-
+    tools-plugins-profiles-retool.md`.
+  - Diagnostic surface for compact + delay-armed signals (commit
+    e33ec75) — fleet_log writes when compact path schedules / fires
+    / fails, when delay is armed at spawn time. Helped diagnose
+    a heisenbug (compact-to-bottom stopped working after a render
+    crash; restart fixed it) — see Filed gotchas.
+  - Heisenbug filing for widget-render-crash → silently broken
+    move_child mutations (commit c4e19cb). See Terminal/Textual
+    gotchas section.
+  - Branch retool design + cleanup: stale `cool-tereshkova-0196b9`
+    branch deleted from remote (its content was superseded by
+    e4f722f on main).
+
+**Next session picks up at: REMAINING DISCRETE BUGS** (per
+netrunner direction "that shit is expensive"):
+  - Construct refusal text → structured `kind=construct.refused`
+    bus event (when claude's own model layer refuses, not brake-
+    hook denial — currently buried in result event text)
+  - Kill doesn't interrupt in-flight assistant turns — design
+    alongside future inject-and-interrupt v2
+  - Silent wedge investigation (cx-796e0468 case — empty
+    stderr_excerpt; needs more real-deck data points)
+
+**Big design doc waiting**: tools/plugins/profiles retool. Filed
+2026-05-02; not implemented. 4-5 sessions of focused work. Pick
+up with phase 1 (tools registry + hot-reload + missing-tool
+grey-out) as the smallest shippable slice.
+
+**Old "next up" wedge-timeout note (now ✅):** see commit f3f6f2d.
+
+**SAFETY ARCHITECTURE PASS** — 4/4 COMPLETE.
+slice 1 (MCP gating, ✅), slice 2 (tripwire escalation chain, ✅),
+slice 3 (variable-outcome delay UX phases 1+1.5+2, ✅), slice 4
+(DEFAULT_TRIPWIRES expansion, ✅ partial — `host_restart_command`
+shipped 2026-05-01 commit 2a53e0e; bigger expansion deemed
+unnecessary now that real-deck-confirmed LLM authoring
+consistently produces shell-destructive baselines). The pass is
+historical record now. Composable cluster addressing the structural
 truth surfaced by real-deck testing + log analysis: **the brake
 hook is doing 95% of real safety work; most other "safety"
 layers don't compose with it.** Tripwires were observation-only

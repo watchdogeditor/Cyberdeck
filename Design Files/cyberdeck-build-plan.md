@@ -520,28 +520,93 @@ footer; Ctrl+C-as-copy stops killing the deck (parent SIGINT
 swallow); smart Ctrl+Q with running-state guard; producers no
 longer maintain their own listener fan-out paths.
 
-**Next priorities:**
+**Next priorities (after 2026-05-02 session):**
 
-1. **🚨 WEDGE-TIMEOUT DIAGNOSTIC GAP (real-deck-discovered
-   2026-05-01 early).** A LOT of constructs hitting 30s wedge
-   timeout in `fleet.py:421` `c.wait(timeout=30.0)`. Caught now
-   (kill_source field stamps it) but opaque about WHY each one
-   wedges — `Construct.wait()`'s TimeoutError handler doesn't
-   drain stderr before kill, so we discard the only diagnostic
-   signal claude subprocesses might have left. Three changes,
-   ~20 LOC total: (a) drain stderr with 2s timeout in
-   TimeoutError handler before kill, capture into
-   `self._stderr_buf`; (b) include `stderr_excerpt` (~500 chars)
-   in finalize payload when `kill_source == "fleet_wedge_
-   timeout"`; (c) make wedge timeout configurable in Limits
-   modal as `wedge_timeout_seconds`, default 30. After (a)+(b)
-   ship, future wedge kills come with claude's own error output
-   — reveals whether it's the suspected Windows-orphan / cmd-
-   wrapper pattern or model/network errors that should retry
-   rather than die. Jumps the queue ahead of slice 3 because
-   wedge frequency is degrading the deck's everyday usefulness.
+The safety architecture pass is now 4/4 complete; the cache-cost
++ tripwire-race fixes also landed; three discrete bug fixes
+shipped. The queue resets to:
 
-2. **🔥 SAFETY ARCHITECTURE PASS (in progress — 2.25/4 shipped).**
+0. ~~**🚨 WEDGE-TIMEOUT DIAGNOSTIC GAP**~~ ✅ SHIPPED 2026-05-01
+   (commit f3f6f2d). Construct.wait()'s TimeoutError handler
+   drains stderr with a 2s ceiling before kill; stderr_excerpt
+   on finalize when kill_source=fleet_wedge_timeout; configurable
+   wedge_timeout_seconds via Limits modal. Real-deck verified.
+
+0a. ~~**🔥 SAFETY PASS slice 3 phases 1+1.5+2**~~ ✅ SHIPPED
+    2026-05-01 / 02 (commits e4981b0, e33ec75, c4e19cb, f97d1af,
+    6c6de8e, 2ed51c9). See state.md for the full delivery shape.
+    The pass is closed.
+
+0b. ~~**Cache-cost fix (cache_miss_reason: system_changed)**~~ ✅
+    SHIPPED 2026-05-02 (commit 1dea7f7). Stable spawn settings
+    file + session_id → cid lookup at hook runtime. Real-deck
+    verified: system_changed misses gone.
+
+0c. ~~**Tripwire-authoring spawn race**~~ ✅ SHIPPED 2026-05-02
+    (commit 8632b00). DaemonSession awaits authoring completion
+    before first spawn batch. Real-deck verified.
+
+0d. ~~**Discrete bugs cluster (enum payloads + daemon over-
+    volunteer)**~~ ✅ SHIPPED 2026-05-02 (commit 60b91aa).
+
+1. **TOOLS / PLUGINS / PROFILES RETOOL** (filed 2026-05-02 —
+   `Design Files/cyberdeck-tools-plugins-profiles-retool.md`,
+   commit de22d58). Three-way clean separation: tools = registered
+   CLI (binaries on PATH or scripts at listed paths), plugins =
+   deck-extended capability (folders in DECK SOURCE, not home;
+   brake hook protects them), profiles = recipes (default prompt
+   + tools list, plugins daemon-wide-decided per spawn). 4-5
+   phases, ~600 LOC. P1 (tools registry) is the smallest
+   shippable slice and useful even alone.
+
+2. **REMAINING DISCRETE BUGS** (per netrunner direction "that
+   shit is expensive"):
+   - Construct refusal text → structured `kind=construct.refused`
+     bus event. When claude itself refuses (model layer, not
+     brake hook), the rich refusal narrative lands as result.text
+     rather than a distinct event. Watchdog Q&A and chatlog
+     can't distinguish refusal from completion.
+   - Kill doesn't interrupt in-flight assistant turns — SIGTERM
+     lands AFTER model finishes turn (real money + observable
+     output continues post-kill). Stopping the model itself
+     requires stdin-injection or stream interrupt; design
+     alongside future inject-and-interrupt v2.
+   - Silent wedge investigation (cx-796e0468 case, real-deck
+     2026-05-02: empty stderr_excerpt on a wedge timeout —
+     useful negative info, but needs more data points to
+     characterize).
+
+3. **Caliber selection** (`cyberdeck-model-effort-design.md`).
+   Per-spawn model + effort + fast-mode bundle. Five phases;
+   phase 4 hard-blocks on quota-aware throttling (item 13
+   below), the rest are independent.
+
+4. **Daemon narrative fix** — daemon mislabels brake-hook
+   denials as tripwire fires.
+
+5. **Log-readability overhaul** — fleet/chatlog/watchdog/daemon
+   surfaces scattered; structural rearrangement.
+
+6. **Mechanic v1** — LLM session half (diagnose-only on-demand
+   triage). v0 supervisor shipped 2026-04-30. Liveness
+   heartbeat (mechanic v0→v1 bridge filed 2026-05-01) is the
+   natural first sub-slice.
+
+7. **Spine Phase 8b** — Pool + Daemon callback cleanup (low-
+   priority cleanup; integration interfaces, not deprecated
+   shims).
+
+8. Connection consequences round 2 — daemon parking on connection-
+   blocked spawns + recovery flow.
+
+9. Tripwires slice 3 (severity-aware rendering — critical pulls
+   focus, warning badges, low logs only). Composes with slice 3
+   of safety pass already shipped.
+
+(Old "🔥 SAFETY ARCHITECTURE PASS in progress" block kept below
+for historical reference.)
+
+OLD-STATUS. **🔥 SAFETY ARCHITECTURE PASS (in progress — 2.25/4 shipped).**
    Composable set of slices addressing the structural truths
    surfaced by 2026-04-30 late real-deck testing + log analysis:
    **brake hook is doing 95% of safety work alone**; tripwires

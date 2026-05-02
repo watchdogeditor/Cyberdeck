@@ -104,6 +104,71 @@ spawn. Both were dropped during the brake refactor. Brake is now
 deck-global (see below); tool narrowing is delegated to the brake
 hook layer (also below).
 
+### X = approval / execute (deck-wide, 2026-05-01)
+
+`x` (and `Shift+X`, same action) is the universal "netrunner takes
+action on this prompt" key. Bidirectional by context:
+
+  - On a brake-hook delay window with default=deny (default or
+    paranoid brake): X **approves** — flips the deny to allow.
+  - On a brake-hook delay window with default=allow (YOLO brake +
+    delay > 0): X **interrupts** — flips the allow to deny.
+  - On an attention-area item (blacklist proposal, future kinds):
+    X **approves** the proposal.
+
+Mnemonic: **X-ecute**. Filed in `cyberdeck-keymap-revision.md` as a
+spec constant. The per-pane delay overlay and the AttentionPanel
+both show what X will do BEFORE the press, so it's never ambiguous.
+
+### Variable-outcome delay UX (slice 3 of safety architecture pass, 2026-05-01)
+
+Brake hook holds qualifying tool calls for `delay_window_seconds`
+(default 5; configurable in Limits modal; persisted across
+restarts). The netrunner has the window to press X and override
+the brake's default outcome. Per-brake matrix:
+
+  - YOLO + delay > 0: hook installs (formerly didn't). Every
+    side-effect tool call delays. Default = allow, X = interrupt.
+  - Default: only would-deny calls delay. Default = deny, X = approve.
+  - Paranoid: same as Default's logic.
+
+UI: ConstructPane gets a delay overlay row pinned at the top of
+the pane when its tool call enters the delay window — EJECT-style
+20-cell countdown bar + bold "(Running | Redirecting) in Xs" + X
+hint. Pane gets promoted to the top of #main so it's where the
+netrunner is already looking. Heavy magenta border (.-delaying
+class) — distinct from yellow $warning, red $error, green
+success, default $accent. Magenta is the deck-wide "time-
+sensitive, act on it or it auto-resolves" color.
+
+Mechanism is file-protocol (mirrors slice 2's deny_pending.json):
+hook writes `<cid>.delay_pending.json`, polls for `<cid>.delay_
+override.json`, applies override if present or default at deadline.
+DelayMonitor (in brake_delay.py) publishes bus events on file
+appearance/disappearance.
+
+### Attention-needed area (slice 3 phase 2, 2026-05-02)
+
+AttentionPanel widget at the top of #main, hidden when empty,
+heavy magenta border + EJECT-style countdown bars per item. Today
+holds blacklist proposals (filed when critical+bad_enough tripwires
+fire). Future kinds plug in via `AttentionItem.kind`: per-spawn
+allowlist overrides, daemon-requested captures, slow-resume
+warnings.
+
+Distinct from the per-pane delay overlay because attention items
+aren't construct-scoped (the construct that triggered a blacklist
+proposal is already auto-termed by the time the proposal fires —
+the proposal is the netrunner's session-level call). Also distinct
+because the timer lives DECK-side (attention.py + tui.py) rather
+than in the brake hook subprocess.
+
+X-press resolution order (action_x_focused):
+  1. Focused construct pane with an open delay
+  2. Sole-pending brake-hook delay anywhere
+  3. Most-recent open AttentionItem
+  4. Toast "no pending action for X"
+
 ### Brake state (deck-global, runtime enforcement via hook)
 Three levels: paranoid / default / yolo. Set by the netrunner via
 the `b` modal (paranoid is single-press; yolo requires a 3-second
@@ -343,31 +408,89 @@ grep for existing similar work — the pattern is almost always there.
 ### `brake_state.py`
 - BrakeState enum (paranoid/default/yolo) + persistent store +
   listener pattern (mirrors ConnectionMonitor)
-- Per-spawn settings file generation at
-  `<home>/.cyberdeck/spawns/<construct_id>.json`
-- `cleanup_spawn_settings` runs on construct finalization
+- Per-spawn settings file generation at the STABLE shared path
+  `<home>/.cyberdeck/spawn_settings.json` (post-cache-fix
+  2026-05-02). Pre-fix it was `<home>/.cyberdeck/spawns/
+  <construct_id>.json` — different per spawn, both path AND
+  content; stabilizing closed the `cache_miss_reason: system_
+  changed` cache hemorrhage
+- `make_spawn_settings(brake, home, construct_id, delay_window_
+  seconds)` writes the shared file. Hook command shape stable
+  across spawns under the same brake+delay (no construct_id in
+  argv anymore — see brake_hook.py for the runtime resolution
+  path)
+- `write_session_cid_lookup(home, session_id, construct_id)` +
+  `cleanup_session_cid_lookup(home, session_id)` manage the
+  small `<home>/.cyberdeck/spawns/<session_id>.cid` lookup files
+  the hook reads to resolve cid at runtime. Fleet writes them on
+  system_init capture, cleans up on finalize
+- `load_limits(state_path)` + `save_limits(state_path, **values)`
+  manage the `limits` namespace inside state.json (delay_window_
+  seconds + wedge_timeout_seconds persist across deck restarts;
+  brake save preserves limits siblings via read-merge-write)
+- `cleanup_spawn_settings` runs on construct finalization. No-ops
+  on the new stable filename; still cleans legacy per-cid files
 
 ### `brake_hook.py`
 - Self-contained PreToolUse hook script invoked by claude per tool
   call. Reads JSON from stdin, brake state from argv, exits 0/2
   with stderr denial reason
-- ~180 LOC; depends only on stdlib (json, re, os, sys, pathlib)
-- Patterns are hand-curated and short — destructive bash regex
-  and OS-root path prefixes
-- **Both Bash and PowerShell are gated** (`SHELL_TOOLS` set +
-  `PARANOID_DENY_TOOLS` includes both). Claude Code on Windows
-  exposes PowerShell as a separate tool with the same `command`
-  shape; an LLM denied Bash will pivot to PowerShell automatically
-  if PowerShell isn't gated equivalently
+- ~700 LOC after slice 2 + slice 3 + cache fix; depends only on
+  stdlib (json, re, os, sys, time, pathlib)
+- Argv shape (post-2026-05-02): `python <hook> <brake> <delay_
+  window_seconds>`. construct_id is NOT in argv anymore — hook
+  resolves it at runtime via stdin's session_id + the
+  `<home>/.cyberdeck/spawns/<session_id>.cid` lookup file. This
+  stabilizes the hook command across spawns and keeps Anthropic's
+  prompt cache happy
+- Patterns: destructive bash regex, OS-root path prefixes, MCP
+  verb gating (default-deny destructive + unknown verbs; allow
+  read-shaped). `SHELL_TOOLS` covers Bash + PowerShell symmetrically
 - Path-aware shell check: any Bash/PowerShell command mentioning
-  one of three sentinel deck filenames (brake_hook.py,
-  brake_state.py, brake_patterns.py) is denied — closes the
-  redirect bypass route to the brake config itself
-- Deck-source-dir-as-substring matching was deliberately dropped:
-  cyberdeck-home/ sits inside the deck source dir, so a substring
-  match denies every legitimate plugin and dispatcher invocation
-- Future: watchdog will eventually author additional goal-scoped
-  patterns; this script's pattern lists are the always-on baseline
+  brake_hook.py / brake_state.py / brake_patterns.py is denied —
+  closes the redirect bypass route to the brake config itself
+- Slice 2: `read_and_clear_deny_pending` reads tripwire-engine-
+  written deny-pending flags keyed by construct_id (lookup-
+  resolved). 100ms recheck on write-class tools mitigates the
+  same-turn race
+- Slice 3: `should_delay` + `run_delay_window` implement the
+  variable-outcome delay UX. Hook writes `<cid>.delay_pending.
+  json` when an interesting call qualifies, polls every 100ms
+  for `<cid>.delay_override.json`, applies default action at
+  deadline expiry or override action when present. Hook installs
+  even under YOLO when delay > 0 (the "pause-before-allowing"
+  lane)
+
+### `brake_delay.py` (new 2026-05-01, slice 3 phase 1, ~280 LOC)
+- DelayEntry + DelayResolution dataclasses; AttentionResolution-
+  shaped `reason` field on resolved events ("override" / "expired")
+- DelayMonitor: 50ms polling task on `<home>/.cyberdeck/spawns/`
+  for `*.delay_pending.json` files written by brake_hook. Publishes
+  `brake.delay_opened` + `brake.delay_resolved` bus events on
+  appearance / disappearance. Tracks pending overrides via
+  `note_override(cid, action)` so resolution events attribute
+  correctly (override vs expired)
+- `write_delay_override(home, cid, action)` helper for the deck's
+  X-press handler to write the override file. `read_active_
+  delays(home)` for snapshot reads
+- Stdlib + asyncio only. No fsnotify dependency
+
+### `attention.py` (new 2026-05-02, slice 3 phase 2, ~200 LOC)
+- AttentionItem dataclass with item_id + kind + title + detail +
+  payload + opened_at/deadline_ts/window_seconds. Construct_id
+  optional (not all attention kinds are construct-scoped)
+- AttentionKind class-as-namespace: today only
+  `BLACKLIST_PROPOSAL`. Future kinds plug in here without
+  re-architecture
+- AttentionResolution: `APPROVED` / `EXPIRED` / `DROPPED`
+- AttentionResolved dataclass for `attention.resolved` bus event
+  payloads
+- App-side state + lifecycle (in tui.py): `_attention_items`
+  dict + `_attention_timers` dict + `_open_attention` /
+  `_approve_attention` / `_resolve_attention` helpers. Deck-
+  owned timers (asyncio Workers); approve cancels the timer
+  before resolve. Bus events: `attention.opened` /
+  `attention.resolved`
 
 ### `plugins.py` + `plugin_registry.py`
 - Plugin dataclass + manifest loader; one-shot registry that scans

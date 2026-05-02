@@ -4,8 +4,9 @@ A keyboard-first Textual TUI that orchestrates Claude Code subprocesses.
 The "daemon" coordinator decomposes goals; "constructs" execute in
 parallel; the "watchdog" oracle answers questions about fleet activity.
 Personal hobby project, in active production use on Windows.
-~19k LOC across 23 Python modules at the deck-source root (as of
-2026-04-30, post-spine + post-y/Y-copy + post-limits-rework).
+~22k LOC across 26 Python modules at the deck-source root (as of
+2026-05-02, post-safety-architecture-pass-4/4 + cache-cost-fix +
+attention-area + brake_delay.py + attention.py).
 
 The user is the "netrunner." Match the cyberpunk vocabulary in code
 and prose — these are the right names for what each thing does.

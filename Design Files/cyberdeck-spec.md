@@ -454,6 +454,14 @@ Inside text-input modals, alphabet keys type literally. Outside text inputs, the
 | `Esc` | Cancel modal / go up one hierarchy level |
 | `Enter` | Submit |
 
+### Approval / execute (deck-wide convention, 2026-05-01)
+
+| Key | Action |
+|---|---|
+| `x` / `X` | Approve / execute the most-relevant pending prompt — focused-pane brake-hook delay, sole-pending delay anywhere, or most-recent attention-area item |
+
+X is bidirectional by context — under default/paranoid brake it approves a deny-default; under YOLO it interrupts an allow-default. The per-pane delay overlay and AttentionPanel both show what X will do BEFORE the press. Mnemonic: **X-ecute**. Both lowercase and Shift+X are bound to the same `action_x_focused` (this isn't a soft/loud pair; it's deliberate-execute either way). See `cyberdeck-keymap-revision.md` Layer 1 inventory + spec-constants section for the full convention; this rule extends to any future netrunner-prompt surface (per-spawn allowlist override, daemon-requested capture, planning-mode launch).
+
 ### Emergency
 
 | Key | Action |
@@ -462,7 +470,9 @@ Inside text-input modals, alphabet keys type literally. Outside text inputs, the
 
 ### Reserved unassigned
 
-`g`, `z`, `x`, `v`, `b` and their Shift- variants stay free for future verbs. Empty keys are real estate, not bugs.
+`g`, `v` and their Shift- variants stay free for future verbs. Empty keys are real estate, not bugs.
+
+(`z` is zoom/expand; `b` is brake modal; `x`/`X` is approve/execute — all formerly reserved, now claimed.)
 
 ### Design principles
 
