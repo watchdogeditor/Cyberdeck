@@ -308,15 +308,55 @@ parses cleanly, `--list` returns `screenshot` against the right
 path, `--help` forwards to the plugin verbatim. End-to-end mss
 capture not exercised this session (needs a display target).
 
-**Next session picks up at: P3 of the retool** — `load_into_
-deck(app)` hook (~80 LOC). Optional function on each plugin's
-`plugin.py`; runs once at deck startup with the App instance
-after the TUI mounts. Lets plugins subscribe to bus events,
-register marker handlers, add widgets. screenshot stays no-op
-(pure stateless capture). Lays groundwork for future plugins
-(IR blaster, camera, etc.) without committing to specific use
-cases. See `Design Files/cyberdeck-tools-plugins-profiles-
-retool.md` §P3 for the full design.
+**✅ TOOLS RETOOL P3 SHIPPED 2026-05-03** (uncommitted as of this
+CLAUDE.md update). `load_into_deck(app)` hook for plugins. Each
+available plugin's `plugin.py` is imported into the deck process
+via `importlib.util.spec_from_file_location` (so plugin folders
+stay off sys.path) under a `cyberdeck_plugin_<name>` synthetic
+module; if the module defines a top-level callable
+`load_into_deck`, the deck calls it once at on_mount with the App
+instance. Per-plugin try/except — a crashing hook surfaces a
+chatlog warning but doesn't break startup.
+
+Three lifecycle outcomes published as bus events:
+  - `plugin.hook_loaded` — hook ran successfully (info severity,
+    yellow chatlog line "plugin hook loaded: <name>")
+  - `plugin.hook_skipped` — plugin has no hook (silent — most
+    plugins won't have one; chatlog noise would be worse than the
+    visibility benefit)
+  - `plugin.hook_error` — import failed, hook isn't callable, or
+    hook raised (warning severity, red chatlog line with reason)
+
+Wiring: separate bus subscription on filter `plugin.hook_*` —
+narrowed the existing `_handle_plugin_event` filter from `plugin.*`
+to explicit `[plugin.loaded, plugin.scan_error, plugin.scan_complete]`
+so the registry handler doesn't see hook events with their
+different payload shape. Hook events carry `{plugin_name, status,
+reason}` dicts; registry events carry `PluginEvent` dataclasses.
+Three new `Kind` constants in `event_bus.py`. ~210 LOC across
+tui.py + ~30 LOC in plugins.py docstring.
+
+Real-deck verified 2026-05-03 with a temporary smoketest plugin:
+- screenshot (no hook) → `plugin.hook_skipped`, silent ✓
+- smoketest with successful hook → `plugin.hook_loaded`, chatlog
+  yellow line, hook's own bus.publish from inside the deck
+  process worked (proved app access composes correctly) ✓
+- smoketest with raising hook → `plugin.hook_error` warning,
+  red chatlog line with full reason, deck still booted ✓
+
+Smoketest plugin then deleted; only screenshot stays in
+plugins/.
+
+**Next session picks up at: P4 of the retool** — profile schema
+migration: `recommended_tools` → `tools` (~100 LOC + daemon
+prompt rewrite). Field rename + semantic shift (registry names
+from tools.toml, not Claude Code tool names). Default profile
+auto-seed regenerated; existing user-edited profiles get
+migrated on first launch (idempotent). Daemon system prompt
+gains PLUGINS AVAILABLE catalog growth and per-profile tools
+enumeration. Spawn action JSON shape grows optional `plugins`
+field. See `Design Files/cyberdeck-tools-plugins-profiles-
+retool.md` §P4 for the full design.
 
 **Filed for Mechanic v0→v1 bridge (2026-05-01):** liveness heartbeat.
 Currently Mechanic v0 watches the deck PID — proves the process

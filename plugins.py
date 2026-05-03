@@ -37,6 +37,37 @@ for the Tools panel and daemon system prompt. Hot-reload is
 deliberately absent — plugins are code, not data, and Python module
 reloading is fraught.
 
+Deck-side hook (P3 of the retool, 2026-05-03):
+
+    # plugin.py module-level
+    def load_into_deck(app):
+        '''Optional. Called ONCE during deck startup, after the TUI
+        mounts. `app` is the cyberdeck CyberdeckApp instance — the
+        plugin can subscribe to bus events, register marker handlers,
+        add widgets, or do whatever its capability needs.
+
+        Per-plugin try/except guards the call: a crash here skips
+        this plugin's deck-side integration (chatlog warning) but
+        the deck still boots. Plugins should be defensive themselves
+        — failing to import an optional dep, for example, should
+        early-return rather than raise.
+
+        Idempotency: the deck calls load_into_deck once per launch.
+        If the plugin's setup is intrinsically idempotent (subscribe
+        + handle), it composes naturally with deck restart. If it
+        needs cleanup (timer task), the plugin can register a bus
+        subscription on `bus.shutdown` (or similar) — though today's
+        bus doesn't fire a shutdown event explicitly; cleanup happens
+        via process exit.
+        '''
+        ...
+
+The hook is OPTIONAL. Plugins like screenshot (pure stateless
+capture, no deck-side state) define no hook and skip silently. The
+deck imports `plugin.py` regardless to look for the function — so
+plugin.py must be import-clean (no top-level side effects beyond
+function/class definitions).
+
 This module is the data layer: Plugin dataclass + manifest loader.
 Pure data; zero integration with fleet/daemon/TUI.
 

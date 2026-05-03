@@ -3500,10 +3500,29 @@ class CyberdeckApp(App):
             bus=self.bus,
         )
         # Phase 8: bus subscription (same pattern as profile_registry).
+        # P3 of the retool added a separate hook-event subscription
+        # below — narrow this filter to registry-emitted kinds only
+        # so hook events (which carry a different payload shape)
+        # don't fall into the registry handler.
         self.bus.subscribe(
             self._handle_plugin_event,
-            filter=["plugin.*"],
+            filter=[
+                "plugin.loaded",
+                "plugin.scan_error",
+                "plugin.scan_complete",
+            ],
             name="tui.plugin_event",
+        )
+        # Plugin hook lifecycle events (P3 of the tools/plugins/
+        # profiles retool, 2026-05-03). Separate subscriber because
+        # the payload is a small dict, not a PluginEvent dataclass —
+        # avoids `if isinstance(payload, ...)` switching inside the
+        # registry handler. Bus filter scopes to the `plugin.hook_*`
+        # namespace.
+        self.bus.subscribe(
+            self._handle_plugin_hook_event,
+            filter=["plugin.hook_*"],
+            name="tui.plugin_hook_event",
         )
         # Tools registry (P1 of the tools/plugins/profiles retool, 2026-
         # 05-03). Single-file watcher over <home>/tools/tools.toml. The
@@ -4250,6 +4269,183 @@ class CyberdeckApp(App):
                     f"[dim]({avail} available{avail_note})[/dim]"
                 )
 
+    def _handle_plugin_hook_event(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber: plugin.hook_<status> event arrived.
+
+        Status: loaded / skipped / error. Only `error` and `loaded`
+        chatlog-render — `skipped` is the common case (a plugin
+        without deck-side integration like screenshot) and would
+        spam the chatlog if announced. P3 of the tools/plugins/
+        profiles retool, 2026-05-03."""
+        payload = deck_event.payload or {}
+        if not isinstance(payload, dict):
+            return
+        plugin_name = payload.get("plugin_name", "?")
+        status = payload.get("status", "?")
+        reason = payload.get("reason", "")
+        if status == "error":
+            short = reason.replace("\n", " ")
+            if len(short) > 160:
+                short = short[:157] + "..."
+            self._chatlog_write(
+                f"[red]plugin hook error:[/red] {plugin_name} · {short}"
+            )
+        elif status == "loaded":
+            self._chatlog_write(
+                f"[yellow]plugin hook loaded:[/yellow] [dim]{plugin_name}[/dim]"
+            )
+        # status == "skipped" is silent — it's the no-op-plugin case
+        # (most plugins won't have load_into_deck) and chatlog noise
+        # would be worse than the visibility benefit.
+
+    def _run_plugin_hooks(self) -> None:
+        """Call each available plugin's `load_into_deck(app)` hook,
+        if defined. P3 of the tools/plugins/profiles retool.
+
+        Runs once during on_mount, after plugin_registry.scan() has
+        populated the registry. Per-plugin try/except — a crashing
+        hook skips that plugin's deck-side integration but the deck
+        still boots.
+
+        Plugins are imported via `importlib.util.spec_from_file_
+        location` so the deck process loads `plugin.py` as a module
+        without putting plugin folders on sys.path. Module names use
+        a `cyberdeck_plugin_<name>` prefix to avoid sys.modules
+        collisions; `load_into_deck` is only called if it exists as
+        a module-level callable.
+
+        Skipped:
+          - Unavailable plugins (requires-failed): their deps may
+            not even be importable.
+          - Plugins with no `plugin.py` (`entry` field points
+            elsewhere): the subprocess entry can be a different file,
+            but deck-side integration must live in `plugin.py`.
+          - Plugins where `load_into_deck` doesn't exist: legitimate
+            no-op (screenshot is the canonical example — pure
+            stateless capture, nothing to integrate deck-side).
+
+        Errored:
+          - Module import raised
+          - `load_into_deck` exists but isn't callable
+          - `load_into_deck(app)` itself raised
+
+        Idempotency: this method runs ONCE during on_mount; the
+        plugin's hook implementation is responsible for being
+        idempotent against its own repeated bus subscribes etc. if
+        the deck somehow re-runs hooks (it shouldn't, but defending
+        the contract is cheap).
+        """
+        import importlib.util
+        import sys as _sys
+
+        for pl in self.plugin_registry.available():
+            if pl.source_dir is None:
+                # In-memory plugin (test fixture). No filesystem
+                # source to import from; skip.
+                self._publish_plugin_hook_event(
+                    pl.name, "skipped",
+                    reason="no source_dir",
+                )
+                continue
+            plugin_py = pl.source_dir / "plugin.py"
+            if not plugin_py.is_file():
+                self._publish_plugin_hook_event(
+                    pl.name, "skipped",
+                    reason=f"no plugin.py at {plugin_py}",
+                )
+                continue
+
+            module_name = f"cyberdeck_plugin_{pl.name}"
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    module_name, plugin_py,
+                )
+                if spec is None or spec.loader is None:
+                    self._publish_plugin_hook_event(
+                        pl.name, "error",
+                        reason="spec_from_file_location returned None",
+                    )
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                # Stash in sys.modules so relative imports inside
+                # the plugin work and so the mechanic v2 integrity
+                # scan (deferred) can find loaded modules.
+                _sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+            except Exception as exc:
+                self._publish_plugin_hook_event(
+                    pl.name, "error",
+                    reason=f"import failed: {exc!r}",
+                )
+                continue
+
+            hook = getattr(module, "load_into_deck", None)
+            if hook is None:
+                # Legitimate no-op — plugin has no deck-side
+                # integration (e.g. screenshot, pure capture).
+                self._publish_plugin_hook_event(
+                    pl.name, "skipped",
+                    reason="no load_into_deck",
+                )
+                continue
+            if not callable(hook):
+                self._publish_plugin_hook_event(
+                    pl.name, "error",
+                    reason=(
+                        f"load_into_deck is not callable "
+                        f"(got {type(hook).__name__})"
+                    ),
+                )
+                continue
+
+            try:
+                hook(self)
+            except Exception as exc:
+                self._publish_plugin_hook_event(
+                    pl.name, "error",
+                    reason=f"load_into_deck raised: {exc!r}",
+                )
+                continue
+
+            self._publish_plugin_hook_event(pl.name, "loaded")
+
+    def _publish_plugin_hook_event(
+        self,
+        plugin_name: str,
+        status: str,
+        *,
+        reason: str = "",
+    ) -> None:
+        """Emit a `plugin.hook_<status>` bus event.
+
+        Status: loaded / skipped / error. Severity: error events
+        ride at WARNING (not ERROR — a single broken plugin
+        shouldn't poison the broader log signal); loaded/skipped
+        ride at INFO. Same convention as plugin.scan_error vs
+        plugin.loaded."""
+        try:
+            from event_bus import DeckEvent
+            severity = "warning" if status == "error" else "info"
+            self.bus.publish(DeckEvent(
+                kind=f"plugin.hook_{status}",
+                source="tui.plugin_hooks",
+                severity=severity,
+                payload={
+                    "plugin_name": plugin_name,
+                    "status": status,
+                    "reason": reason,
+                },
+            ))
+        except Exception as exc:
+            # Defense in depth — bus publish failure shouldn't
+            # break the hook-loading loop.
+            import sys as _sys
+            print(
+                f"plugin_hook: bus publish failed for "
+                f"{plugin_name!r}: {exc!r}",
+                file=_sys.stderr,
+            )
+
     def _handle_tool_event(self, deck_event: "DeckEvent") -> None:
         """Bus subscriber: tool.<kind> event arrived.
 
@@ -4354,6 +4550,27 @@ class CyberdeckApp(App):
             import sys as _sys
             print(
                 f"plugin_registry: top-level scan crashed: {exc!r}",
+                file=_sys.stderr,
+            )
+        # Plugin deck-side hooks (P3 of the tools/plugins/profiles
+        # retool, 2026-05-03). Each available plugin gets its
+        # plugin.py imported into the deck process and its optional
+        # `load_into_deck(app)` function called once. Deliberately
+        # AFTER scan() so we know which plugins are available + valid;
+        # AFTER the rest of on_mount's setup completes is unnecessary
+        # — plugins receive `self` and can inspect/subscribe to
+        # whatever they need at the time the hook fires. Per-plugin
+        # try/except inside _run_plugin_hooks; a crashing hook
+        # surfaces a chatlog warning but doesn't break startup.
+        try:
+            self._run_plugin_hooks()
+        except Exception as exc:
+            # Top-level guard: should never trigger because
+            # _run_plugin_hooks has its own per-plugin try/except,
+            # but defensive in case the loop itself crashes.
+            import sys as _sys
+            print(
+                f"plugin_hooks: loop crashed: {exc!r}",
                 file=_sys.stderr,
             )
         # Watchdog worker loop. Idempotent start; runs until

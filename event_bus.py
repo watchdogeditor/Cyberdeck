@@ -472,6 +472,19 @@ class Kind:
     PLUGIN_SCAN_ERROR = "plugin.scan_error"
     PLUGIN_SCAN_COMPLETE = "plugin.scan_complete"
 
+    # Plugin deck-side hooks (P3 of the tools/plugins/profiles
+    # retool, 2026-05-03). Each available plugin's optional
+    # `load_into_deck(app)` function fires one of these:
+    #   loaded  — hook ran successfully
+    #   skipped — plugin has no hook (legitimate no-op like
+    #             screenshot) or the import target is missing
+    #   error   — import failed, hook isn't callable, or hook raised
+    # Payload: dict with plugin_name / status / reason. Severity:
+    # WARNING for error, INFO otherwise.
+    PLUGIN_HOOK_LOADED = "plugin.hook_loaded"
+    PLUGIN_HOOK_SKIPPED = "plugin.hook_skipped"
+    PLUGIN_HOOK_ERROR = "plugin.hook_error"
+
     # Tools registry (P1 of the tools/plugins/profiles retool, 2026-
     # 05-03). ToolEvent.kind ∈ {added, changed, removed, unavailable,
     # scan_error, scan_complete} maps to tool.<kind>. unavailable +
