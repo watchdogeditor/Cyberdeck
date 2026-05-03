@@ -240,19 +240,64 @@ deciding the request is something it shouldn't do at all.
     branch deleted from remote (its content was superseded by
     e4f722f on main).
 
-**Next session picks up at: BUILD-PLAN PIVOT.** Discrete-bugs list
-worked through to the practical floor. Two remaining items aren't
-fixable today:
+**✅ TOOLS REGISTRY (P1 of tools/plugins/profiles retool)** shipped
+2026-05-03. The first slice of the four-phase retool. New
+`tools.py` (data layer) + `tools_registry.py` (mtime-watch
+registry) provide a single-file watcher over
+`<home>/tools/tools.toml`. Schema:
+
+  [[tool]]
+  name        = "ripgrep"
+  kind        = "binary"       # "binary" | "script"
+  command     = "rg"
+  description = "Fast recursive grep."
+  # path      = "..."          # optional. Override for binaries,
+                                # path-to-script for scripts.
+                                # ${tools_dir} substitutes to
+                                # <home>/tools/.
+  # help_text = "..."          # optional. Longer description.
+
+Existence check at load: `shutil.which(command)` for binaries (or
+the `path` override if set), `Path(path).exists()` for scripts.
+Failures downgrade to `available=False` with reason but stay
+registered, mirroring plugin availability.
+
+  - **Bus events**: `tool.added` / `tool.changed` / `tool.removed`
+    / `tool.unavailable` / `tool.scan_error` / `tool.scan_complete`.
+    `unavailable` and `scan_error` escalate to WARNING severity;
+    rest are INFO.
+  - **Default seed**: tools.toml writes a comment-only template on
+    first run (mirrors profile_registry's auto-seed). Re-seeds on
+    deletion — netrunner edits are sacred.
+  - **TUI wiring**: new TOOLS section in the Tools tab between
+    Plugins and Scripts. ListView with kind glyphs (⚙ binary,
+    ⌬ script) + cyan-name-when-available, red ✗ + dim-name-when-
+    not. Per the gotcha note in this doc, `_right_panel_focusables`
+    grew the new ListView so W/S nav reaches it.
+  - **Lifecycle**: same shape as ProfileRegistry — `start()` does
+    initial scan + spawns 1s-poll watcher; `shutdown()` is
+    idempotent and called from the deck's existing teardown path.
+
+Real-deck verification pending. Smoke tests passed: registry
+default-seeds tools.toml on missing, mtime-watcher picks up live
+edits, bus fires correct event kinds + severities, bad TOML
+preserves prior state and surfaces scan_error, panel re-renders
+on scan_complete. ~520 LOC across 2 new files (tools.py +
+tools_registry.py) + ~120 LOC in tui.py. Existing SCRIPTS section
+preserved as-is (legacy flat-file scan); P5 of the retool will
+collapse both into one unified panel. P2-P5 still queued.
+
+**Next session picks up at: P2 of the retool — move plugins to
+deck source + bridge dispatcher** (`cyberdeck-tools-plugins-
+profiles-retool.md` §P2, ~120 LOC). Or pivot to one of the other
+queued items: caliber selection, Mechanic v0 follow-ups, Phase 8b.
+
+Two discrete bugs from earlier remain deferred (not fixable
+today):
   - Kill doesn't interrupt in-flight assistant turns — design
-    alongside future inject-and-interrupt v2; not a quick fix
+    alongside future inject-and-interrupt v2
   - Silent wedge investigation (cx-796e0468 case — empty
     stderr_excerpt; needs more real-deck data points)
-Pivoting back to the build plan: caliber selection (per-spawn
-model + effort + fast-mode — see `cyberdeck-model-effort-design.
-md`) is queued, with Mechanic v0 follow-ups (track non-construct
-subprocess sources) and Phase 8b (Pool/Daemon callback cleanup)
-on deck. Tools/plugins/profiles retool design also waiting at
-phase 1 (tools registry + hot-reload + missing-tool grey-out).
 
 **Big design doc waiting**: tools/plugins/profiles retool. Filed
 2026-05-02; not implemented. 4-5 sessions of focused work. Pick

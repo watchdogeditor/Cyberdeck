@@ -49,6 +49,7 @@ from display import (
 )
 from profiles import Profile
 from profile_registry import ProfileRegistry, ProfileEvent
+from tools_registry import ToolRegistry, ToolEvent
 from plugins import Plugin
 from plugin_registry import PluginRegistry, PluginEvent
 from session_manager import SessionManager, SessionPool, PoolEvent
@@ -3472,6 +3473,22 @@ class CyberdeckApp(App):
             filter=["plugin.*"],
             name="tui.plugin_event",
         )
+        # Tools registry (P1 of the tools/plugins/profiles retool, 2026-
+        # 05-03). Single-file watcher over <home>/tools/tools.toml. The
+        # netrunner declares system-installed CLIs (binaries on PATH,
+        # scripts on disk) here; the deck checks at load time whether
+        # each is reachable and surfaces the result in the Tools panel.
+        # Same lifecycle as profile_registry: started in on_mount, shut
+        # down in on_unmount, hot-reloads on file edit.
+        self.tool_registry = ToolRegistry(
+            self.home_dir / "tools",
+            bus=self.bus,
+        )
+        self.bus.subscribe(
+            self._handle_tool_event,
+            filter=["tool.*"],
+            name="tui.tool_event",
+        )
         # Watchdog Q&A oracle. Async question→answer pipe backed by
         # one-shot `claude -p` invocations. The simpler half of the
         # spec'd Watchdog (tripwires + blacklist still deferred).
@@ -3859,6 +3876,22 @@ class CyberdeckApp(App):
                             # glance which plugins are installed but
                             # missing dependencies.
                             yield ListView(id="tools_plugin_list")
+                            # Tools section (P1 of the tools/plugins/
+                            # profiles retool, 2026-05-03). Mirrors
+                            # the plugins section's shape: registry-
+                            # backed, available/unavailable indicator,
+                            # ListView of focusable rows. Sourced from
+                            # <home>/tools/tools.toml — netrunner-
+                            # declared system CLIs the deck knows
+                            # about. SCRIPTS section below remains
+                            # for now (legacy flat-file scan); the
+                            # P5 UI retool collapses both into one
+                            # unified Tools section.
+                            yield Label(
+                                "[b]TOOLS[/b]  [dim](0)[/dim]",
+                                id="tools_registry_header",
+                            )
+                            yield ListView(id="tools_registry_list")
                             yield Label(
                                 "[b]SCRIPTS[/b]  [dim](0)[/dim]",
                                 id="tools_scripts_header",
@@ -3916,6 +3949,9 @@ class CyberdeckApp(App):
             plugins_list = self.query_one(
                 "#tools_plugin_list", ListView
             )
+            tools_registry_list = self.query_one(
+                "#tools_registry_list", ListView
+            )
             header = self.query_one(
                 "#tools_profiles_header", Label
             )
@@ -3924,6 +3960,9 @@ class CyberdeckApp(App):
             )
             plugins_header = self.query_one(
                 "#tools_plugins_header", Label
+            )
+            tools_registry_header = self.query_one(
+                "#tools_registry_header", Label
             )
         except Exception:
             # Pre-mount or test harness without right panel.
@@ -4030,6 +4069,59 @@ class CyberdeckApp(App):
                         PluginListItem(pl, label_markup)
                     )
 
+        # Tools section (registry-backed, P1 retool 2026-05-03).
+        # Reads from <home>/tools/tools.toml via tool_registry. Each
+        # row prefixed with a kind glyph — ⚙ for binary, ⌬ for
+        # script — so the netrunner can scan kinds at a glance.
+        # Available entries render in cyan; unavailable ones get the
+        # red ✗ + dimmed name treatment that mirrors plugin rendering.
+        tools_by_kind = self.tool_registry.by_kind()
+        tool_total = sum(len(ts) for ts in tools_by_kind.values())
+        tool_avail = len(self.tool_registry.available())
+        if tool_avail == tool_total:
+            tools_registry_header.update(
+                f"[b]TOOLS[/b]  [dim]({tool_total})[/dim]"
+            )
+        else:
+            tools_registry_header.update(
+                f"[b]TOOLS[/b]  [dim]({tool_avail}/{tool_total} "
+                f"available)[/dim]"
+            )
+        tools_registry_list.clear()
+        if tool_total == 0:
+            empty_item = ListItem(Label(
+                "[dim](no tools — add [[tool]] entries to "
+                "~/tools/tools.toml)[/dim]",
+                markup=True,
+            ))
+            empty_item.disabled = True
+            tools_registry_list.append(empty_item)
+        else:
+            # Glyph by kind. P5 of the retool will collapse plugins
+            # into the same panel and add ⊕ for plugin; for now we
+            # render only registry tools (binary/script).
+            kind_glyphs = {"binary": "⚙", "script": "⌬"}
+            for kind, tools_in_kind in tools_by_kind.items():
+                glyph = kind_glyphs.get(kind, "?")
+                for tool in tools_in_kind:
+                    if tool.available:
+                        avail_marker = f"[dim]{glyph}[/dim]"
+                        name_color = "cyan"
+                    else:
+                        avail_marker = "[red]✗[/red]"
+                        name_color = "dim"
+                    label_markup = (
+                        f"{avail_marker} "
+                        f"[{name_color}]{tool.name}[/{name_color}]"
+                    )
+                    # ListItem with the tool stashed for downstream
+                    # handlers (z-magnify, future launch). We don't
+                    # have a dedicated ToolListItem dataclass yet —
+                    # P5 may add one alongside the unified panel.
+                    item = ListItem(Label(label_markup, markup=True))
+                    item.tool = tool  # type: ignore[attr-defined]
+                    tools_registry_list.append(item)
+
         # Scripts section. Disk-scanned from <home>/tools/<cat>/<file>.
         # The dispatcher (tools/deck/cyberdeck.py) shows up here on
         # first run because bootstrap writes it. Constructs that
@@ -4124,6 +4216,54 @@ class CyberdeckApp(App):
                     f"[dim]({avail} available{avail_note})[/dim]"
                 )
 
+    def _handle_tool_event(self, deck_event: "DeckEvent") -> None:
+        """Bus subscriber: tool.<kind> event arrived.
+
+        P1 of the tools/plugins/profiles retool. Mirrors the shape of
+        _handle_profile_event / _handle_plugin_event: per-event
+        kinds (added/changed/removed/unavailable) are quiet, the
+        scan_complete tick rebuilds the Tools panel and posts a
+        chatlog line. scan_error surfaces inline so the netrunner
+        sees broken tools.toml fast.
+        """
+        event: ToolEvent = deck_event.payload
+        if event.kind == "scan_error":
+            err = (event.error or "?").replace("\n", " ")
+            if len(err) > 120:
+                err = err[:117] + "..."
+            self._chatlog_write(
+                f"[red]tools error:[/red] {err}"
+            )
+            return
+        if event.kind == "unavailable":
+            # Per-tool unavailability gets a soft chatlog note —
+            # netrunner-actionable signal (the tool's declared but
+            # missing). Short form, the panel renders the full reason
+            # on hover.
+            reason = (event.error or "?").replace("\n", " ")
+            if len(reason) > 100:
+                reason = reason[:97] + "..."
+            self._chatlog_write(
+                f"[yellow]tool unavailable:[/yellow] "
+                f"[b]{event.name}[/b] [dim]· {reason}[/dim]"
+            )
+            return
+        if event.kind == "scan_complete":
+            self._refresh_tools_panel()
+            total = len(self.tool_registry.all())
+            avail = len(self.tool_registry.available())
+            # Suppress chatlog noise on the empty-registry case (fresh
+            # install, no [[tool]] entries declared yet).
+            if total > 0:
+                avail_note = (
+                    f", {total - avail} unavailable"
+                    if avail != total else ""
+                )
+                self._chatlog_write(
+                    f"[yellow]tools updated[/yellow] "
+                    f"[dim]({avail} available{avail_note})[/dim]"
+                )
+
     def on_mount(self) -> None:
         self.title = "Cyberdeck"
         self._refresh_subtitle()
@@ -4156,6 +4296,13 @@ class CyberdeckApp(App):
         self._profile_registry_start_task = asyncio.create_task(
             self.profile_registry.start(),
             name="profile-registry-start",
+        )
+        # Tools registry (P1 retool 2026-05-03). Same lifecycle shape
+        # as profile_registry — start() does an initial scan + spawns
+        # a background mtime-watcher; on_unmount calls shutdown().
+        self._tool_registry_start_task = asyncio.create_task(
+            self.tool_registry.start(),
+            name="tool-registry-start",
         )
         # Plugin registry is one-shot: scan synchronously here. No
         # background task to manage, no shutdown needed. Failures
@@ -4465,6 +4612,10 @@ class CyberdeckApp(App):
             # Stop the profile registry's poll loop. Idempotent — safe
             # if start() never finished or hadn't been called.
             await self.profile_registry.shutdown()
+
+            # Stop the tools registry's poll loop (P1 retool 2026-05-
+            # 03). Same idempotent shape as profile_registry.shutdown.
+            await self.tool_registry.shutdown()
 
             # Stop the watchdog worker. Cancels any in-flight question
             # subprocess; queued questions are dropped (matches EJECT
@@ -6870,11 +7021,12 @@ class CyberdeckApp(App):
             if active_tab == "tools_tab":
                 # Order matters: list as they appear top-to-bottom in
                 # the tab so W/S walks visually rather than out-of-
-                # order. Profiles first, Plugins second, Scripts last
-                # — same as the compose() order.
+                # order. Profiles → Plugins → Tools (P1 retool) →
+                # Scripts — same as the compose() order.
                 return [
                     self.query_one("#tools_profile_list", ListView),
                     self.query_one("#tools_plugin_list", ListView),
+                    self.query_one("#tools_registry_list", ListView),
                     self.query_one("#tools_scripts_list", ListView),
                 ]
         except Exception:

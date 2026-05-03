@@ -472,6 +472,18 @@ class Kind:
     PLUGIN_SCAN_ERROR = "plugin.scan_error"
     PLUGIN_SCAN_COMPLETE = "plugin.scan_complete"
 
+    # Tools registry (P1 of the tools/plugins/profiles retool, 2026-
+    # 05-03). ToolEvent.kind ∈ {added, changed, removed, unavailable,
+    # scan_error, scan_complete} maps to tool.<kind>. unavailable +
+    # scan_error escalate to WARNING severity in the registry's
+    # _emit; the rest stay INFO.
+    TOOL_ADDED = "tool.added"
+    TOOL_CHANGED = "tool.changed"
+    TOOL_REMOVED = "tool.removed"
+    TOOL_UNAVAILABLE = "tool.unavailable"
+    TOOL_SCAN_ERROR = "tool.scan_error"
+    TOOL_SCAN_COMPLETE = "tool.scan_complete"
+
     # Direct chatlog writes (Phase 6). Pre-rendered lines that the TUI
     # composes itself (tripwire fire chrome, brake transition lines,
     # blacklist additions, goal-update markers, watchdog Q&A

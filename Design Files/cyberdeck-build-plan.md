@@ -580,8 +580,26 @@ shipped. The queue resets to:
    deck-extended capability (folders in DECK SOURCE, not home;
    brake hook protects them), profiles = recipes (default prompt
    + tools list, plugins daemon-wide-decided per spawn). 4-5
-   phases, ~600 LOC. P1 (tools registry) is the smallest
-   shippable slice and useful even alone.
+   phases, ~600 LOC.
+
+   - **✅ P1 (tools registry + hot-reload + missing-tool grey-
+     out)** shipped 2026-05-03. New `tools.py` + `tools_registry.
+     py`; mtime-watch over `<home>/tools/tools.toml`; bus events
+     `tool.added` / `tool.changed` / `tool.removed` / `tool.
+     unavailable` / `tool.scan_error` / `tool.scan_complete`;
+     existence check via shutil.which / Path.exists; default-
+     seeded tools.toml with inline schema docs; TOOLS section in
+     the Tools tab with ⚙/⌬ kind glyphs + red-✗-when-unavailable.
+     Existing SCRIPTS section preserved (P5 collapses both).
+     ~520 LOC + ~120 LOC tui.py wiring. Real-deck verification
+     pending.
+   - P2 — move plugins to deck source + bridge dispatcher
+     (~120 LOC) — next.
+   - P3 — `load_into_deck(app)` hook (~80 LOC).
+   - P4 — profile schema migration: `recommended_tools` → `tools`
+     (~100 LOC + daemon prompt rewrite).
+   - P5 — UI retool: Profiles its own tab, unified Tools tab
+     (~150 LOC).
 
 2. **REMAINING DISCRETE BUGS** (per netrunner direction "that
    shit is expensive"):

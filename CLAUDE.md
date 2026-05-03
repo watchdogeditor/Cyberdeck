@@ -258,14 +258,23 @@ stay deferred:
    stderr_excerpt; needs more real-deck data points before
    it's actionable.
 
-**Next session picks up at: BUILD-PLAN PIVOT.** With discrete-
-bugs at the practical floor, queue is back to design-led work.
-Top of the priority queue: caliber selection (per-spawn model +
-effort + fast-mode — see `cyberdeck-model-effort-design.md`).
-Mechanic v0 follow-ups (track non-construct subprocess sources)
-and Phase 8b (Pool/Daemon callback cleanup) on deck. Tools/
-plugins/profiles retool design also waiting at phase 1 (tools
-registry + hot-reload + missing-tool grey-out).
+**✅ TOOLS RETOOL P1 SHIPPED 2026-05-03.** First slice of the
+four-phase tools/plugins/profiles retool. New `tools.py` + `tools_
+registry.py` with mtime-watch over `<home>/tools/tools.toml`,
+existence-check via shutil.which/Path.exists, bus events
+(`tool.added/changed/removed/unavailable/scan_error/scan_
+complete`), default-seeded tools.toml with inline schema docs,
+TOOLS section in the Tools tab with ⚙/⌬ kind glyphs and red-✗-
+when-unavailable rendering. ~520 LOC across new files + ~120 LOC
+tui.py wiring. Real-deck verification pending. Existing SCRIPTS
+section preserved; P5 collapses both into one unified panel.
+
+**Next session picks up at: P2 of the retool** — move plugins
+into deck source + bridge dispatcher (~120 LOC). The brake hook's
+deck-source-write protection extends automatically to plugin
+code, closing the "construct writes a half-baked plugin file"
+failure mode at the filesystem layer. See `Design Files/cyberdeck-
+tools-plugins-profiles-retool.md` §P2 for the full design.
 
 **Filed for Mechanic v0→v1 bridge (2026-05-01):** liveness heartbeat.
 Currently Mechanic v0 watches the deck PID — proves the process
