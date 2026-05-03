@@ -1,27 +1,41 @@
 """
 Plugins: prescriptive capability bundles on disk.
 
-A plugin lives at <home>/plugins/<name>/ and consists of:
+A plugin lives at <deck-source>/plugins/<name>/ (post-P2 of the
+tools/plugins/profiles retool, 2026-05-03 — pre-P2 they lived under
+<home>/plugins/). Each plugin folder contains:
   - plugin.toml  — manifest (name, category, description, entry, requires)
   - README.md    — LLM-facing interface docs (loaded into context lazily)
-  - <entry>      — executable entry point (typically Python; any language
-                   that can be invoked via the netrunner's shell works)
+  - <entry>      — executable entry point (typically `plugin.py`; any
+                   language that can be invoked via Python works since
+                   the bridge dispatcher is what constructs talk to)
 
 Plugins extend the deck's capability surface in directions Bash alone
 can't reach: cross-platform interfaces (camera, IR blaster, NFC),
 external service integrations (MCP-shaped plugins are a v2 sub-shape),
 and stateful sessions (also v2). v1 ships stateless plugins only —
 each invocation is a fresh subprocess; output flows back on stdout,
-errors on stderr, exit code signals success/failure. Constructs
-invoke plugins via Bash per instructions in their system-prompt
-addendum, the same way they invoke scripts.
+errors on stderr, exit code signals success/failure.
+
+Constructs do NOT invoke plugin entry scripts directly. They go
+through the bridge dispatcher at <home>/tools/deck/plugin_bridge.py
+(bootstrapped on every deck launch by tui._bootstrap_plugin_bridge),
+which forwards `python <bridge> <plugin_name> [args...]` to the
+plugin's entry script in deck source. Two reasons:
+  1. Constructs don't need to know where deck source lives —
+     keeps plugin invocations cache-friendly across deck moves.
+  2. Putting plugin code in <deck-source>/ means the brake hook's
+     deck-source-write protection (path_is_protected) prevents
+     constructs from corrupting plugin files via Write/Edit/Bash.
+     The bridge is regenerated on every deck launch, so it can't
+     be persistently tampered with either.
 
 Discovery is import-on-startup. PluginRegistry (plugin_registry.py)
-walks <home>/plugins/, validates each manifest, checks `requires`
-(platforms, python imports), and exposes loaded plugins for the
-Tools panel and daemon system prompt. Hot-reload is deliberately
-absent — plugins are code, not data, and Python module reloading is
-fraught.
+walks <deck-source>/plugins/, validates each manifest, checks
+`requires` (platforms, python imports), and exposes loaded plugins
+for the Tools panel and daemon system prompt. Hot-reload is
+deliberately absent — plugins are code, not data, and Python module
+reloading is fraught.
 
 This module is the data layer: Plugin dataclass + manifest loader.
 Pure data; zero integration with fleet/daemon/TUI.
@@ -31,7 +45,7 @@ Manifest shape:
     name = "screenshot"
     category = "Capture"
     description = "Capture the current screen as a PNG."
-    entry = "run.py"
+    entry = "plugin.py"
 
     [requires]
     platforms = ["windows", "linux", "darwin"]

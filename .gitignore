@@ -19,12 +19,14 @@ Desktop.ini
 .claude/settings.local.json
 .claude/worktrees/
 
-# Cyberdeck runtime working dir — keep profile templates and
-# plugin bundles, ignore everything else (logs, ejection snapshots,
-# bootstrapped dispatcher script, construct work outputs).
+# Cyberdeck runtime working dir — keep profile templates, ignore
+# everything else (logs, ejection snapshots, bootstrapped dispatcher
+# scripts, construct work outputs). Plugin bundles moved out of
+# cyberdeck-home/plugins/ into <deck-source>/plugins/ in P2 of the
+# tools/plugins/profiles retool (2026-05-03) — the brake hook's
+# deck-source-write protection now extends to plugin code.
 cyberdeck-home/*
 !cyberdeck-home/profiles/
-!cyberdeck-home/plugins/
 
 # Per-launch NDJSON log files (Phase 7 of the unified-event-stream
 # slice). Operational artifacts; live next to the .py source so the

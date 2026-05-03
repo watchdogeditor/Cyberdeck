@@ -278,19 +278,76 @@ registered, mirroring plugin availability.
     initial scan + spawns 1s-poll watcher; `shutdown()` is
     idempotent and called from the deck's existing teardown path.
 
-Real-deck verification pending. Smoke tests passed: registry
-default-seeds tools.toml on missing, mtime-watcher picks up live
-edits, bus fires correct event kinds + severities, bad TOML
-preserves prior state and surfaces scan_error, panel re-renders
-on scan_complete. ~520 LOC across 2 new files (tools.py +
-tools_registry.py) + ~120 LOC in tui.py. Existing SCRIPTS section
-preserved as-is (legacy flat-file scan); P5 of the retool will
-collapse both into one unified panel. P2-P5 still queued.
+Real-deck verified 2026-05-03. The netrunner added a `[[tool]]`
+entry pointing at a non-existent `testcmd`; mtime-watch fired
+`tool.unavailable` with the reason "cannot locate 'testcmd' on
+PATH"; the TOOLS section flipped to `(0/1 available)` and rendered
+the entry with a red ✗ glyph + dim name. Registry default-seed,
+bus events, scan_error, panel re-render — all worked first try.
+~520 LOC across 2 new files (tools.py + tools_registry.py) +
+~120 LOC in tui.py. Existing SCRIPTS section preserved as-is
+(legacy flat-file scan); P5 of the retool will collapse both
+into one unified panel.
 
-**Next session picks up at: P2 of the retool — move plugins to
-deck source + bridge dispatcher** (`cyberdeck-tools-plugins-
-profiles-retool.md` §P2, ~120 LOC). Or pivot to one of the other
-queued items: caliber selection, Mechanic v0 follow-ups, Phase 8b.
+**✅ TOOLS RETOOL P2 SHIPPED 2026-05-03** (uncommitted as of this
+state.md update). Plugins moved from `<home>/plugins/` into
+`<deck-source>/plugins/`. Two structural shifts:
+  - **Brake-hook protection extends to plugin code automatically.**
+    `path_is_protected()` already protects everything inside deck
+    source except the workspace; the move means constructs CANNOT
+    write to plugin files via Write/Edit/Bash. Closes the
+    "construct writes a half-baked plugin file mid-run and the
+    deck self-destructs at restart" failure mode at the filesystem
+    layer, no new gating needed.
+  - **Bridge dispatcher.** New `plugin_bridge.py` in deck source
+    root (~170 LOC), bootstrapped to `<home>/tools/deck/plugin_
+    bridge.py` on every deck launch via `_bootstrap_plugin_bridge`
+    (mirrors `_bootstrap_deck_dispatcher`'s flow). Constructs
+    invoke `python <bridge> <plugin_name> [args...]` — the bridge
+    resolves to `<deck-source>/plugins/<name>/plugin.py` and
+    forwards via subprocess, piping stdin/stdout/stderr/exit code
+    through verbatim. Bootstrap-time token replacement stamps
+    the absolute plugins-dir path into the script (the bridge
+    runs from `<home>/tools/deck/` and has no natural relative
+    path to plugins/ on its own); `repr()` preserves Windows
+    backslashes correctly.
+
+Plus: `run.py` → `plugin.py` rename for screenshot (matches the
+"plugin.py is the entry convention" in the design doc);
+`plugin.toml` `entry` field updated; README + plugin docstring +
+_usage() string updated to teach bridge invocation; daemon
+system prompt + construct addendum rewritten to reference the
+bridge instead of direct invocation; `.gitignore`'s
+`!cyberdeck-home/plugins/` exception retired (plugins are
+tracked at deck-source root now).
+
+Real-deck-shape verified: registry picks up the plugin from the
+new location, bootstrap fires at App.__init__, bootstrapped copy
+parses cleanly, `--list` returns `screenshot` against the right
+path, `--help` forwards to the plugin verbatim. End-to-end mss
+capture not exercised this session (needs a real display).
+
+**Sequencing gotcha caught + filed.** First implementation had
+`_bootstrap_plugin_bridge` reach for `self.plugins_dir`, but the
+bootstrap fires earlier in `__init__` than the plugins_dir
+assignment — produced a silent AttributeError swallowed by the
+outer try/except. Smoke test caught it (no plugin_bridge.py
+landed in <home>/tools/deck/); fixed by resolving plugins_dir
+inside the bootstrap method directly from `Path(__file__)`. The
+deck dispatcher had no equivalent issue because it doesn't
+depend on any later-assigned attrs. **Lesson:** when adding a
+new bootstrap method that mirrors an existing one, audit
+attribute access against the actual ordering in `__init__`,
+don't assume parity with the existing bootstrap.
+
+**Next session picks up at: P3 of the retool — `load_into_
+deck(app)` hook** (`cyberdeck-tools-plugins-profiles-retool.md`
+§P3, ~80 LOC). Optional function on each plugin's `plugin.py`;
+runs once at deck startup with the App instance after the TUI
+mounts. Lets plugins subscribe to bus events, register marker
+handlers, add widgets. screenshot stays no-op (pure stateless
+capture). Lays groundwork for future plugins (IR blaster,
+camera, etc.) without committing to specific use cases.
 
 Two discrete bugs from earlier remain deferred (not fixable
 today):

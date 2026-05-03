@@ -3,7 +3,11 @@
 
 See README.md for the full interface. Brief:
 
-    python run.py [output_path] [monitor_index]
+    python <home>/tools/deck/plugin_bridge.py screenshot [output_path] [monitor_index]
+
+(Constructs invoke through the bridge dispatcher; the bridge forwards
+to this entry script. Direct `python plugin.py [args]` also works
+for development.)
 
 Stdout: absolute path of the captured PNG (one line, on success).
 Stderr: ERROR: <reason> (on failure, with non-zero exit code).
@@ -27,7 +31,7 @@ from pathlib import Path
 
 def _usage() -> str:
     return (
-        "usage: python run.py [output_path] [monitor_index]\n"
+        "usage: python plugin_bridge.py screenshot [output_path] [monitor_index]\n"
         "  output_path     where to write the PNG (default: cwd/screenshot-<ts>.png)\n"
         "  monitor_index   which monitor (0=all monitors, 1+=specific; default: 0)"
     )

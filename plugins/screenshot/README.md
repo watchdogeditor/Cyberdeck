@@ -8,12 +8,14 @@ between calls.
 ## Invocation
 
 ```
-python <plugin_dir>/run.py [output_path] [monitor_index]
+python <home>/tools/deck/plugin_bridge.py screenshot [output_path] [monitor_index]
 ```
 
-Both arguments optional. `<plugin_dir>` is the absolute path to this
-plugin's folder; the deck provides it in your system-prompt addendum
-at spawn time.
+Both arguments optional. The bridge dispatcher (`plugin_bridge.py` in
+`<home>/tools/deck/`) is bootstrapped each time the deck launches; it
+forwards the call to this plugin's entry script and pipes
+stdout/stderr/exit code through verbatim. You don't need to know the
+plugin's source location — only the plugin name (`screenshot`).
 
 - `output_path` (default: `screenshot-YYYYMMDD-HHMMSS.png` in cwd):
   where to write the PNG. Relative paths resolve against cwd. Parent
@@ -32,20 +34,20 @@ at spawn time.
 Quickest possible capture, default location:
 
 ```bash
-python /path/to/plugins/screenshot/run.py
+python ~/tools/deck/plugin_bridge.py screenshot
 # → C:/Users/.../screenshot-20260427-153045.png
 ```
 
 Capture to a specific path:
 
 ```bash
-python /path/to/plugins/screenshot/run.py /tmp/myshot.png
+python ~/tools/deck/plugin_bridge.py screenshot /tmp/myshot.png
 ```
 
 Capture only the primary monitor:
 
 ```bash
-python /path/to/plugins/screenshot/run.py shot.png 1
+python ~/tools/deck/plugin_bridge.py screenshot shot.png 1
 ```
 
 ## Use cases

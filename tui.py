@@ -3328,6 +3328,22 @@ class CyberdeckApp(App):
             # won't have deck-control protocol available — they'll
             # still spawn and run normally without it.
             pass
+        # Bootstrap plugin-bridge dispatcher (P2 of the tools/plugins/
+        # profiles retool, 2026-05-03). Same idempotent overwrite
+        # pattern as the deck dispatcher above. The bridge lives at
+        # <home>/tools/deck/plugin_bridge.py and forwards
+        # `python <bridge> <plugin_name> [args...]` invocations to
+        # the appropriate plugin's entry script in <deck-source>/
+        # plugins/<name>/plugin.py. The bootstrap stamps the absolute
+        # plugins-dir path into the script so the bridge can resolve
+        # plugin folders without env vars or runtime walks.
+        try:
+            self._bootstrap_plugin_bridge()
+        except Exception:
+            # Same posture as the deck dispatcher — bootstrap failure
+            # degrades to "no plugin invocations available" rather
+            # than crashing app startup.
+            pass
         # Profiles dir defaults to <home>/profiles. The registry will
         # create it if missing on start. Explicit --profiles-dir
         # overrides for testing or shared profile sets across multiple
@@ -3456,13 +3472,29 @@ class CyberdeckApp(App):
             filter=["profile.*"],
             name="tui.profile_event",
         )
-        # Plugins directory: defaults next to profiles. Plugins are
-        # capability bundles (manifest + README + entry script) that
-        # extend what constructs can do beyond Bash + builtins. Unlike
-        # profiles, plugins are NOT hot-reloaded — adding a new plugin
-        # or editing an entry script requires a deck restart. Plugin
-        # registry scans once at startup; that's the entire lifecycle.
-        self.plugins_dir = self.home_dir / "plugins"
+        # Plugins directory: lives under DECK SOURCE, not workspace.
+        # Plugins are capability bundles (manifest + README + entry
+        # script) that extend what constructs can do beyond Bash +
+        # builtins. Unlike profiles, plugins are NOT hot-reloaded —
+        # adding a new plugin or editing an entry script requires a
+        # deck restart. Plugin registry scans once at startup; that's
+        # the entire lifecycle.
+        #
+        # P2 of the tools/plugins/profiles retool (2026-05-03) moved
+        # plugins from <home>/plugins/ into <deck-source>/plugins/
+        # for one specific safety guarantee: the brake hook protects
+        # <deck-source>/ from constructs by `path_is_protected()`.
+        # Putting plugin code there means constructs CANNOT write to
+        # plugin files via Write/Edit/Bash, period — closes the
+        # "construct writes a half-baked plugin file mid-run and the
+        # deck self-destructs at restart" failure mode at the
+        # filesystem layer. The construct-facing surface is the
+        # bridge dispatcher at <home>/tools/deck/plugin_bridge.py,
+        # which the deck regenerates on every startup (the bridge
+        # itself can't be tampered with persistently).
+        self.plugins_dir = (
+            Path(__file__).resolve().parent / "plugins"
+        )
         self.plugin_registry = PluginRegistry(
             self.plugins_dir,
             bus=self.bus,
@@ -3868,7 +3900,9 @@ class CyberdeckApp(App):
                             # Plugins section — capability bundles that
                             # extend what constructs can do beyond Bash
                             # + builtins. Each plugin is a folder under
-                            # <home>/plugins/ with a manifest, a README,
+                            # <deck-source>/plugins/ (P2 of the retool
+                            # moved them there for brake-hook
+                            # protection) with a manifest, a README,
                             # and an entry point. Items render with
                             # `[category/name][availability badge]`,
                             # similar to profiles but with a unique
@@ -5243,9 +5277,9 @@ class CyberdeckApp(App):
         # aren't installed; that just produces failed spawns. One
         # line per plugin: name + category + description (collapsed).
         # The full README isn't injected here — too much per-turn
-        # token cost. Constructs can read individual plugin READMEs
-        # via Read tool against <home>/plugins/<name>/README.md when
-        # they actually need the interface details.
+        # token cost. Constructs read individual plugin READMEs via
+        # the bridge dispatcher's --help convention or the deck-source
+        # path the construct addendum provides.
         avail_plugins = self.plugin_registry.available()
         if avail_plugins:
             catalog: list[str] = [
@@ -5263,10 +5297,13 @@ class CyberdeckApp(App):
             catalog.append("")
             catalog.append(
                 "When a construct needs a plugin's capability, instruct "
-                "it to invoke the plugin via Bash: "
-                "`python <home>/plugins/<name>/run.py [args]`. The "
-                "construct can read the plugin's README.md for the "
-                "exact argument shape if needed."
+                "it to invoke the plugin via Bash through the bridge "
+                "dispatcher: "
+                "`python <home>/tools/deck/plugin_bridge.py <plugin_name> "
+                "[args]`. The construct doesn't need to know where "
+                "plugin code lives — the bridge resolves and forwards. "
+                "The construct's spawn-time addendum carries the exact "
+                "invocation shape and per-plugin docs path."
             )
             sections.append("\n".join(catalog))
 
@@ -5617,6 +5654,65 @@ class CyberdeckApp(App):
         except (NotImplementedError, OSError):
             pass
 
+    def _bootstrap_plugin_bridge(self) -> None:
+        """Write the plugin-bridge dispatcher script into
+        <home>/tools/deck/plugin_bridge.py. Idempotent — overwrites
+        every startup so the bridge always matches what the deck
+        expects (same pattern as _bootstrap_deck_dispatcher).
+
+        Difference from the deck dispatcher: the bridge needs to
+        find plugin code at <deck-source>/plugins/<name>/plugin.py,
+        but the bridge runs from <home>/tools/deck/, so it has no
+        natural relative path to the plugin folders. Token
+        replacement at bootstrap time stamps the absolute plugins-
+        dir path into the source — the canonical source has a
+        `__PLUGINS_DIR__` placeholder that the bridge resolves at
+        runtime; we rewrite that placeholder during bootstrap so
+        the installed copy points at the right location.
+
+        Why not use env vars or argv? Each invocation comes through
+        the construct's Bash; bolting an env var onto every Bash
+        call would balloon the construct prompt, and an argv flag
+        adds a moving part the construct could omit. Stamping the
+        path at bootstrap time keeps the construct-side invocation
+        as `python <bridge> <plugin_name> [args]` — minimal, stable,
+        cache-friendly."""
+        deck_root = Path(__file__).resolve().parent
+        src = deck_root / "plugin_bridge.py"
+        if not src.is_file():
+            # Bridge source missing — bail quietly. Constructs will
+            # see the bridge as unavailable; plugin invocations
+            # would need to be rerouted (none exist today, but P3+
+            # plugins would lose their capability path).
+            return
+        deck_dir = self.home_dir / "tools" / "deck"
+        deck_dir.mkdir(parents=True, exist_ok=True)
+        target = deck_dir / "plugin_bridge.py"
+        # Token replacement: the canonical source carries
+        # __PLUGINS_DIR__ as a placeholder; we replace it with the
+        # resolved absolute path here. Use a string repr so backslash
+        # path separators on Windows survive into the generated
+        # source as a literal string, not as escape sequences.
+        # Resolve plugins_dir from __file__ rather than
+        # self.plugins_dir so we don't depend on instance attribute
+        # ordering — bootstrap fires early in __init__ before some
+        # other attrs are assigned.
+        plugins_dir = str((deck_root / "plugins").resolve())
+        text = src.read_text(encoding="utf-8")
+        # Replace the assignment line that initializes PLUGINS_DIR
+        # to the token. We swap the entire assignment to a string
+        # literal so the bootstrapped copy carries a plain path
+        # (using repr() to handle path separators safely).
+        text = text.replace(
+            'PLUGINS_DIR = _PLUGINS_DIR_TOKEN',
+            f'PLUGINS_DIR = {plugins_dir!r}',
+        )
+        target.write_text(text, encoding="utf-8")
+        try:
+            target.chmod(0o755)
+        except (NotImplementedError, OSError):
+            pass
+
     def _scan_scripts(self) -> list[tuple[str, str, str]]:
         """Scan <home>/tools/ for scripts. Each script lives at
         <home>/tools/<category>/<filename> — flat one-level deep,
@@ -5703,12 +5799,17 @@ class CyberdeckApp(App):
         # a Read tool call away.
         avail_plugins = self.plugin_registry.available()
         if avail_plugins:
+            bridge_path = (
+                self.home_dir / "tools" / "deck" / "plugin_bridge.py"
+            )
             plugin_lines: list[str] = [
                 "",
-                "Plugins are capability bundles installed at "
-                "<home>/plugins/<name>/. Each has an entry script you "
-                "invoke via Bash and a README.md describing its "
-                "interface. Available plugins for this session:",
+                "Plugins are capability bundles invoked through the "
+                f"bridge dispatcher at {bridge_path}. You don't reach "
+                "plugin code directly — call the bridge with the "
+                "plugin name and any arguments, and the bridge "
+                "forwards to the plugin's entry script. Available "
+                "plugins for this session:",
                 "",
             ]
             for pl in avail_plugins:
@@ -5716,12 +5817,11 @@ class CyberdeckApp(App):
                 if len(desc_short) > 140:
                     desc_short = desc_short[:137] + "..."
                 if pl.source_dir is not None:
-                    entry_path = pl.source_dir / pl.entry
                     plugin_lines.append(
                         f"  - {pl.name}: {desc_short}"
                     )
                     plugin_lines.append(
-                        f"    invoke: python {entry_path} [args]"
+                        f"    invoke: python {bridge_path} {pl.name} [args]"
                     )
                     plugin_lines.append(
                         f"    docs:   Read {pl.source_dir / 'README.md'}"

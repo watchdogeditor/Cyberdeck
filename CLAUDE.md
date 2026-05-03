@@ -266,15 +266,57 @@ existence-check via shutil.which/Path.exists, bus events
 complete`), default-seeded tools.toml with inline schema docs,
 TOOLS section in the Tools tab with ⚙/⌬ kind glyphs and red-✗-
 when-unavailable rendering. ~520 LOC across new files + ~120 LOC
-tui.py wiring. Real-deck verification pending. Existing SCRIPTS
-section preserved; P5 collapses both into one unified panel.
+tui.py wiring. Real-deck verified 2026-05-03 — registry
+auto-loads, mtime-watch fires `tool.unavailable` cleanly when an
+entry references a missing binary, panel rendered with `(0/1
+available)` count + red ✗ glyph. Existing SCRIPTS section
+preserved; P5 collapses both into one unified panel.
 
-**Next session picks up at: P2 of the retool** — move plugins
-into deck source + bridge dispatcher (~120 LOC). The brake hook's
-deck-source-write protection extends automatically to plugin
-code, closing the "construct writes a half-baked plugin file"
-failure mode at the filesystem layer. See `Design Files/cyberdeck-
-tools-plugins-profiles-retool.md` §P2 for the full design.
+**✅ TOOLS RETOOL P2 SHIPPED 2026-05-03** (uncommitted as of this
+CLAUDE.md update). Plugins moved from `<home>/plugins/` into
+`<deck-source>/plugins/`. Two structural shifts:
+- **Brake-hook protection extends to plugin code automatically.**
+  `path_is_protected()` already protects everything inside deck
+  source except the workspace; the move means constructs CANNOT
+  write to plugin files via Write/Edit/Bash. Closes the
+  "construct writes a half-baked plugin file mid-run and the
+  deck self-destructs at restart" failure mode at the filesystem
+  layer, no new gating needed.
+- **Bridge dispatcher.** New `plugin_bridge.py` in deck source
+  root (~170 LOC), bootstrapped to `<home>/tools/deck/plugin_
+  bridge.py` on every deck launch via new `_bootstrap_plugin_
+  bridge` (mirrors `_bootstrap_deck_dispatcher`'s flow). Constructs
+  invoke `python <bridge> <plugin_name> [args...]` — the bridge
+  resolves to `<deck-source>/plugins/<name>/plugin.py` and
+  forwards via subprocess, piping stdin/stdout/stderr/exit code
+  through verbatim. Token-replacement at bootstrap time stamps
+  the absolute plugins-dir path into the script (bridge runs
+  from `<home>/tools/deck/` and has no natural relative path to
+  plugins/); `repr()` preserves Windows backslashes correctly.
+
+Plus: `run.py` → `plugin.py` rename for screenshot (matches the
+design's "plugin.py is the entry convention"); `plugin.toml`
+`entry` field updated; README + plugin docstring + `_usage()`
+updated to teach bridge invocation; daemon system prompt +
+construct addendum rewritten to reference the bridge instead of
+direct invocation; `.gitignore`'s `!cyberdeck-home/plugins/`
+exception retired (plugins are tracked at deck-source root now).
+
+Real-deck-shape verified: registry picks up the plugin from the
+new location, bootstrap fires at App.__init__, bootstrapped copy
+parses cleanly, `--list` returns `screenshot` against the right
+path, `--help` forwards to the plugin verbatim. End-to-end mss
+capture not exercised this session (needs a display target).
+
+**Next session picks up at: P3 of the retool** — `load_into_
+deck(app)` hook (~80 LOC). Optional function on each plugin's
+`plugin.py`; runs once at deck startup with the App instance
+after the TUI mounts. Lets plugins subscribe to bus events,
+register marker handlers, add widgets. screenshot stays no-op
+(pure stateless capture). Lays groundwork for future plugins
+(IR blaster, camera, etc.) without committing to specific use
+cases. See `Design Files/cyberdeck-tools-plugins-profiles-
+retool.md` §P3 for the full design.
 
 **Filed for Mechanic v0→v1 bridge (2026-05-01):** liveness heartbeat.
 Currently Mechanic v0 watches the deck PID — proves the process

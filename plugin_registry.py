@@ -1,5 +1,5 @@
 """
-Plugin registry: discovery + listing of <home>/plugins/.
+Plugin registry: discovery + listing of <deck-source>/plugins/.
 
 Walks the plugins directory once at startup, validates each plugin
 folder via plugins.load_plugin, and exposes a queryable map. Unlike
@@ -9,6 +9,13 @@ sensitivity + arbitrary native dependency state make hot-reload
 fraught. If the netrunner adds a new plugin or edits an existing
 one, they restart the deck. (Plugins were not made to be hot-edited
 the way profiles are.)
+
+Pre-P2 of the retool (2026-05-03), plugins lived at <home>/plugins/.
+P2 moved them into deck source so the brake hook's deck-source-write
+protection prevents constructs from corrupting plugin code at the
+filesystem layer; the registry's only responsibility for that move
+was retargeting the directory pointer (callers supply the new path
+at construction).
 
 Lifecycle is one-shot: scan() at startup, no background work.
 Failures during a plugin's load become 'scan_error' events; the
