@@ -142,6 +142,67 @@ watchdog blindfold. Personal use doesn't need it.
 
 Roughly ordered by likely appeal:
 
+00. **Comprehensive architecture + design review** (filed
+   2026-05-04 by netrunner). Once major mechanisms feel done,
+   walk the canon docs (orientation / state / spec / philosophy
+   / build plan) against the current code and produce a
+   structured findings report under four headings:
+   (A) architecture coherence, (B) hard-rules compliance,
+   (C) filed-gotcha re-introduction risk, (D) tech debt + TODO
+   scrub. Each finding cites file + line numbers, classifies
+   severity, proposes a concrete fix. Output goes to
+   `Design Files/cyberdeck-review-<date>.md`. Read-only — no
+   source modifications, no PRs.
+   - **Scheduled** to fire 2026-06-01 at 09:00 EDT as a remote
+     agent (taskId `cyberdeck-architecture-review`); the agent
+     does a phase-point sanity-check first and defers if
+     in-flight work is still visible. Manual run any time via
+     the Scheduled-tasks UI. The schedule is a soft-reminder
+     mechanism — netrunner can trigger or defer at will.
+   - **Why this matters:** the deck has accumulated 8+ months
+     of decisions and ~12k LOC. Drift is invisible until
+     something walks the whole tree fresh against the canon.
+     Pre-public-repo-launch and pre-1.0 are both natural
+     review windows; this fits before either.
+
+0c. **Tools UI: space-launch + z-info + H-haiku-research**
+   (Thought of Dave, filed 2026-05-04). Tools tab unified-
+   ListView rows (post-P5 retool) get the same focused-action
+   set that file rows have:
+   - **space** on a tool/plugin row → opens
+     NewConstructScreen pre-populated with the tool name
+     in the task body (mirror of the existing FileListItem
+     space-launch). The construct gets a "you should use
+     <tool>" steering hint by default; the netrunner edits
+     the task before submitting.
+   - **z** on a tool/plugin row → opens an info modal showing
+     the tool's name, description, kind, command/path, help_text
+     (if registered), availability + reason. For plugins:
+     plugin manifest + README contents. Same z convention as
+     existing list items. ExpandModal is the right widget.
+   - **H** (uppercase) within the z-modal → opens a sidebar
+     pane that spawns a Haiku one-shot ("haiku bot") with a
+     prompt like "research <tool>: read its manpage / help
+     text / web docs and summarize its uses, common flags, and
+     one practical example invocation." Haiku is cheap and
+     fast — a few cents per query, ~5s response. The result
+     renders in the sidebar as it streams; netrunner can yank
+     (y) it for reference. Brake hook still gates any tool
+     calls the haiku bot might emit (it's just a Bash run of
+     `claude -p ... --model haiku`).
+   - **Why H specifically:** "H for Haiku" is mnemonic + on
+     the home row. Avoids stomping on the deck-wide X-execute
+     convention (the modal isn't a delay/attention surface).
+     Reserved for the modal scope only — not a deck-level
+     keybind.
+   - **Implementation order:** space-launch first (mirrors
+     existing FileListItem path), z-info second (small
+     ExpandModal extension), H-haiku-research third (more
+     scope — needs subprocess management, streaming render,
+     model selection composition with caliber if that lands
+     first). Each shippable independently.
+   - ~250 LOC across the three sub-features.
+
 0. **README restructure for public GitHub repo** (filed 2026-05-02
    by netrunner). The repo is now public at
    github.com/watchdogeditor/Cyberdeck. Current README is light

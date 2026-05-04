@@ -1857,6 +1857,25 @@ and 11.
   dev, Windows-first), license/contributing. See build-plan
   item 0 in the deferred list for the full section outline.
   Sub-day session, no code changes.
+- **Architecture + design review (scheduled)** (filed 2026-05-04).
+  Walk the canon (orientation / state / spec / philosophy / build
+  plan) against current code; structured findings under four
+  headings (architecture coherence, hard-rules compliance,
+  filed-gotcha re-introduction risk, tech debt + TODOs). Read-only;
+  output to `Design Files/cyberdeck-review-<date>.md`. Scheduled
+  remote agent fires 2026-06-01 09:00 EDT (taskId
+  `cyberdeck-architecture-review`); the agent does its own
+  phase-point sanity-check and defers if work is still in flight.
+  Manual run any time via the Scheduled-tasks UI. See build-plan
+  item 00 for the full review prompt + scope.
+- **Tools UI: space-launch + z-info + H-haiku-research** (Thought
+  of Dave, filed 2026-05-04). Tools tab unified-ListView rows
+  get focused actions: space → spawn-targeting NewConstructScreen
+  (mirror of FileListItem); z → info modal with manifest +
+  README + availability; H within the z-modal → Haiku one-shot
+  sidebar that researches the tool (manpage / help text / web
+  docs) and renders streaming output. ~250 LOC across three
+  sub-features. See build-plan item 0c.
 - **First-run onboarding check** (filed 2026-05-03). Today's
   deck self-bootstraps file artifacts but doesn't verify
   Python version, `textual`, `mss`, claude binary on PATH, or
