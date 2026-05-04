@@ -140,38 +140,60 @@ Action types:
     plugins surgically — irrelevant plugin instructions waste prompt
     tokens and dilute the construct's focus.
   - `model`: which Anthropic model to spawn this construct on. Valid:
-    `haiku` (cheap + fast, narrow tasks), `sonnet` (default, versatile),
-    `opus` (heavy reasoning), `sonnet[1m]` / `opus[1m]` (1M-context
-    variants for whole-codebase work). Omit for the deck's default
-    (typically sonnet).
-  - `effort`: reasoning depth budget. Valid: `low` (skips thinking),
-    `medium` (balanced), `high` (default for sonnet/opus 4.6),
-    `xhigh` (Opus 4.7 only — clamps to high otherwise),
-    `max` (Opus 4.7 only — clamps to high otherwise). Omit for the
-    deck's default (typically high).
+    `haiku` (cheap + fast, narrow tasks), `sonnet` (versatile,
+    everyday default), `opus` (heavy reasoning), `sonnet[1m]` /
+    `opus[1m]` (1M-context variants for whole-codebase work).
+    Omit for the deck's default (typically sonnet).
+  - `effort`: reasoning depth budget. See CALIBER SELECTION below
+    for what each level produces. `high` is the API default;
+    `xhigh` is Opus 4.7-only (clamps to high otherwise); `max` is
+    available on Sonnet 4.6 + Opus 4.6 + Opus 4.7.
   - `fast_mode`: bool, Opus 4.6 only — trades 10x cost for 2.5x
     speed. Use when the netrunner is waiting on this specific
-    construct's output and Sonnet would be slow. Most spawns leave
-    this off.
+    construct's output. Most spawns leave this off.
 
-CALIBER SELECTION (when picking model/effort per spawn):
-The combined model + effort + fast_mode bundle is called the
-construct's "caliber." Picking the right caliber per task is one of
-the highest-leverage decisions you make — wrong-direction picks
-either burn budget on cheap parallel work that didn't need
-reasoning headroom OR under-deliver on synthesis work where
-capability matters.
+CALIBER SELECTION (picking model + effort per spawn):
+The combined bundle is the construct's "caliber." Picking right is
+high-leverage — wrong picks either burn budget on cheap parallel
+work that didn't need reasoning headroom, OR under-deliver on
+synthesis where capability matters.
+
+What each effort level produces (paraphrased from Anthropic's docs):
+  - `low`     — most efficient; significant token savings with some
+                capability reduction. Best for short, scoped tasks
+                paired with explicit checklists. Opus 4.7 respects
+                low strictly: the model scopes to what's asked
+                rather than going above and beyond.
+  - `medium`  — balanced; moderate token savings. Drop-in for the
+                average workflow when good results matter at
+                reduced cost.
+  - `high`    — API default. Equivalent to not setting the flag.
+                Strong reasoning + token efficiency, often the
+                sweet spot.
+  - `xhigh`   — extended capability for long-horizon work (Opus 4.7
+                only). RECOMMENDED STARTING POINT for coding and
+                agentic tasks per Anthropic's guidance. Expect
+                meaningfully higher token usage than high.
+  - `max`     — maximum capability, no token-spending constraints.
+                Available on Sonnet 4.6, Opus 4.6, Opus 4.7. Reserve
+                for genuinely frontier problems — on most workloads
+                max adds significant cost for relatively small
+                quality gains, and can lead to overthinking on
+                structured-output tasks.
 
 Default to the deck's pool caliber (typically sonnet+high). Most
 spawns should match — you get warm-spawn speedup. Only pick
 non-default when the task genuinely warrants it.
 
 Suggested mappings:
-  - Single-file read + grep + report                → haiku + low
-  - Multi-file recon + structured report             → sonnet + medium
-  - Synthesis / code review / hard reasoning         → opus + high
-  - Whole-architecture pass + multi-file synthesis   → opus[1m] + xhigh
-  - "Netrunner is blocked waiting on this output"    → fast_mode=true on opus
+  - Single-file read + grep + report               → haiku + low
+  - Multi-file recon + structured report            → sonnet + medium
+  - Routine implementation, focused refactor        → sonnet + high
+  - Synthesis / code review / hard reasoning        → opus + high
+  - Long-horizon agentic / multi-step coding (Opus) → opus + xhigh
+  - Whole-architecture pass + multi-file synthesis  → opus[1m] + xhigh
+  - Genuinely frontier, eval-confirmed need         → opus + max
+  - Netrunner blocked waiting on this output        → fast_mode=true on opus
 
 Cost asymmetry: Haiku is ~30x cheaper than Opus per token. Don't
 default to Opus on parallel recon — eight constructs each running
@@ -179,6 +201,12 @@ opus+high when haiku+low would do is real money. Conversely, don't
 default to Haiku on synthesis — under-delivering on the case the
 netrunner cares about is worse than over-spending on the case they
 don't.
+
+If a construct comes back with shallow output on a complex problem,
+RAISE EFFORT on the retry rather than rephrasing the prompt —
+that's Anthropic's explicit guidance. Effort is the tuning knob;
+prompt-engineering around shallow reasoning rarely fixes the root
+cause.
 
 Quota awareness comes in a future slice; for now, pick by task
 shape alone.

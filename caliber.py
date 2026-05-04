@@ -49,15 +49,37 @@ KNOWN_MODELS: frozenset[str] = frozenset({
 })
 
 
-# Effort levels. Per Anthropic's effort docs:
-#   low     — skips thinking for simple cases; minimum reasoning
-#   medium  — balanced (default-ish for cheap models)
-#   high    — strong reasoning (default for sonnet/opus 4.6)
-#   xhigh   — extra-high (Opus 4.7 only; clamps to high otherwise)
-#   max     — maximum (Opus 4.7 only; clamps to high otherwise)
+# Effort levels per Anthropic's effort-flag documentation. The
+# behavioral signal each level produces (paraphrased from the docs):
 #
-# The clamp is Claude Code's runtime behavior — we don't try to be
-# smarter than the runtime. Pass the level through; let it clamp.
+#   low     — most efficient; significant token savings with some
+#             capability reduction. Best for short, scoped tasks
+#             paired with explicit checklists. Opus 4.7 respects
+#             `low` more strictly than 4.6 — the model scopes to
+#             what's asked rather than going above and beyond.
+#   medium  — balanced approach with moderate token savings. The
+#             drop-in for the average workflow when good results
+#             are wanted with reduced costs.
+#   high    — API DEFAULT. Equivalent to not setting the parameter.
+#             Strong reasoning balanced with token efficiency — often
+#             the sweet spot.
+#   xhigh   — extended capability for long-horizon work (Opus 4.7
+#             ONLY). Recommended starting point for coding and
+#             agentic tasks; meaningfully higher token usage than
+#             `high`. Set max_tokens generously (~64k) so the model
+#             has room.
+#   max     — maximum capability with no constraints on token
+#             spending. Available on Sonnet 4.6, Opus 4.6, Opus 4.7,
+#             and Mythos Preview. Reserve for genuinely frontier
+#             problems — on most workloads `max` adds significant
+#             cost for relatively small quality gains; on
+#             structured-output or less intelligence-sensitive
+#             tasks it can lead to overthinking.
+#
+# Levels not supported by the chosen model clamp at the runtime to
+# the highest supported (e.g. xhigh on Sonnet → high). The deck
+# doesn't try to be smarter than the runtime — pass the level
+# through and let it clamp.
 KNOWN_EFFORTS: frozenset[str] = frozenset({
     "low",
     "medium",
