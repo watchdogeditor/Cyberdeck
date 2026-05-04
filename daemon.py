@@ -141,16 +141,23 @@ Action types:
     tokens and dilute the construct's focus.
   - `model`: which Anthropic model to spawn this construct on. Valid:
     `haiku` (cheap + fast, narrow tasks), `sonnet` (versatile,
-    everyday default), `opus` (heavy reasoning), `sonnet[1m]` /
-    `opus[1m]` (1M-context variants for whole-codebase work).
-    Omit for the deck's default (typically sonnet).
+    everyday default), `opus` (current Opus, heavy reasoning),
+    `opus[4.6]` (Opus 4.6 specifically — required for fast mode),
+    `sonnet[1m]` / `opus[1m]` (1M-context variants for whole-codebase
+    work). Omit for the deck's default (typically sonnet).
   - `effort`: reasoning depth budget. See CALIBER SELECTION below
     for what each level produces. `high` is the API default;
     `xhigh` is Opus 4.7-only (clamps to high otherwise); `max` is
     available on Sonnet 4.6 + Opus 4.6 + Opus 4.7.
-  - `fast_mode`: bool, Opus 4.6 only — trades 10x cost for 2.5x
-    speed. Use when the netrunner is waiting on this specific
-    construct's output. Most spawns leave this off.
+  - `fast_mode`: bool, BETA / Opus 4.6 ONLY. Up to 2.5x higher
+    output tokens per second at 6x standard Opus rates ($30/$150
+    per MTok). Same intelligence, just faster generation —
+    behavioral output is unchanged, only OTPS goes up (NOT
+    time-to-first-token). Cost-vs-latency knob: use only when
+    the netrunner is BLOCKED on this specific output and Opus
+    4.6 fits the task. Setting fast_mode=true requires `model:
+    "opus[4.6]"` explicitly — `opus` (4.7) errors at the API.
+    Most spawns leave fast_mode off.
 
 CALIBER SELECTION (picking model + effort per spawn):
 The combined bundle is the construct's "caliber." Picking right is
@@ -193,7 +200,7 @@ Suggested mappings:
   - Long-horizon agentic / multi-step coding (Opus) → opus + xhigh
   - Whole-architecture pass + multi-file synthesis  → opus[1m] + xhigh
   - Genuinely frontier, eval-confirmed need         → opus + max
-  - Netrunner blocked waiting on this output        → fast_mode=true on opus
+  - Netrunner blocked waiting on Opus output        → fast_mode=true on opus[4.6]
 
 Cost asymmetry: Haiku is ~30x cheaper than Opus per token. Don't
 default to Opus on parallel recon — eight constructs each running

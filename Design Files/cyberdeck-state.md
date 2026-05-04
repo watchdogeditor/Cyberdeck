@@ -1957,6 +1957,21 @@ and 11.
   dev, Windows-first), license/contributing. See build-plan
   item 0 in the deferred list for the full section outline.
   Sub-day session, no code changes.
+- **Verify Claude Code's fast-mode settings.json key** (filed
+  2026-05-04). Anthropic's API uses `speed: "fast"` (per
+  https://platform.claude.com/docs/en/build-with-claude/fast-mode).
+  Claude Code wraps this through settings.json; the exact key is
+  presumed to be `fastMode: true` (based on the design's prior
+  research + the `fast_mode_state` field in Claude Code's
+  `system_init` event payload). The deck currently writes
+  `{"fastMode": true}` in per-spawn override files for fast_mode
+  spawns; if Claude Code expects `speed: "fast"` instead, the
+  flag is silently ignored. Real-deck verification: spawn a
+  construct with `fast_mode=true` + `model="opus[4.6]"`, check
+  the `system_init` event's `fast_mode_state` field — should
+  flip to `"on"` if Claude Code accepted the setting. If it
+  stays `"off"`, the key needs to be `speed` instead. Either
+  way, file the correction in caliber.py + brake_state.py.
 - **Architecture + design review (scheduled)** (filed 2026-05-04).
   Walk the canon (orientation / state / spec / philosophy / build
   plan) against current code; structured findings under four

@@ -6,7 +6,7 @@ watchdog) deploys at. Three independent axes wrapped in one dataclass:
 
   - model:  haiku / sonnet / opus, plus 1M-context variants
   - effort: low / medium / high / xhigh / max
-  - fast_mode: bool (Opus 4.6-only latency knob)
+  - fast_mode: bool (Opus 4.6-only latency knob — beta)
 
 Phase 1 of the caliber slice (2026-05-04) — see
 `Design Files/cyberdeck-model-effort-design.md`. This module is the
@@ -20,6 +20,36 @@ recon and under-delivers on heavy synthesis. Caliber lets the daemon
 pick the right grade per task, with quota-aware fallback when the
 netrunner's window approaches its cap (Phase 4, queued behind
 build-plan item 13).
+
+Fast mode reality check (verified 2026-05-04 against Anthropic's
+fast-mode docs):
+  - Currently supported on Claude Opus 4.6 ONLY (`claude-opus-4-6`).
+    Opus 4.7 is NOT supported. Sending fast=true with any other
+    model errors at the API.
+  - Beta / research preview — requires the waitlist
+    (https://claude.com/fast-mode) and the `anthropic-beta:
+    fast-mode-2026-02-01` header to even attempt.
+  - Speed: up to 2.5x higher output tokens per second (OTPS) at
+    SAME intelligence/capability — Anthropic explicitly says it's
+    the same model weights, just faster inference. NOT time-to-
+    first-token; OTPS only.
+  - Cost: 6x standard Opus rates ($30/MTok input, $150/MTok
+    output vs Opus standard $15/$75). Stacks with prompt-caching
+    multipliers and data-residency multipliers.
+  - Switching fast↔standard between calls invalidates prompt
+    cache (separate cache pools).
+  - Rate limits: separate dedicated bucket from standard Opus.
+    Recommended pattern is "try fast, on 429 fall back to
+    standard" — a hot fast-mode spawn that's rate-limited shouldn't
+    block on retry.
+  - API signature: top-level `speed: "fast"` param. Anthropic
+    response carries `usage.speed = "fast"|"standard"` so the
+    caller can verify fast actually engaged.
+  - Claude Code's settings.json wrapper for fast mode is presumed
+    to be `"fastMode": true` based on (a) the design doc's prior
+    research and (b) the `fast_mode_state` field in Claude Code's
+    `system_init` event payloads. The exact key is UNVERIFIED;
+    real-deck testing required to confirm.
 
 This module is data + validation only. Zero integration with
 fleet/daemon/TUI; pure dataclass.
@@ -43,10 +73,58 @@ from typing import Optional
 KNOWN_MODELS: frozenset[str] = frozenset({
     "haiku",
     "sonnet",
-    "opus",
-    "sonnet[1m]",   # 1M-context variants
+    "opus",            # current default Opus (4.7 as of 2026-05-04)
+    "opus[4.6]",       # Opus 4.6 — required for fast mode
+    "sonnet[1m]",      # 1M-context variants
     "opus[1m]",
 })
+
+
+# Models the deck recognizes as fast-mode-compatible. Per Anthropic's
+# docs (2026-05-04) only Opus 4.6 supports fast mode. The match
+# accepts the deck's `opus[4.6]` alias plus a couple of literal forms
+# the daemon might emit (Anthropic's canonical id, or the
+# `claude-opus-4-6` short form). If Anthropic adds more in the future,
+# extend this set.
+_FAST_MODE_MODELS: frozenset[str] = frozenset({
+    "opus[4.6]",
+    "claude-opus-4-6",
+    "opus-4-6",
+    "opus-4.6",
+})
+
+
+# Deck-side alias → Claude Code canonical model identifier. Applied in
+# Caliber.to_claude_args() so the `--model <name>` flag carries
+# something Claude Code's CLI recognizes. Aliases the daemon might
+# pick that need translation:
+#
+#   opus[4.6]  → claude-opus-4-6  (Opus 4.6 — fast mode only)
+#
+# Other aliases (haiku/sonnet/opus, and the 1M variants) pass through
+# unchanged because Claude Code accepts them directly. If a model
+# name isn't in this map, it's emitted verbatim — Claude Code's
+# error path is more authoritative than the deck's constants table.
+_MODEL_ALIAS_MAP: dict[str, str] = {
+    "opus[4.6]": "claude-opus-4-6",
+}
+
+
+def _is_fast_mode_compatible(model: str) -> bool:
+    """True if the model identifier resolves to one of the
+    fast-mode-supporting models. Lowercase + bracket-tolerant."""
+    return model.lower().strip() in _FAST_MODE_MODELS
+
+
+def _resolve_model_alias(model: str) -> str:
+    """Map deck-side aliases to Claude Code's `--model` flag values.
+
+    Pass-through for anything not in the alias map — Claude Code
+    accepts most short forms (haiku/sonnet/opus) directly, and bare
+    canonical IDs (claude-opus-4-7, etc.) work too. Only aliases
+    that wouldn't resolve at the CLI need translation.
+    """
+    return _MODEL_ALIAS_MAP.get(model, model)
 
 
 # Effort levels per Anthropic's effort-flag documentation. The
@@ -157,17 +235,22 @@ class Caliber:
                 f"through to Claude Code anyway",
                 file=sys.stderr,
             )
-        # Fast mode is Opus 4.6-specific per the design; "fast on
-        # haiku" is meaningless, "fast on opus 4.7" isn't supported.
-        # Soft warn here — don't reject, since Anthropic's surface
-        # may evolve.
-        if self.fast_mode and not self.model.startswith("opus"):
-            print(
-                f"caliber: warning: fast_mode set with model "
-                f"{self.model!r} — fast mode is Opus-only; the "
-                f"runtime will likely ignore the fast-mode flag",
-                file=sys.stderr,
-            )
+        # Fast mode is Opus 4.6-only per Anthropic's docs (verified
+        # 2026-05-04). Opus 4.7 is NOT supported; the API errors on
+        # fast+opus-4.7. Haiku/Sonnet are obviously wrong. Soft warn
+        # here — don't reject, since the runtime will surface the
+        # error itself and we don't want to gate on a known-evolving
+        # surface (fast mode is in beta / research preview).
+        if self.fast_mode:
+            if not _is_fast_mode_compatible(self.model):
+                print(
+                    f"caliber: warning: fast_mode=True with model "
+                    f"{self.model!r} — fast mode requires Opus 4.6 "
+                    f"specifically (`opus[4.6]` / `claude-opus-4-6`). "
+                    f"Other models will error at the API. Set the "
+                    f"model to opus 4.6 or drop fast_mode.",
+                    file=sys.stderr,
+                )
 
     @classmethod
     def default(cls) -> "Caliber":
@@ -182,14 +265,25 @@ class Caliber:
         Returns the args to APPEND to the existing claude command:
             ["--model", "sonnet", "--effort", "high"]
 
-        Phase 1 scope: model + effort go via CLI flags. fast_mode
-        is NOT emitted here — it requires settings.json editing
-        ("fastMode": true), which is Phase 2 territory (composes
-        with the existing brake-hook settings JSON). For Phase 1,
-        a Caliber with fast_mode=True falls through silently;
-        Phase 2 wires the settings.json path.
+        Deck-side aliases get resolved to Claude Code's canonical
+        forms here (e.g. `opus[4.6]` → `claude-opus-4-6`) so the
+        `--model` flag carries something the CLI recognizes. See
+        _resolve_model_alias for the translation map.
+
+        Phase 2 scope: model + effort go via CLI flags. fast_mode
+        is emitted via the per-spawn settings.json file
+        (`"fastMode": true`) — see brake_state.make_spawn_settings.
+        Anthropic's raw API surface is `speed: "fast"`; Claude
+        Code's settings.json wrapper for fast mode is presumed to
+        be `fastMode: true` (matches the `fast_mode_state` field
+        in Claude Code's `system_init` event payload). The exact
+        key is UNVERIFIED at the deck level — real-deck testing
+        will confirm or correct.
         """
-        return ["--model", self.model, "--effort", self.effort]
+        return [
+            "--model", _resolve_model_alias(self.model),
+            "--effort", self.effort,
+        ]
 
     def merge(self, override: Optional["Caliber"]) -> "Caliber":
         """Return a new Caliber with override's fields applied on
