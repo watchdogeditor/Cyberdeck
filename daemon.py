@@ -127,7 +127,17 @@ Action types:
 - spawn: creates a new construct with the given task. The construct
   starts with NO context beyond what you write in `task` — include
   everything necessary: what to do, where to look, what deliverable to
-  produce.
+  produce. Optional fields:
+  - `profile`: name of a profile from the PROFILES catalog. The
+    construct adopts that profile's steering addendum + tools list.
+    Omit to use the deck's active default profile.
+  - `plugins`: list of plugin names from the PLUGINS catalog (when
+    one is present). Surfaces ONLY these plugins in the construct's
+    spawn-time addendum, scoped to what the construct actually needs.
+    Omit to surface all available plugins (back-compat default).
+    Empty list means "explicitly no plugins for this spawn." Pick
+    plugins surgically — irrelevant plugin instructions waste prompt
+    tokens and dilute the construct's focus.
 
 Status values:
 - "working": you've issued actions and are making progress

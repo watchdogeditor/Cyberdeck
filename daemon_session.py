@@ -52,6 +52,9 @@ class DaemonSession:
         blacklist: Optional["Blacklist"] = None,
         bus: Optional["EventBus"] = None,
         tripwire_authoring_complete: Optional[asyncio.Event] = None,
+        per_spawn_addendum_renderer: Optional[
+            Callable[[Optional["Profile"], Optional[list[str]]], str]
+        ] = None,
     ) -> None:
         self.daemon = daemon
         self.fleet = fleet
@@ -114,6 +117,16 @@ class DaemonSession:
         # await returns immediately (no overhead in the common case
         # where authoring already finished or never started).
         self.tripwire_authoring_complete = tripwire_authoring_complete
+
+        # P4 of the tools/plugins/profiles retool (2026-05-03):
+        # callback the TUI wires up to render per-spawn addendum
+        # text (profile.tools resolved against the tool registry +
+        # daemon-selected plugins resolved against the plugin
+        # registry). Daemon_session calls it before each fleet.spawn
+        # and threads the result through. None when running headless
+        # (no TUI, no registries to resolve against) — fleet then
+        # uses its static deck_addendum only.
+        self.per_spawn_addendum_renderer = per_spawn_addendum_renderer
 
         # Track task-per-construct so we can report useful outcomes
         # (the finalized event doesn't carry the original task text).
@@ -489,6 +502,46 @@ class DaemonSession:
                     requested_name, task,
                 )
 
+            # P4 of the tools/plugins/profiles retool (2026-05-03):
+            # daemon may include an optional `plugins` field listing
+            # plugin names to surface for THIS spawn. None means "no
+            # explicit selection" — fleet/TUI defaults to all
+            # available plugins for back-compat. Empty list means
+            # "explicitly no plugins for this spawn."
+            requested_plugins = action.get("plugins")
+            spawn_plugins: Optional[list[str]] = None
+            if isinstance(requested_plugins, list):
+                # Validate every entry is a string; drop non-strings
+                # silently (defensive — daemon shouldn't emit bad
+                # types but better robust than tracebacks).
+                spawn_plugins = [
+                    p for p in requested_plugins
+                    if isinstance(p, str)
+                ]
+
+            # Render per-spawn addendum (profile-tools-with-descriptions
+            # + plugins-with-descriptions) via the TUI-supplied
+            # callback. None when running headless — fleet falls back
+            # to the static deck_addendum only.
+            per_spawn_addendum: Optional[str] = None
+            if self.per_spawn_addendum_renderer is not None:
+                try:
+                    per_spawn_addendum = (
+                        self.per_spawn_addendum_renderer(
+                            chosen_profile, spawn_plugins,
+                        )
+                    )
+                except Exception as exc:
+                    # Defense in depth — a buggy renderer shouldn't
+                    # break the spawn dispatch. Log and proceed
+                    # without per-spawn rendering.
+                    import sys as _sys
+                    print(
+                        f"daemon_session: per-spawn addendum "
+                        f"renderer crashed: {exc!r}",
+                        file=_sys.stderr,
+                    )
+
             self._total_spawns += 1
             # origin="daemon" so the chatlog spawn line goes
             # un-badged (daemon spawns are the baseline, what's not
@@ -499,6 +552,8 @@ class DaemonSession:
                 task,
                 profile=chosen_profile,
                 origin="daemon",
+                plugins=spawn_plugins,
+                per_spawn_addendum=per_spawn_addendum,
             )
         # Future action types: kill, wire, inject, etc.
 

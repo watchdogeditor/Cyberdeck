@@ -434,18 +434,14 @@ class Construct:
             profile_addendum = self.profile.default_construct_addendum.strip()
             if profile_addendum:
                 addenda.append(profile_addendum)
-            # Recommended tools — surface as a soft signal. The model
-            # gets told "for this kind of work, prefer X / Y / Z";
-            # the construct still has access to all default tools, so
-            # this is a steering nudge, not a cap. Skipped when the
-            # profile didn't declare any (empty tuple = no opinion).
-            if self.profile.recommended_tools:
-                rec = ", ".join(self.profile.recommended_tools)
-                addenda.append(
-                    f"Recommended tools for this profile: {rec}. "
-                    f"Prefer these unless the task clearly needs "
-                    f"something else."
-                )
+            # Profile.tools rendering MOVED to the TUI's
+            # _build_construct_addendum (deck_addendum) in P4 of the
+            # tools/plugins/profiles retool (2026-05-03). The TUI has
+            # access to the tool registry and can resolve each name
+            # to its description; here we'd only be able to print
+            # bare names. Same applies to legacy `recommended_tools`
+            # for any profile that hasn't been migrated — the TUI
+            # surfaces it via the same path.
         if self.deck_addendum:
             deck_addendum = self.deck_addendum.strip()
             if deck_addendum:

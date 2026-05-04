@@ -69,11 +69,14 @@ or when the netrunner explicitly wants the unsteered behavior.
 default_daemon_addendum = ""
 default_construct_addendum = ""
 
-# Empty recommended_tools = no specific suggestion; construct picks
-# from the full default tool set freely.
-recommended_tools = []
-
-default_scripts = []
+# Empty `tools` = no specific recommendation. The construct still
+# has access to all of Claude Code's built-in tools (Bash, Read,
+# Write, etc.) regardless. Entries here reference the deck's tool
+# registry at <home>/tools/tools.toml — system-installed CLIs the
+# netrunner has declared. P4 of the tools/plugins/profiles retool
+# (2026-05-03) renamed this from `recommended_tools` and shifted
+# the semantic from "Claude Code tool names" to "registry CLI names."
+tools = []
 '''
 
 
@@ -304,6 +307,20 @@ class ProfileRegistry:
         # only the literally-missing case is.
         self._seed_default_if_missing()
 
+        # P4 of the tools/plugins/profiles retool (2026-05-03):
+        # rename `recommended_tools` → `tools` in legacy profile
+        # files. Idempotent — only touches files that have the old
+        # field and not the new one. Runs every scan because the
+        # netrunner might add a profile with the legacy field after
+        # the deck has been running. Safe overhead (most scans see
+        # zero migration candidates after the first launch).
+        try:
+            current_tomls = list(self.profiles_dir.glob("*.toml"))
+        except OSError:
+            current_tomls = []
+        for path in current_tomls:
+            self._migrate_legacy_tools_field(path)
+
         try:
             current_paths = {
                 p.resolve() for p in self.profiles_dir.glob("*.toml")
@@ -376,6 +393,129 @@ class ProfileRegistry:
         # Don't emit an event here — the next file-walk in this same
         # scan will pick up the new file via the normal mtime path
         # and emit the proper 'added' event. This avoids double-firing.
+
+    def _migrate_legacy_tools_field(self, path: Path) -> None:
+        """Rename `recommended_tools` → `tools` in a legacy profile
+        TOML, in-place.
+
+        P4 of the tools/plugins/profiles retool (2026-05-03). Runs at
+        scan time before _load_or_reload so a migrated file lands in
+        the registry under the new schema directly. Idempotent —
+        files that already have `tools` (with or without
+        `recommended_tools`) are left alone.
+
+        Implementation is line-level rather than TOML-roundtripped
+        because tomllib is read-only (no writer in stdlib) and
+        pulling in `tomli_w` for one rename is a heavy dependency
+        for a one-time migration. Line-level keeps the netrunner's
+        formatting + comments intact. We only act when the file has
+        a clean `recommended_tools = ...` line (no inline comment
+        tricks); anything ambiguous gets left alone with a warning,
+        and the loader's deprecation warn-and-load path takes over.
+
+        Matches:
+          - `recommended_tools = []` (any number of spaces around =)
+          - `recommended_tools = ["a", "b"]`
+
+        Skips (loader handles via deprecation warning):
+          - Multi-line array literals
+          - Lines with trailing inline comments
+          - Files where `tools = ...` is already present
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        # Fast path: if the legacy field isn't even mentioned, nothing
+        # to migrate. Spares the regex pass on the common case (post-
+        # P4 files).
+        if "recommended_tools" not in text:
+            return
+        # Already migrated? Look for a `tools = ...` line at the top
+        # level (real key, not a comment or a substring inside another
+        # field name like `default_tools`).
+        lines = text.splitlines(keepends=True)
+        has_tools_key = False
+        for line in lines:
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            # Match `tools` followed by whitespace + `=`. Reject
+            # `default_tools`, `recommended_tools`, etc. by requiring
+            # the key to be exactly "tools".
+            if (
+                stripped.startswith("tools")
+                and len(stripped) > 5
+                and stripped[5:].lstrip().startswith("=")
+                # The first 5 chars are "tools"; nothing before them
+                # in the stripped string (since we already lstrip'd).
+                # The character at position 5 must be a space, tab,
+                # or '=' — not an alphanum/underscore (which would
+                # make this a different identifier like `tools_dir`).
+                and (stripped[5] in " \t=")
+            ):
+                has_tools_key = True
+                break
+        if has_tools_key:
+            # File has both old and new fields — loader will warn.
+            # Don't mutate; let the netrunner clean up.
+            return
+        # Look for a single-line `recommended_tools = ...` line we
+        # can safely rewrite. Multi-line arrays and inline comments
+        # bail to the loader's deprecation warning path.
+        rewrote = False
+        new_lines: list[str] = []
+        for line in lines:
+            stripped = line.lstrip()
+            if not stripped.startswith("recommended_tools"):
+                new_lines.append(line)
+                continue
+            # Verify the line is `recommended_tools = ...` shape AND
+            # is single-line (closing bracket on same line for arrays,
+            # no trailing comment to preserve carefully).
+            after_key = stripped[len("recommended_tools"):]
+            if not after_key.lstrip().startswith("="):
+                new_lines.append(line)
+                continue
+            # Bail on inline comments — preserving them across a
+            # rename is fiddly and rare enough to not bother.
+            if "#" in line:
+                new_lines.append(line)
+                continue
+            # Bail on multi-line arrays — opening bracket without a
+            # matching close on the same line means more lines follow.
+            if line.count("[") != line.count("]"):
+                new_lines.append(line)
+                continue
+            # Safe to rewrite. Preserve leading whitespace (TOML's
+            # convention is column 0 but the netrunner might indent).
+            indent = line[: len(line) - len(line.lstrip())]
+            rest = line[len(indent) + len("recommended_tools"):]
+            new_lines.append(f"{indent}tools{rest}")
+            rewrote = True
+        if not rewrote:
+            return
+        new_text = "".join(new_lines)
+        try:
+            # Atomic-ish: write to a sibling temp file, then rename.
+            # Keeps the file readable even mid-migration if something
+            # crashes between write and rename (the original is intact
+            # until rename succeeds).
+            tmp = path.with_suffix(path.suffix + ".migrating")
+            tmp.write_text(new_text, encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            print(
+                f"profile_registry: warning: could not migrate "
+                f"{path.name} (recommended_tools → tools): {exc!r}",
+                file=sys.stderr,
+            )
+            return
+        print(
+            f"profile_registry: migrated {path.name}: "
+            f"recommended_tools → tools (P4 of retool)",
+            file=sys.stderr,
+        )
 
     def _load_or_reload(self, path: Path, mtime: float) -> bool:
         """Load (or reload) a single file. Updates state and emits

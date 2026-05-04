@@ -22,13 +22,13 @@ paths for every finding so the netrunner can navigate to them quickly.
 End with a one-paragraph summary of the overall code health you observed.
 """
 
-# Recommended tools — the read-only investigation kit. Surfaces in
-# the construct's system-prompt addendum so the model knows what's
-# idiomatic for code review. Not enforced — runtime gating lives in
-# the deck-global brake (paranoid is the right deck-wide brake for
-# code-review work). The model will gravitate toward these tools
-# because they're called out; the brake stops it from misbehaving
-# regardless.
-recommended_tools = ["Read", "Glob", "Grep"]
-
-default_scripts = []
+# Registry-backed tools recommended for code review. References
+# entries in <home>/tools/tools.toml. Empty by default — Claude
+# Code's built-in Read/Glob/Grep cover most code-review work, and
+# those aren't registry-backed (constructs always have them).
+# Add registry CLIs here for review work that benefits from them
+# (ripgrep, ast-grep, etc.). Not enforced — runtime gating lives
+# in the deck-global brake (paranoid is the right deck-wide brake
+# for code review). P4 of the tools/plugins/profiles retool
+# (2026-05-03) renamed `recommended_tools` → `tools`.
+tools = []

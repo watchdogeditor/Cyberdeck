@@ -716,6 +716,8 @@ class Fleet:
         parent_id: Optional[str] = None,
         profile: Optional["Profile"] = None,
         origin: str = "daemon",
+        plugins: Optional[list[str]] = None,
+        per_spawn_addendum: Optional[str] = None,
     ) -> Optional[Construct]:
         """Spawn a single construct and wire its consumer into the fleet.
 
@@ -767,6 +769,21 @@ class Fleet:
         event so listeners (the TUI in particular) can link the new pane
         to its origin. Used by inject — the new construct is a turn-N+1
         continuation of the parent's session, not an independent task.
+
+        `plugins` (P4 of the tools/plugins/profiles retool, 2026-05-03):
+        list of plugin names selected by the daemon for this spawn. The
+        construct's prompt addendum surfaces ONLY these plugins (rather
+        than every available plugin in the registry). When None, the
+        construct sees all available plugins (back-compat for callers
+        that haven't updated). Threaded into the spawned meta payload
+        so observers can see which plugins were dispatched.
+
+        `per_spawn_addendum` (P4): additional system-prompt text the
+        TUI rendered FOR THIS spawn — typically the registry-resolved
+        tools list (with descriptions) and the per-spawn plugins
+        rendering. Concatenated by Construct alongside the static
+        deck_addendum + the profile's free-text addendum. None when
+        no caller-side rendering is needed.
         """
         # Connection-aware gate. If the deck's connection isn't ONLINE,
         # remote-model spawns can't reach claude.ai/anthropic — they'd
@@ -826,6 +843,22 @@ class Fleet:
         # filename), then generate the per-spawn brake settings file
         # and attach. Doing it in this order keeps the construct id
         # canonical (Construct mints one in __init__ if not given).
+        # Compose deck addendum + per-spawn addendum (the latter is
+        # the TUI-rendered tools list with descriptions + per-spawn
+        # plugins selection from P4 of the retool). Both are pre-
+        # rendered strings; we concatenate here so the construct sees
+        # one combined deck-side addendum.
+        composed_deck_addendum = self.deck_addendum
+        if per_spawn_addendum:
+            if composed_deck_addendum:
+                composed_deck_addendum = (
+                    composed_deck_addendum.rstrip()
+                    + "\n\n"
+                    + per_spawn_addendum.strip()
+                )
+            else:
+                composed_deck_addendum = per_spawn_addendum.strip()
+
         c = Construct(
             task=task,
             claude_bin=self.claude_bin,
@@ -833,7 +866,7 @@ class Fleet:
             resume_session_id=resume_id,
             cwd=self.cwd,
             profile=profile,
-            deck_addendum=self.deck_addendum,
+            deck_addendum=composed_deck_addendum,
         )
 
         # Generate the brake-hook --settings file for this spawn, if
@@ -928,6 +961,14 @@ class Fleet:
                 # never came up; the supervisor skips entries with
                 # pid=None.
                 "pid": c.pid,
+                # P4 of the tools/plugins/profiles retool (2026-05-03):
+                # which plugins the daemon picked for this spawn. None
+                # means "no per-spawn selection" — typically a netrunner-
+                # direct or pre-P4 daemon spawn, where the construct's
+                # addendum surfaces all available plugins. Empty list
+                # means "explicitly no plugins for this spawn." A
+                # non-empty list is the daemon's per-spawn pick.
+                "plugins": list(plugins) if plugins is not None else None,
             },
         ))
         consumer = asyncio.create_task(self._consume(c))

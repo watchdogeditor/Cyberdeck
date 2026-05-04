@@ -10,8 +10,9 @@ or when the netrunner explicitly wants the unsteered behavior.
 default_daemon_addendum = ""
 default_construct_addendum = ""
 
-# Empty recommended_tools = no specific suggestion; construct picks
-# from the full default tool set freely.
-recommended_tools = []
-
-default_scripts = []
+# Empty `tools` = no specific recommendation. The construct still
+# has access to all of Claude Code's built-in tools (Bash, Read,
+# Write, etc.) regardless. Entries here reference the deck's tool
+# registry at <home>/tools/tools.toml — system-installed CLIs the
+# netrunner has declared.
+tools = []

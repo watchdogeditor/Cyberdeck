@@ -29,15 +29,31 @@ Profile shape:
     default_daemon_addendum = \"\"\"...\"\"\"
     default_construct_addendum = \"\"\"...\"\"\"
 
-    recommended_tools = ["Bash", "Read", "WebSearch"]
-    default_scripts = ["scan_wifi", "geolocate_subject"]
+    tools = ["nmap", "subfinder", "ripgrep"]
 
 Required: name, category, description. Everything else has a sensible
-default. `recommended_tools` surface in the construct's system-prompt
-addendum so the model knows what's idiomatic for this profile;
-they're a soft signal, not a hard cap. `default_scripts` is stored
-but not yet consumed — forward-compat parking for the deferred
-Scripts system.
+default. `tools` references entries in the deck's tool registry
+(`<home>/tools/tools.toml`) — system-installed CLIs the netrunner
+declared. The construct's system-prompt addendum surfaces each
+selected tool's name + short description (resolved from the registry
+at spawn time). `tools` is a SOFT signal — the construct still has
+access to all of Claude Code's built-in tools (Bash, Read, etc.)
+regardless. The deck-global brake state (brake_state.py) is the only
+runtime gate.
+
+Legacy field — `recommended_tools`:
+P4 of the tools/plugins/profiles retool (2026-05-03) renamed
+`recommended_tools` → `tools` and shifted the semantic from
+"Claude Code built-in tool names" to "registry-backed tool names."
+Profiles still readable in either form: profile_registry.py runs a
+file-level rename migration on first scan, and load_profile here
+accepts either field with `tools` winning if both present (with a
+deprecation warning).
+
+`default_scripts` was an earlier forward-compat parking field for the
+deferred Scripts system. P4 keeps it readable for backward compat
+but the retool's P5 will collapse it (scripts and binary tools both
+become entries in tools.toml).
 """
 from __future__ import annotations
 
@@ -110,17 +126,33 @@ class Profile:
     default_daemon_addendum: str = ""
     default_construct_addendum: str = ""
 
-    # Recommended tools for this profile — surfaced in the construct's
-    # system-prompt addendum as a soft suggestion ("for this kind of
-    # work, prefer X / Y / Z"). NOT a hard cap; the construct still
-    # has access to all default tools. The deck-global brake state
-    # (brake_state.py) is the only thing that actually narrows
-    # capability at runtime, deck-wide. Empty tuple means "no
-    # specific recommendation" — let the construct pick.
+    # Registry-backed tools recommended for this profile. Each entry
+    # is a name from <home>/tools/tools.toml (a system-installed CLI
+    # the netrunner has declared). The construct's spawn-time
+    # addendum surfaces name + short description for each — full
+    # help_text is omitted to keep the prompt bounded. Soft signal:
+    # the construct can ignore the recommendation and use anything
+    # else available. Runtime gating is the brake hook's job, not
+    # the profile's. Empty tuple = no specific recommendation.
+    #
+    # P4 of the tools/plugins/profiles retool (2026-05-03) renamed
+    # this from `recommended_tools` and shifted the semantic from
+    # "Claude Code built-in tool names" to "registry-backed CLI
+    # names." Loader accepts either field for backward compat;
+    # `tools` wins if both present.
+    tools: tuple[str, ...] = field(default_factory=tuple)
+
+    # Legacy field, kept readable for backward compat. Old profiles
+    # that haven't been migrated still surface their list here. The
+    # registry's file-level migration renames `recommended_tools`
+    # → `tools` in-place at scan time, so this should be empty for
+    # any profile loaded from a recent disk state. Deprecated;
+    # exists for the transition window only.
     recommended_tools: tuple[str, ...] = field(default_factory=tuple)
 
-    # Forward-compat: stored but not yet consumed. Lands when the
-    # Scripts registry grows the manifest layer.
+    # Forward-compat: stored but not yet consumed. P5 of the retool
+    # will collapse this — scripts become entries in tools.toml
+    # alongside binary tools.
     default_scripts: tuple[str, ...] = field(default_factory=tuple)
 
     # Provenance — where on disk this profile came from. Useful for
@@ -193,13 +225,54 @@ def load_profile(path: Path) -> Profile:
     # Optional fields with type checking
     daemon_addendum = _optional_str(raw, "default_daemon_addendum", path, default="")
     construct_addendum = _optional_str(raw, "default_construct_addendum", path, default="")
+    tools = _optional_str_list(raw, "tools", path)
     recommended_tools = _optional_str_list(raw, "recommended_tools", path)
     default_scripts = _optional_str_list(raw, "default_scripts", path)
+
+    # Backward-compat resolution between `tools` (post-P4) and the
+    # legacy `recommended_tools` field. The registry's file-level
+    # migration should rewrite legacy files in-place, but a profile
+    # loaded straight from a freshly-cloned repo or hand-edited
+    # without rename can land here in the legacy form. Resolution
+    # rules:
+    #   - both present, identical: silently take `tools` (no warn).
+    #   - both present, different: warn loudly; take `tools`. The
+    #     netrunner's almost certainly mid-migration; surface the
+    #     drift so they clean it up.
+    #   - only `tools`: use it (the post-P4 happy path).
+    #   - only `recommended_tools`: warn deprecation; copy to tools.
+    #     The migration helper SHOULD have caught this earlier; if
+    #     it didn't (e.g. read-only fs), we still load the profile
+    #     correctly but flag the drift.
+    if tools and recommended_tools:
+        if list(tools) != list(recommended_tools):
+            print(
+                f"profiles: warning: {path.name}: both `tools` and "
+                f"`recommended_tools` present with different values "
+                f"— `tools` wins; remove `recommended_tools`",
+                file=sys.stderr,
+            )
+        # else: identical, silently dedupe by ignoring legacy.
+        recommended_tools = []  # don't double-store
+    elif recommended_tools and not tools:
+        print(
+            f"profiles: warning: {path.name}: `recommended_tools` is "
+            f"deprecated — rename to `tools` (P4 of the retool, "
+            f"2026-05-03). Loading legacy field for now.",
+            file=sys.stderr,
+        )
+        tools = list(recommended_tools)
+        # Also clear so the dataclass doesn't carry both — keeps
+        # the surface clean for callers reading profile.tools.
+        recommended_tools = []
 
     # Soft warnings (write to stderr, don't fail)
     _warn_unknown_keys(raw, path)
     _warn_filename_mismatch(name, path)
-    _warn_unknown_tools(recommended_tools, path)
+    # `tools` validation is now registry-backed (per P4 retool) and
+    # happens at spawn time when the addendum is built — composes
+    # with hot-reload of tools.toml. profiles.py just validates
+    # they're strings.
 
     return Profile(
         name=name,
@@ -207,6 +280,7 @@ def load_profile(path: Path) -> Profile:
         description=description,
         default_daemon_addendum=daemon_addendum,
         default_construct_addendum=construct_addendum,
+        tools=tuple(tools),
         recommended_tools=tuple(recommended_tools),
         default_scripts=tuple(default_scripts),
         source_path=path,
@@ -226,8 +300,9 @@ _KNOWN_KEYS: frozenset[str] = frozenset({
     "description",
     "default_daemon_addendum",
     "default_construct_addendum",
-    "recommended_tools",
-    "default_scripts",
+    "tools",                # P4 (post-retool) registry-backed names
+    "recommended_tools",    # legacy; deprecated, kept readable
+    "default_scripts",      # legacy; collapses into tools in P5
 })
 
 

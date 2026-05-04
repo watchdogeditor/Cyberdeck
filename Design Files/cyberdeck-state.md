@@ -405,16 +405,72 @@ only screenshot stays in `<deck-source>/plugins/`. ~210 LOC
 across tui.py + ~30 LOC docstring contract in plugins.py + 3
 new Kind constants in event_bus.py.
 
-**Next session picks up at: P4 of the retool — profile schema
-migration: `recommended_tools` → `tools`** (`cyberdeck-tools-
-plugins-profiles-retool.md` §P4, ~100 LOC + daemon prompt
-rewrite). Field rename + semantic shift (registry names from
-tools.toml, not Claude Code tool names). Default profile
-auto-seed regenerated with new schema. Existing user-edited
-profiles get migrated on first launch idempotently. Daemon
-system prompt grows PLUGINS AVAILABLE catalog and per-profile
-tools enumeration. Spawn action JSON shape grows optional
-`plugins` field for daemon-driven plugin selection per spawn.
+**✅ TOOLS RETOOL P4 SHIPPED 2026-05-03** (uncommitted as of this
+state.md update). Profile schema migration `recommended_tools` →
+`tools` with semantic shift to registry-backed CLI names, plus
+optional per-spawn `plugins` field on the daemon's spawn action.
+
+Profile.tools is now a list of names from <home>/tools/tools.toml
+— system-installed CLIs the netrunner has declared. The construct's
+prompt addendum surfaces each tool's name + short description
+(resolved at spawn time against tool_registry). Names that don't
+resolve render with `(not in registry)` rather than getting
+silently dropped — visible drift > invisible drift.
+
+The legacy `recommended_tools` field stays loadable for backward
+compat (warns deprecated, copies value into `.tools`). Bundled
+profiles (default, code_reviewer, recon_specialist) pre-migrated;
+the registry's file-level migration only fires for user-added or
+freshly-cloned legacy files. Migration is idempotent + atomic-ish
+(temp-file write + rename) and bails on ambiguous shapes
+(multi-line arrays, inline comments) so the loader's deprecation
+path takes over.
+
+Per-spawn addendum architecture split:
+  - `_build_deck_addendum` — STATIC. Dispatcher utility info
+    only. Set on Fleet at construction; same for every spawn.
+  - `_build_per_spawn_addendum(profile, plugins)` — DYNAMIC.
+    Renders profile.tools resolved against tool_registry +
+    plugins resolved against plugin_registry. plugins=None means
+    "surface all available" (back-compat); plugins=[...] means
+    "surface only these" (daemon's per-spawn pick); plugins=[]
+    means "explicitly no plugins."
+  - DaemonSession takes a `per_spawn_addendum_renderer` callback;
+    the TUI wires `_build_per_spawn_addendum` to it. Daemon-side
+    spawns render before fleet.spawn; netrunner-direct spawn
+    sites in tui.py call the renderer directly. Inject path
+    passes None — resumed session has its prompt cached
+    server-side, re-rendering would bloat for no gain.
+
+Spawn action JSON grows optional `plugins: list[str]` field. Daemon
+system prompt teaches the field with steering: "pick plugins
+surgically — irrelevant plugin instructions waste prompt tokens
+and dilute the construct's focus." Validates entries are strings;
+non-strings dropped silently. Threaded into the `spawned` meta
+event payload so observers attribute per-spawn plugin selection.
+
+Real-deck verified 2026-05-03:
+  - All three bundled profiles load with tools=[] / recommended_tools=[]
+  - Synthetic legacy profile: deprecation warning fires, tools
+    populated from recommended_tools, recommended_tools cleared
+  - Migration helper: legacy TOML rewritten cleanly + idempotent
+  - Renderer: 4 unit-test scenarios verified — profile.tools
+    with mix of resolved + unresolved names; plugins=None /
+    plugins=[bad,good] / plugins=[] all render correctly
+  - Full deck startup: zero errors, all events flow as before
+
+~410 LOC across profiles.py, profile_registry.py, tui.py,
+fleet.py, daemon_session.py, daemon.py, construct.py + 3
+bundled profile rewrites.
+
+**Next session picks up at: P5 of the retool — UI retool**
+(`cyberdeck-tools-plugins-profiles-retool.md` §P5, ~150 LOC).
+Profiles graduates from a section in the Tools tab to its own
+TabPane. Tools tab unifies tools + plugins into a single
+ListView with kind glyphs (⚙ binary, ⌬ script, ⊕ plugin).
+`_right_panel_focusables` re-wired (per the gotcha — hand-
+curated, not auto-derived). Lands the four-tab right panel:
+Chatlog | Files | Profiles | Tools.
 
 Two discrete bugs from earlier remain deferred (not fixable
 today):

@@ -5430,7 +5430,12 @@ class CyberdeckApp(App):
             "they attempt forbidden actions."
         )
 
-        # Profile catalog
+        # Profile catalog. P4 of the tools/plugins/profiles retool
+        # (2026-05-03) shifted profiles' tools field from "soft hint
+        # at Claude Code tool names" to "registry-backed CLI names."
+        # Each profile's `tools` references entries in tools.toml;
+        # constructs spawned with the profile see those tools'
+        # name + short description in their prompt addendum.
         profiles_loaded = self.profile_registry.all()
         if profiles_loaded:
             catalog: list[str] = [
@@ -5440,16 +5445,16 @@ class CyberdeckApp(App):
             ]
             for p in profiles_loaded:
                 tool_str = (
-                    ", ".join(p.recommended_tools)
-                    if p.recommended_tools
-                    else "(no specific recommendation)"
+                    ", ".join(p.tools)
+                    if p.tools
+                    else "(no specific tools)"
                 )
                 desc_short = " ".join(p.description.split())  # collapse newlines
                 if len(desc_short) > 200:
                     desc_short = desc_short[:197] + "..."
                 catalog.append(
                     f"- {p.name} ({p.category}): "
-                    f"recommended tools={tool_str}\n"
+                    f"tools={tool_str}\n"
                     f"  {desc_short}"
                 )
             sections.append("\n".join(catalog))
@@ -5584,6 +5589,13 @@ class CyberdeckApp(App):
             # authoring; subsequent batches within the same goal find
             # it set and proceed immediately.
             tripwire_authoring_complete=self._tripwire_authoring_complete,
+            # P4 of the tools/plugins/profiles retool (2026-05-03):
+            # callback the daemon-session calls before each spawn to
+            # render the per-spawn addendum (profile.tools resolved
+            # against tool_registry + plugins resolved against
+            # plugin_registry). Centralizes registry access on the
+            # TUI side; daemon-session stays a thin glue layer.
+            per_spawn_addendum_renderer=self._build_per_spawn_addendum,
         )
 
         if self.daemon_pane is not None:
@@ -5977,26 +5989,26 @@ class CyberdeckApp(App):
         return scripts
 
     def _build_deck_addendum(self) -> str:
-        """System-prompt addendum that describes the deck-control
-        utilities every construct can use. Joined into the
-        --append-system-prompt arg by Construct alongside any
-        profile-specific addendum.
+        """STATIC system-prompt addendum that describes the deck-
+        control utility every construct can use. Set on Fleet at
+        construction time; same string for every spawn.
+
+        P4 of the tools/plugins/profiles retool (2026-05-03) split
+        this from the per-spawn parts: profile-tools-with-descriptions
+        and plugin-selection both depend on per-spawn context (which
+        profile, which plugins the daemon picked) and now flow
+        through `_build_per_spawn_addendum` instead. This static
+        addendum stays small and cache-friendly; the per-spawn parts
+        ride alongside as a separate string assembled by Construct.
 
         We pass the absolute dispatcher path here (rather than
         relying on PATH) because:
           (a) Constructs run with cwd=cyberdeck-home but their PATH
               isn't extended, so `cyberdeck` wouldn't resolve.
           (b) Telling the construct exact bytes to invoke is
-              clearer than hoping it figures out invocation form.
-
-        The addendum is short by design — Claude Code's system prompt
-        is already verbose and this is one of several addenda. We
-        get the point across in a handful of lines and move on. The
-        plugin section appears only when the registry has at least
-        one available plugin; absent plugins means the addendum stays
-        short for routine no-plugin sessions."""
+              clearer than hoping it figures out invocation form."""
         dispatcher = self.home_dir / "tools" / "deck" / "cyberdeck.py"
-        sections: list[str] = [
+        return (
             f"You have access to a deck-control utility at "
             f"{dispatcher}. Invoke it via the Bash tool to surface "
             f"files in the netrunner's UI panel:\n"
@@ -6006,30 +6018,111 @@ class CyberdeckApp(App):
             f"see in their Files panel — finished outputs, generated "
             f"reports, etc. Don't surface every intermediate scratch "
             f"file. Paths can be absolute or relative to your cwd."
-        ]
+        )
 
-        # Plugin awareness. Only available plugins (`requires` checks
-        # passed) are surfaced — telling the construct about a plugin
-        # whose deps aren't installed just produces failed Bash calls.
-        # One line per plugin so the addendum stays bounded; if the
-        # construct needs the full interface contract, the README is
-        # a Read tool call away.
-        avail_plugins = self.plugin_registry.available()
-        if avail_plugins:
+    def _build_per_spawn_addendum(
+        self,
+        profile: Optional["Profile"],
+        plugins: Optional[list[str]],
+    ) -> str:
+        """Per-spawn system-prompt addendum: profile.tools resolved
+        against the tool registry + plugins (daemon-selected or all
+        available) resolved against the plugin registry.
+
+        P4 of the tools/plugins/profiles retool (2026-05-03). Replaces
+        the static all-plugins-always rendering that lived in
+        _build_deck_addendum pre-P4. Now:
+
+          - Profile.tools enumerates registry entries the construct
+            should prefer for this profile's work. We surface name +
+            short description; help_text is omitted (prompt-bloat-
+            aware — the construct can `<tool> --help` if it needs
+            argument shapes). Names that don't resolve against the
+            registry render as bare names with a "(not in registry)"
+            note; never silently dropped — visible drift is better
+            than invisible drift.
+
+          - Plugins selection: when `plugins` is a list, surface ONLY
+            those (the daemon-per-spawn pick). When None, surface
+            ALL available plugins (back-compat for netrunner-direct
+            spawns and pre-P4 daemon spawns that don't carry a
+            plugins field). Empty list = explicit no-plugins.
+
+        Returns a possibly-empty string that Construct will append
+        to its system prompt after the static deck_addendum."""
+        sections: list[str] = []
+
+        # Profile tools. Resolved against tool_registry — pulls each
+        # tool's description for inclusion. Skipped silently for
+        # profiles with no tools (the common case).
+        tools_list: list[str] = []
+        if profile is not None and profile.tools:
+            tools_list = list(profile.tools)
+        if tools_list:
+            tool_lines: list[str] = [
+                "Profile-recommended tools for this spawn — registry "
+                "entries (system-installed CLIs the netrunner has "
+                "declared). Prefer these over re-implementing the "
+                "same capability in Bash composition:",
+                "",
+            ]
+            registry = getattr(self, "tool_registry", None)
+            for name in tools_list:
+                tool = registry.get(name) if registry is not None else None
+                if tool is None:
+                    tool_lines.append(
+                        f"  - {name}  (not in registry — netrunner "
+                        f"may have removed this tool)"
+                    )
+                    continue
+                desc_short = " ".join(tool.description.split())
+                if len(desc_short) > 140:
+                    desc_short = desc_short[:137] + "..."
+                avail_marker = (
+                    "" if tool.available else "  [unavailable: "
+                    f"{tool.unavailable_reason or '?'}]"
+                )
+                tool_lines.append(
+                    f"  - {name}: {desc_short}{avail_marker}"
+                )
+            sections.append("\n".join(tool_lines))
+
+        # Plugin selection. Filter the available registry by `plugins`
+        # if supplied; otherwise surface all available.
+        all_avail = self.plugin_registry.available()
+        if plugins is None:
+            chosen = all_avail
+        else:
+            wanted = set(plugins)
+            chosen = [pl for pl in all_avail if pl.name in wanted]
+            # Surface a note for daemon-named plugins that don't
+            # resolve (typo, unavailable plugin, plugin not registered).
+            unresolved = wanted - {pl.name for pl in chosen}
+            if unresolved:
+                sections.append(
+                    "Daemon requested plugins that didn't resolve "
+                    f"(typo or unavailable): {sorted(unresolved)}. "
+                    f"Continuing without them."
+                )
+
+        if chosen:
             bridge_path = (
                 self.home_dir / "tools" / "deck" / "plugin_bridge.py"
             )
+            heading = (
+                "Plugins selected for this spawn"
+                if plugins is not None
+                else "Plugins available for this session"
+            )
             plugin_lines: list[str] = [
-                "",
-                "Plugins are capability bundles invoked through the "
-                f"bridge dispatcher at {bridge_path}. You don't reach "
-                "plugin code directly — call the bridge with the "
-                "plugin name and any arguments, and the bridge "
-                "forwards to the plugin's entry script. Available "
-                "plugins for this session:",
+                f"{heading} — invoke through the bridge dispatcher "
+                f"at {bridge_path}. You don't reach plugin code "
+                f"directly; call the bridge with the plugin name "
+                f"and any arguments, and the bridge forwards to the "
+                f"plugin's entry script.",
                 "",
             ]
-            for pl in avail_plugins:
+            for pl in chosen:
                 desc_short = " ".join(pl.description.split())
                 if len(desc_short) > 140:
                     desc_short = desc_short[:137] + "..."
@@ -6051,13 +6144,13 @@ class CyberdeckApp(App):
             plugin_lines.append(
                 "Read a plugin's README before first use so you know "
                 "the exact argument shape and output format. The "
-                "deck's brake hook still gates plugin invocations the "
-                "same way it gates any Bash — destructive patterns "
-                "and protected paths apply."
+                "deck's brake hook still gates plugin invocations "
+                "the same way it gates any Bash — destructive "
+                "patterns and protected paths apply."
             )
             sections.append("\n".join(plugin_lines))
 
-        return "\n".join(sections)
+        return "\n\n".join(sections)
 
     def _shorten_path(self, p: str) -> str:
         """Render `p` with `~/` substituted for the cyberdeck home
@@ -7628,6 +7721,15 @@ class CyberdeckApp(App):
                     final_task,
                     profile=spawn_profile,
                     origin="netrunner",
+                    # P4 retool: render per-spawn addendum (profile.tools
+                    # resolved + all available plugins) for this
+                    # netrunner-direct spawn. plugins=None means
+                    # "surface all available" — netrunner-direct
+                    # spawns don't go through daemon's per-spawn
+                    # plugin selection.
+                    per_spawn_addendum=self._build_per_spawn_addendum(
+                        spawn_profile, None,
+                    ),
                 ),
                 name="spawn",
             )
@@ -8852,6 +8954,11 @@ class CyberdeckApp(App):
             )
         new_construct: Optional[Construct] = None
         try:
+            # Inject continues an existing session; the system prompt
+            # is already cached server-side, so per-spawn addendum
+            # rendering would just bloat the resume turn for no gain.
+            # Pass None — fleet falls back to the static deck_addendum
+            # which the original session already has anyway.
             new_construct = await self.fleet.spawn(
                 task=framed_task,
                 resume_session_id=session_id,
@@ -9670,6 +9777,12 @@ class CyberdeckApp(App):
                 task,
                 profile=self.default_profile,
                 origin="netrunner",
+                # P4 retool: per-spawn addendum (profile.tools +
+                # all available plugins). Netrunner-direct spawn,
+                # so plugins=None (surface all).
+                per_spawn_addendum=self._build_per_spawn_addendum(
+                    self.default_profile, None,
+                ),
             ),
             name="spawn",
         )

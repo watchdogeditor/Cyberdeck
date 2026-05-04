@@ -17,12 +17,12 @@ yourself wanting to write or modify, stop and ask. Findings should be
 structured: targets identified, signals observed, gaps remaining.
 """
 
-# Recommended tools for recon work — Read/Bash for filesystem and
-# command-line recon, WebSearch + WebFetch for OSINT enrichment.
-# The system-prompt addendum already steers toward observational
-# work; these are the tools the construct should reach for first.
-# Runtime gating against destructive ops lives in the deck-global
-# brake (default-brake's bash patterns block the obvious shapes).
-recommended_tools = ["Bash", "Read", "Glob", "Grep", "WebSearch", "WebFetch"]
-
-default_scripts = ["scan_wifi", "geolocate_subject"]
+# Registry-backed tools for recon work. References entries in
+# <home>/tools/tools.toml. Empty default — register recon CLIs
+# (nmap, subfinder, dnsx, naabu, ripgrep, etc.) in tools.toml and
+# add their names here to surface them in the construct's prompt
+# addendum. Claude Code's built-in Bash/Read/Glob/Grep/WebSearch/
+# WebFetch are always available regardless. P4 of the
+# tools/plugins/profiles retool (2026-05-03) renamed
+# `recommended_tools` → `tools`.
+tools = []
