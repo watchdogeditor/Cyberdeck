@@ -463,14 +463,86 @@ Real-deck verified 2026-05-03:
 fleet.py, daemon_session.py, daemon.py, construct.py + 3
 bundled profile rewrites.
 
-**Next session picks up at: P5 of the retool — UI retool**
-(`cyberdeck-tools-plugins-profiles-retool.md` §P5, ~150 LOC).
-Profiles graduates from a section in the Tools tab to its own
-TabPane. Tools tab unifies tools + plugins into a single
-ListView with kind glyphs (⚙ binary, ⌬ script, ⊕ plugin).
-`_right_panel_focusables` re-wired (per the gotcha — hand-
-curated, not auto-derived). Lands the four-tab right panel:
-Chatlog | Files | Profiles | Tools.
+**✅ TOOLS RETOOL P5 SHIPPED 2026-05-04** (uncommitted as of this
+state.md update). UI retool: four-tab right panel
+(Chatlog | Files | Profiles | Tools), unified Tools tab.
+
+Profiles graduated from a section inside Tools to its own
+TabPane between Files and Tools. Single header + ListView;
+`tools_profile_list` ID preserved (no need to rename for cosmetic
+structure shifts).
+
+Tools tab collapsed from a multi-section VerticalScroll layout
+into a single ListView (`tools_unified_list`) with three kinds
+of rows distinguished by leading glyph:
+  ⚙ binary  — system-installed CLI (cyan when found; red ✗ + dim
+              when shutil.which can't locate it)
+  ⌬ script  — registered scripts (kind = "script" in tools.toml,
+              entry path resolved via Path(path).exists())
+  ⊕ plugin  — deck-extended capability from
+              <deck-source>/plugins/<name>/
+
+Render order: binaries → scripts → plugins, alphabetical within
+each kind. Plugins keep their `Capture/screenshot`-style category
+prefix; tools render bare names (the registry doesn't model
+categories). Single header `TOOLS (N/total available)` covers
+all three kinds.
+
+Empty state: `(empty — register CLIs in ~/tools/tools.toml or
+drop plugins in <deck-source>/plugins/<name>/)` when both
+registries are empty. Per-kind empty placeholders gone.
+
+Legacy SCRIPTS section retired. The disk-scan
+(`_scan_scripts`) of `<home>/tools/<category>/<filename>`
+violated the design's "Don't auto-discover scripts" rule, plus
+the only files in there were deck-bootstrapped infrastructure
+(cyberdeck.py, plugin_bridge.py) — not netrunner-meaningful
+tools. `_scan_scripts` left in tui.py for now (no callers, dead
+code); follow-up commit can prune.
+
+Wiring updates:
+  - `_right_panel_focusables` collapses to single-focusable-per-
+    tab. Profiles tab → `tools_profile_list`; Tools tab →
+    `tools_unified_list`.
+  - `_cycle_right_panel_tabs` order extended:
+    Chatlog → Files → Profiles → Tools.
+  - Two helpers (`_append_tool_row`, `_append_plugin_row`) keep
+    the unified panel renderer readable.
+
+~80 net LOC after consolidation (compose -55, refresh restructure
++30, focusables -10, helpers +50, cycle order +1).
+
+**Tools/plugins/profiles retool COMPLETE — 5/5 phases shipped
+2026-05-03 → 2026-05-04.**
+
+  P1 (2026-05-03): tools_registry.py + mtime-watch +
+                   tools.toml schema with default-seed.
+  P2 (2026-05-03): plugins moved into deck source + plugin_bridge
+                   dispatcher with bootstrap-time path stamping.
+  P3 (2026-05-03): load_into_deck(app) hook for plugin deck-side
+                   integration.
+  P4 (2026-05-03): profile schema migration (recommended_tools →
+                   tools, registry-backed) + per-spawn `plugins`
+                   field on daemon spawn actions + per-spawn
+                   addendum architecture split.
+  P5 (2026-05-04): 4-tab UI + unified Tools ListView.
+
+The retool's structural goals all landed: one registry per
+concept (tools → tools.toml, plugins → deck-source/plugins/,
+profiles → home/profiles/), one invocation surface per kind
+(plugins through the bridge, tools through PATH or absolute
+path, profiles through daemon system prompt), one UI surface
+per concept (Profiles tab + unified Tools tab).
+
+**Next session picks up at: open netrunner choice.** Several
+queued items, no single forced direction:
+  - Caliber selection (cyberdeck-model-effort-design.md)
+  - First-run onboarding check + preferences module (build-plan
+    items 0a + 0b)
+  - README restructure for public repo (build-plan item 0)
+  - Mechanic v0→v1 bridge (liveness heartbeat)
+  - Remaining discrete bugs (kill doesn't interrupt in-flight
+    turns; silent wedge investigation cx-796e0468)
 
 Two discrete bugs from earlier remain deferred (not fixable
 today):

@@ -3895,73 +3895,55 @@ class CyberdeckApp(App):
                         # No header label needed — empty state is
                         # handled by an in-list placeholder.
                         yield ListView(id="files_list")
+                    with TabPane("Profiles", id="profiles_tab"):
+                        # P5 of the tools/plugins/profiles retool
+                        # (2026-05-04): profiles graduate from a
+                        # section inside the Tools tab into their own
+                        # tab. The dedicated tab gives profiles room
+                        # without competing for vertical space against
+                        # tools + plugins, and matches the conceptual
+                        # split — profiles are recipes (the daemon
+                        # picks them per task), tools/plugins are
+                        # capabilities (constructs invoke them).
+                        # Header label kept for the count badge;
+                        # ListView ID `tools_profile_list` preserved
+                        # so existing query_one + handler wiring
+                        # stays untouched (no need to chase ID
+                        # renames for cosmetic structure shifts).
+                        yield Label(
+                            "[b]PROFILES[/b]  [dim](0)[/dim]",
+                            id="tools_profiles_header",
+                        )
+                        yield ListView(id="tools_profile_list")
                     with TabPane("Tools", id="tools_tab"):
-                        # Tools tab is now a structured layout with
-                        # focusable list items, not a flat RichLog.
-                        # Profile rows can be selected (C1g.4 will wire
-                        # Tools tab is now a structured layout with
-                        # focusable list items, not a flat RichLog.
-                        # Profile rows can be selected (C1g.4 wires
-                        # space → launch modal); script rows too
-                        # (will become a "spin up a construct
-                        # configured for this script" shortcut).
-                        # Scripts populate from <home>/tools/<cat>/<file>.
-                        with VerticalScroll(id="tools_panel_scroll"):
-                            yield Label(
-                                "[b]PROFILES[/b]  [dim](0)[/dim]",
-                                id="tools_profiles_header",
-                            )
-                            yield ListView(id="tools_profile_list")
-                            yield Label(
-                                "[b]PLUGINS[/b]  [dim](0)[/dim]",
-                                id="tools_plugins_header",
-                            )
-                            # Plugins section — capability bundles that
-                            # extend what constructs can do beyond Bash
-                            # + builtins. Each plugin is a folder under
-                            # <deck-source>/plugins/ (P2 of the retool
-                            # moved them there for brake-hook
-                            # protection) with a manifest, a README,
-                            # and an entry point. Items render with
-                            # `[category/name][availability badge]`,
-                            # similar to profiles but with a unique
-                            # marker so the netrunner can tell at a
-                            # glance which plugins are installed but
-                            # missing dependencies.
-                            yield ListView(id="tools_plugin_list")
-                            # Tools section (P1 of the tools/plugins/
-                            # profiles retool, 2026-05-03). Mirrors
-                            # the plugins section's shape: registry-
-                            # backed, available/unavailable indicator,
-                            # ListView of focusable rows. Sourced from
-                            # <home>/tools/tools.toml — netrunner-
-                            # declared system CLIs the deck knows
-                            # about. SCRIPTS section below remains
-                            # for now (legacy flat-file scan); the
-                            # P5 UI retool collapses both into one
-                            # unified Tools section.
-                            yield Label(
-                                "[b]TOOLS[/b]  [dim](0)[/dim]",
-                                id="tools_registry_header",
-                            )
-                            yield ListView(id="tools_registry_list")
-                            yield Label(
-                                "[b]SCRIPTS[/b]  [dim](0)[/dim]",
-                                id="tools_scripts_header",
-                            )
-                            # Renamed id from tools_construct_list →
-                            # tools_scripts_list. Same widget shape;
-                            # different content (disk-scanned scripts
-                            # instead of hardcoded built-ins). Built-
-                            # ins were a category mismatch with the
-                            # spec's tool-registry concept anyway —
-                            # they're Claude Code's surface, not the
-                            # deck's registered capabilities.
-                            yield ListView(id="tools_scripts_list")
-                            # No directory reference labels — the
-                            # netrunner knows where ~/profiles and
-                            # ~/tools live; the path text was just
-                            # vertical noise.
+                        # P5: unified list combining registry-backed
+                        # tools (binary + script kinds, from
+                        # <home>/tools/tools.toml) and plugins
+                        # (deck-extended capabilities from
+                        # <deck-source>/plugins/). Three kind glyphs
+                        # distinguish row types at a glance:
+                        #   ⚙ binary  — system-installed CLI on PATH
+                        #   ⌬ script  — registered scripts
+                        #   ⊕ plugin  — deck-extended capability
+                        # Available rows render in cyan; unavailable
+                        # ones (missing binary, requires-failed
+                        # plugin) get a red ✗ glyph + dimmed name —
+                        # same convention as the pre-P5 split panels.
+                        # The legacy SCRIPTS section (flat-file
+                        # auto-scan of <home>/tools/<category>/) was
+                        # retired; the design's "Don't auto-discover
+                        # scripts" rule applies — the only files
+                        # there were deck-bootstrapped infrastructure
+                        # (cyberdeck.py, plugin_bridge.py), not
+                        # netrunner-meaningful tools. Multi-part
+                        # scripts now register through tools.toml as
+                        # `kind = "script"` entries with `path`
+                        # pointing at the entry file.
+                        yield Label(
+                            "[b]TOOLS[/b]  [dim](0)[/dim]",
+                            id="tools_unified_header",
+                        )
+                        yield ListView(id="tools_unified_list")
 
         # BOTTOM: tabbed Daemon + Watchdog. Both surfaces are
         # output-only logs the netrunner can focus + magnify with z.
@@ -3981,67 +3963,46 @@ class CyberdeckApp(App):
         yield Footer()
 
     def _refresh_tools_panel(self) -> None:
-        """Re-populate the Tools tab's ListViews and header labels from
-        the current profile registry state. Called on registry
-        scan_complete and once at mount time. Idempotent — clears each
-        list and rebuilds.
+        """Re-populate the Profiles tab's ListView and the unified
+        Tools tab's ListView from the current registry states. Called
+        on profile/plugin/tool scan_complete events and once at mount
+        time. Idempotent — clears each list and rebuilds.
 
-        The static footer (DAEMON / PERMISSIONS / Future...) is set in
-        compose and never updated here — it doesn't depend on registry
-        state. The dir-line is updated because it depends on
-        self.profiles_dir which is fixed at startup, but we still
-        repopulate it during refresh in case the netrunner ever gains
-        the ability to reconfigure (deferred)."""
+        P5 of the tools/plugins/profiles retool (2026-05-04) split
+        the tab layout: Profiles graduated to its own tab, Tools
+        absorbed plugins into a unified ListView with kind glyphs
+        (⚙ binary, ⌬ script, ⊕ plugin). The legacy disk-scanned
+        SCRIPTS section was retired — the design's "Don't auto-
+        discover" rule applies, and the only files there were
+        deck-bootstrapped infrastructure anyway."""
         try:
             profile_list = self.query_one(
                 "#tools_profile_list", ListView
             )
-            scripts_list = self.query_one(
-                "#tools_scripts_list", ListView
+            unified_list = self.query_one(
+                "#tools_unified_list", ListView
             )
-            plugins_list = self.query_one(
-                "#tools_plugin_list", ListView
-            )
-            tools_registry_list = self.query_one(
-                "#tools_registry_list", ListView
-            )
-            header = self.query_one(
+            profile_header = self.query_one(
                 "#tools_profiles_header", Label
             )
-            scripts_header = self.query_one(
-                "#tools_scripts_header", Label
-            )
-            plugins_header = self.query_one(
-                "#tools_plugins_header", Label
-            )
-            tools_registry_header = self.query_one(
-                "#tools_registry_header", Label
+            unified_header = self.query_one(
+                "#tools_unified_header", Label
             )
         except Exception:
             # Pre-mount or test harness without right panel.
             return
 
-        # Profiles section. Items are sorted by category then by name
-        # within each category. Each item carries the Profile object so
-        # downstream handlers (C1g.4 launch modal) can read its data
-        # without a registry round-trip.
+        # ---- Profiles tab -----------------------------------------
         profiles_by_cat = self.profile_registry.by_category()
-        total = sum(len(ps) for ps in profiles_by_cat.values())
-        header.update(f"[b]PROFILES[/b]  [dim]({total})[/dim]")
-
-        # Clear-and-repopulate. ListView's clear() removes all items;
-        # we then mount each fresh ProfileListItem. Mount happens
-        # synchronously enough that the items are queryable
-        # immediately (which we need so the registered focus handling
-        # picks them up).
+        profile_total = sum(len(ps) for ps in profiles_by_cat.values())
+        profile_header.update(
+            f"[b]PROFILES[/b]  [dim]({profile_total})[/dim]"
+        )
         profile_list.clear()
-        if total == 0:
-            # Empty-state placeholder — also a list item so the empty
-            # list still has SOMETHING focusable, but it's marked as
-            # disabled (the CSS will dim it). Avoids the awkward case
-            # of "press tab into an empty list, focus disappears".
+        if profile_total == 0:
             empty_item = ListItem(Label(
-                "[dim](no profiles — drop a .toml in the dir below)[/dim]",
+                "[dim](no profiles — drop a .toml in "
+                "~/profiles/)[/dim]",
                 markup=True,
             ))
             empty_item.disabled = True
@@ -4049,22 +4010,17 @@ class CyberdeckApp(App):
         else:
             for cat, profiles_in_cat in profiles_by_cat.items():
                 for p in profiles_in_cat:
-                    # Recommended-tool count badge. Profiles no longer
-                    # carry brake state (that's deck-global now), so
-                    # the old P/D/Y sigil is gone — only the
-                    # recommended-tools count survives as a glance
-                    # signal. A profile with N recommended tools shows
-                    # "Nt"; a profile with no opinion shows a single
-                    # dot to keep the column aligned.
+                    # Tool count badge. Post-P4 the field is `tools`
+                    # (registry-backed CLI names). Legacy profiles
+                    # that haven't been migrated still surface
+                    # values via `recommended_tools`; we count
+                    # whichever is present.
+                    tool_count = len(p.tools) or len(p.recommended_tools)
                     count = (
-                        f"[dim]{len(p.recommended_tools)}t[/dim]"
-                        if p.recommended_tools
+                        f"[dim]{tool_count}t[/dim]"
+                        if tool_count
                         else "[dim]·[/dim]"
                     )
-                    # Format: "Engineering/code_reviewer  3t"
-                    # Category prefix replaces the standalone header
-                    # line we used to render — works in a flat list
-                    # without needing non-focusable header rows.
                     label_markup = (
                         f"[dim]{cat}/[/dim]"
                         f"[cyan]{p.name}[/cyan]  {count}"
@@ -4073,131 +4029,113 @@ class CyberdeckApp(App):
                         ProfileListItem(p, label_markup)
                     )
 
-        # Plugins section. Read from the registry's snapshot —
-        # populated once at startup, no hot reload (plugins are code).
-        # Render with category prefix + name, availability marker
-        # for plugins whose `requires` checks failed (so the
-        # netrunner sees what's installed but can't run yet).
-        plugins_by_cat = self.plugin_registry.by_category()
-        plugin_total = sum(len(ps) for ps in plugins_by_cat.values())
-        plugin_avail = len(self.plugin_registry.available())
-        # Header shows available count when it differs from total —
-        # avoids needing the netrunner to expand each row to find
-        # out something's broken.
-        if plugin_avail == plugin_total:
-            plugins_header.update(
-                f"[b]PLUGINS[/b]  [dim]({plugin_total})[/dim]"
-            )
-        else:
-            plugins_header.update(
-                f"[b]PLUGINS[/b]  [dim]({plugin_avail}/{plugin_total} "
-                f"available)[/dim]"
-            )
-        plugins_list.clear()
-        if plugin_total == 0:
-            empty_item = ListItem(Label(
-                "[dim](no plugins — drop a folder in ~/plugins/"
-                "<name>/ with plugin.toml)[/dim]",
-                markup=True,
-            ))
-            empty_item.disabled = True
-            plugins_list.append(empty_item)
-        else:
-            for cat, plugins_in_cat in plugins_by_cat.items():
-                for pl in plugins_in_cat:
-                    # Available plugins render in cyan like profiles;
-                    # unavailable ones get a red marker + dimmed name
-                    # so the netrunner can spot them at a glance.
-                    if pl.available:
-                        avail_marker = "[dim]·[/dim]"
-                        name_color = "cyan"
-                    else:
-                        avail_marker = "[red]✗[/red]"
-                        name_color = "dim"
-                    label_markup = (
-                        f"{avail_marker} [dim]{cat}/[/dim]"
-                        f"[{name_color}]{pl.name}[/{name_color}]"
-                    )
-                    plugins_list.append(
-                        PluginListItem(pl, label_markup)
-                    )
-
-        # Tools section (registry-backed, P1 retool 2026-05-03).
-        # Reads from <home>/tools/tools.toml via tool_registry. Each
-        # row prefixed with a kind glyph — ⚙ for binary, ⌬ for
-        # script — so the netrunner can scan kinds at a glance.
-        # Available entries render in cyan; unavailable ones get the
-        # red ✗ + dimmed name treatment that mirrors plugin rendering.
+        # ---- Tools tab (unified tools + plugins) ------------------
+        # Three kinds of rows. Render order: binary tools → script
+        # tools → plugins. Within each section, alphabetical by name.
+        # Single header showing availability ratio across all kinds —
+        # unavailable count surfaces tools the netrunner registered
+        # but the deck can't locate, plus plugins whose `requires`
+        # checks failed.
         tools_by_kind = self.tool_registry.by_kind()
-        tool_total = sum(len(ts) for ts in tools_by_kind.values())
-        tool_avail = len(self.tool_registry.available())
-        if tool_avail == tool_total:
-            tools_registry_header.update(
-                f"[b]TOOLS[/b]  [dim]({tool_total})[/dim]"
-            )
-        else:
-            tools_registry_header.update(
-                f"[b]TOOLS[/b]  [dim]({tool_avail}/{tool_total} "
-                f"available)[/dim]"
-            )
-        tools_registry_list.clear()
-        if tool_total == 0:
-            empty_item = ListItem(Label(
-                "[dim](no tools — add [[tool]] entries to "
-                "~/tools/tools.toml)[/dim]",
-                markup=True,
-            ))
-            empty_item.disabled = True
-            tools_registry_list.append(empty_item)
-        else:
-            # Glyph by kind. P5 of the retool will collapse plugins
-            # into the same panel and add ⊕ for plugin; for now we
-            # render only registry tools (binary/script).
-            kind_glyphs = {"binary": "⚙", "script": "⌬"}
-            for kind, tools_in_kind in tools_by_kind.items():
-                glyph = kind_glyphs.get(kind, "?")
-                for tool in tools_in_kind:
-                    if tool.available:
-                        avail_marker = f"[dim]{glyph}[/dim]"
-                        name_color = "cyan"
-                    else:
-                        avail_marker = "[red]✗[/red]"
-                        name_color = "dim"
-                    label_markup = (
-                        f"{avail_marker} "
-                        f"[{name_color}]{tool.name}[/{name_color}]"
-                    )
-                    # ListItem with the tool stashed for downstream
-                    # handlers (z-magnify, future launch). We don't
-                    # have a dedicated ToolListItem dataclass yet —
-                    # P5 may add one alongside the unified panel.
-                    item = ListItem(Label(label_markup, markup=True))
-                    item.tool = tool  # type: ignore[attr-defined]
-                    tools_registry_list.append(item)
-
-        # Scripts section. Disk-scanned from <home>/tools/<cat>/<file>.
-        # The dispatcher (tools/deck/cyberdeck.py) shows up here on
-        # first run because bootstrap writes it. Constructs that
-        # produce useful one-shot scripts can save them under
-        # tools/<category>/ and they'll appear here next refresh.
-        scripts = self._scan_scripts()
-        scripts_header.update(
-            f"[b]SCRIPTS[/b]  [dim]({len(scripts)})[/dim]"
+        binary_tools = sorted(
+            tools_by_kind.get("binary", []),
+            key=lambda t: t.name,
         )
-        scripts_list.clear()
-        if not scripts:
+        script_tools = sorted(
+            tools_by_kind.get("script", []),
+            key=lambda t: t.name,
+        )
+        all_plugins = sorted(
+            self.plugin_registry.all(),
+            key=lambda pl: (pl.category, pl.name),
+        )
+
+        total_count = (
+            len(binary_tools) + len(script_tools) + len(all_plugins)
+        )
+        avail_count = (
+            len([t for t in binary_tools if t.available])
+            + len([t for t in script_tools if t.available])
+            + len([pl for pl in all_plugins if pl.available])
+        )
+        if total_count == 0:
+            unified_header.update(
+                f"[b]TOOLS[/b]  [dim](0)[/dim]"
+            )
+        elif avail_count == total_count:
+            unified_header.update(
+                f"[b]TOOLS[/b]  [dim]({total_count})[/dim]"
+            )
+        else:
+            unified_header.update(
+                f"[b]TOOLS[/b]  "
+                f"[dim]({avail_count}/{total_count} available)[/dim]"
+            )
+
+        unified_list.clear()
+        if total_count == 0:
             empty_item = ListItem(Label(
-                "[dim](no scripts — drop one in ~/tools/"
-                "<category>/)[/dim]",
+                "[dim](empty — register CLIs in "
+                "~/tools/tools.toml or drop plugins in "
+                "<deck-source>/plugins/<name>/)[/dim]",
                 markup=True,
             ))
             empty_item.disabled = True
-            scripts_list.append(empty_item)
+            unified_list.append(empty_item)
         else:
-            for path, category, name in scripts:
-                scripts_list.append(
-                    ScriptListItem(path, category, name)
+            # Tools (binary + script) come first. Plugins after.
+            # Within tools, sort by kind (binary first) then name.
+            for tool in binary_tools:
+                self._append_tool_row(
+                    unified_list, tool, glyph="⚙",
                 )
+            for tool in script_tools:
+                self._append_tool_row(
+                    unified_list, tool, glyph="⌬",
+                )
+            for pl in all_plugins:
+                self._append_plugin_row(unified_list, pl)
+
+    def _append_tool_row(
+        self, list_view: "ListView", tool, *, glyph: str,
+    ) -> None:
+        """Render one registry-backed tool row in the unified Tools
+        list. Cyan name when available; red ✗ + dimmed name when
+        the deck couldn't locate the binary/script. The Tool object
+        is stashed on the ListItem so downstream handlers (z-magnify,
+        future launch) can read it without a registry round-trip."""
+        if tool.available:
+            avail_marker = f"[dim]{glyph}[/dim]"
+            name_color = "cyan"
+        else:
+            avail_marker = "[red]✗[/red]"
+            name_color = "dim"
+        label_markup = (
+            f"{avail_marker} "
+            f"[{name_color}]{tool.name}[/{name_color}]"
+        )
+        item = ListItem(Label(label_markup, markup=True))
+        item.tool = tool  # type: ignore[attr-defined]
+        list_view.append(item)
+
+    def _append_plugin_row(
+        self, list_view: "ListView", pl,
+    ) -> None:
+        """Render one plugin row in the unified Tools list. The ⊕
+        glyph distinguishes plugins from binary/script tools.
+        Category prefix matches the pre-P5 plugin rendering so the
+        netrunner sees `Capture/screenshot`, not just `screenshot`."""
+        if pl.available:
+            avail_marker = "[dim]⊕[/dim]"
+            name_color = "cyan"
+        else:
+            avail_marker = "[red]✗[/red]"
+            name_color = "dim"
+        label_markup = (
+            f"{avail_marker} [dim]{pl.category}/[/dim]"
+            f"[{name_color}]{pl.name}[/{name_color}]"
+        )
+        list_view.append(PluginListItem(pl, label_markup))
 
     def _handle_profile_event(self, deck_event: "DeckEvent") -> None:
         """Bus subscriber: profile.<kind> event arrived.
@@ -7428,17 +7366,17 @@ class CyberdeckApp(App):
                 return [self.query_one("#chatlog_log", RichLog)]
             if active_tab == "files_tab":
                 return [self.query_one("#files_list", ListView)]
+            if active_tab == "profiles_tab":
+                # P5 retool (2026-05-04): profiles graduated to its
+                # own tab. Single ListView per tab now — focusables
+                # collapse to one entry.
+                return [self.query_one("#tools_profile_list", ListView)]
             if active_tab == "tools_tab":
-                # Order matters: list as they appear top-to-bottom in
-                # the tab so W/S walks visually rather than out-of-
-                # order. Profiles → Plugins → Tools (P1 retool) →
-                # Scripts — same as the compose() order.
-                return [
-                    self.query_one("#tools_profile_list", ListView),
-                    self.query_one("#tools_plugin_list", ListView),
-                    self.query_one("#tools_registry_list", ListView),
-                    self.query_one("#tools_scripts_list", ListView),
-                ]
+                # P5 retool: tools + plugins unified into one ListView
+                # with kind glyphs. The pre-P5 four-list ordering
+                # (profiles → plugins → tools → scripts) collapses
+                # to a single focusable per tab.
+                return [self.query_one("#tools_unified_list", ListView)]
         except Exception:
             return []
         return []
@@ -7493,15 +7431,17 @@ class CyberdeckApp(App):
             target.focus()
 
     def _cycle_right_panel_tabs(self, forward: bool) -> None:
-        """Swap the active tab in right_panel (Chatlog -> Files -> Tools)
-        and focus the new tab's content."""
+        """Swap the active tab in right_panel
+        (Chatlog -> Files -> Profiles -> Tools) and focus the new
+        tab's content. P5 retool (2026-05-04) added the Profiles
+        tab between Files and Tools."""
         try:
             tabs = self.query_one("#right_panel_tabs", TabbedContent)
         except Exception:
             return
         # Chatlog is the default landing tab; cycle proceeds rightward
-        # through the visual tab order. Adding a fourth tab? Just append.
-        order = ["chatlog_tab", "files_tab", "tools_tab"]
+        # through the visual tab order. Adding another tab? Just append.
+        order = ["chatlog_tab", "files_tab", "profiles_tab", "tools_tab"]
         try:
             cur_idx = order.index(tabs.active)
         except ValueError:

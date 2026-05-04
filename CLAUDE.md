@@ -429,14 +429,85 @@ split + 3 spawn-site updates), fleet.py +30, daemon_session.py
 (removed profile-tools rendering), 3 bundled profiles pre-
 migrated.
 
-**Next session picks up at: P5 of the retool — UI retool**
-(`cyberdeck-tools-plugins-profiles-retool.md` §P5, ~150 LOC).
-Profiles graduates from a section in the Tools tab to its own
-TabPane. Tools tab unifies tools + plugins into a single
-ListView with kind glyphs (⚙ binary, ⌬ script, ⊕ plugin).
-`_right_panel_focusables` re-wired (per the gotcha — hand-
-curated, not auto-derived). Lands the four-tab right panel:
-Chatlog | Files | Profiles | Tools.
+**✅ TOOLS RETOOL P5 SHIPPED 2026-05-04** (uncommitted as of this
+CLAUDE.md update). UI retool: four-tab right panel
+(Chatlog | Files | Profiles | Tools), unified Tools tab with
+kind glyphs.
+
+Structural changes:
+- **Profiles** graduates from a section inside Tools to its own
+  TabPane between Files and Tools. Single header + ListView; the
+  `tools_profile_list` ID preserved so existing query_one and
+  handler wiring stays untouched (no need to chase ID renames
+  for cosmetic structure shifts).
+- **Tools** loses the multi-section vertical scroll layout and
+  becomes a single ListView (`tools_unified_list`). Three kinds
+  of rows distinguished by leading glyph:
+    ⚙ binary  — system-installed CLI on PATH (cyan available;
+                red ✗ + dim when missing)
+    ⌬ script  — registered scripts in tools.toml
+    ⊕ plugin  — deck-extended capability from
+                <deck-source>/plugins/<name>/
+- Tools render order: binaries → scripts → plugins, alphabetical
+  within each kind. Plugins keep their `Capture/screenshot`-style
+  category prefix; binary/script tools render bare names (no
+  category in the registry today).
+- Single header `TOOLS (N/total available)` covers all three
+  kinds — surfaces total count + the ratio when anything's
+  unavailable.
+- **Empty state**: `(empty — register CLIs in ~/tools/tools.toml
+  or drop plugins in <deck-source>/plugins/<name>/)` when both
+  registries are empty. Per-kind empty states (the old "no
+  plugins" / "no tools" placeholders in their own sections) gone.
+
+Retired:
+- The legacy SCRIPTS section (flat-file disk scan of
+  `<home>/tools/<category>/<filename>`). Per the design's "Don't
+  auto-discover scripts" rule, registry should be explicit; loose
+  directories are organizational. Plus the only files there were
+  deck-bootstrapped infrastructure (cyberdeck.py, plugin_bridge.py)
+  — not netrunner-meaningful tools. `_scan_scripts` function
+  remains in tui.py (no callers, dead code) — clean-up deferred
+  to a small follow-up.
+
+Wiring:
+- `_right_panel_focusables` collapses from a 4-list ordering
+  (profiles → plugins → tools → scripts) to a single focusable
+  per tab. The new Profiles tab has one focusable
+  (`tools_profile_list`); Tools tab has one (`tools_unified_list`).
+- `_cycle_right_panel_tabs` order extended to include
+  `profiles_tab`: Chatlog → Files → Profiles → Tools.
+- Two new helper methods `_append_tool_row` and
+  `_append_plugin_row` factor out the per-row rendering so the
+  unified panel building stays readable.
+
+Real-deck verified 2026-05-04: deck boots clean, no errors, all
+panels render (tested via the existing 1-unavailable-tool +
+1-available-plugin state). ~80 net LOC after consolidation
+(compose -55, _refresh_tools_panel restructure +30, focusables
+-10, helpers +50, cycle order +1).
+
+**Tools/plugins/profiles retool COMPLETE — 5/5 phases shipped
+2026-05-03 → 2026-05-04.** What landed across the retool:
+  - P1: tools_registry.py + mtime-watch + tools.toml schema
+  - P2: plugins moved into deck source + plugin_bridge dispatcher
+  - P3: load_into_deck(app) hook for plugin deck-side integration
+  - P4: profile schema migration (recommended_tools → tools) +
+        per-spawn `plugins` field on daemon spawn actions
+  - P5: 4-tab UI (Chatlog/Files/Profiles/Tools) + unified Tools
+        ListView with kind glyphs
+
+**Next session picks up at: open netrunner choice.** Several
+queued items, no single forced direction:
+  - Caliber selection (`cyberdeck-model-effort-design.md`) —
+    per-spawn model + effort + fast-mode picked by daemon based
+    on task + remaining quota; biggest user-facing slice.
+  - First-run onboarding check + preferences module
+    (build-plan items 0a + 0b).
+  - README restructure for public repo (build-plan item 0).
+  - Mechanic v0→v1 bridge (liveness heartbeat).
+  - The remaining discrete bugs (kill doesn't interrupt
+    in-flight assistant turns, silent wedge investigation).
 
 **Filed for Mechanic v0→v1 bridge (2026-05-01):** liveness heartbeat.
 Currently Mechanic v0 watches the deck PID — proves the process
