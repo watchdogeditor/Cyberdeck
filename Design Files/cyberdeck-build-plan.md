@@ -167,6 +167,84 @@ Roughly ordered by likely appeal:
    solicited but issues welcome). Don't include LOC stats —
    they go stale fast. Don't write API docs — there's no API.
    Sub-day session of focused writing; no code changes.
+
+0a. **First-run onboarding check** (filed 2026-05-03 by
+   netrunner). Today's deck self-bootstraps file artifacts
+   (profiles dir, dispatcher script, plugin bridge, tools.toml,
+   state.json) but doesn't verify external prerequisites. A
+   netrunner who clones the repo to a fresh machine and runs
+   `python tui.py` gets either a cryptic ImportError on Textual
+   missing, or `[Errno 2] No such file or directory: 'claude'`
+   deep in async setup, or — worst case — silent failure modes
+   when claude is on PATH but not logged in. Right shape:
+   - Sentinel at `<home>/.cyberdeck/first_run_complete`
+   - `_first_run_check` runs on every startup; cheap (~50ms,
+     stdlib-only). On first run OR on detected FAIL, surfaces
+     diagnostics; otherwise silent.
+   - Probes: Python version (3.11+), `import textual`,
+     `import mss` (warn-only — mss is screenshot-plugin-specific),
+     `shutil.which("claude")` for the binary, `claude --version`
+     to verify the install isn't broken, `claude --help | head`
+     to confirm logged-in account (network call; first-run only).
+   - Each prereq → PASS / WARN / FAIL with remediation hint
+     ("install: pip install textual", "install: npm install -g
+     @anthropic-ai/claude-code", "run: claude /login"). DETECT +
+     SUGGEST, NOT AUTO-INSTALL — npm/pip auto-install is fragile
+     across corp firewalls, alternate Python distributions, and
+     environments where the user can't write globally. Better to
+     be the doctor than the surgeon.
+   - `--doctor` CLI flag re-runs the check on demand even after
+     the sentinel is set. `--no-doctor` skips entirely (escape
+     hatch for environments where the probe itself is broken).
+   - Exit before TUI mount on FAIL of hard prereqs (Python
+     version, textual, claude binary). On WARN (mss missing,
+     auth uncertain), surface a chatlog notice and continue.
+   ~150 LOC, mostly inline `subprocess.run([..., '--version'],
+   timeout=5, capture_output=True)` checks + a small reporter
+   function.
+
+0b. **Preferences module** (filed 2026-05-03 by netrunner).
+   Today's persistent settings are scattered: brake state lives
+   under `<home>/.cyberdeck/state.json`'s `brake` key,
+   delay/wedge timeouts under the `limits` namespace in the
+   same file. Modified through `brake_state.load/save` +
+   `brake_state.load_limits/save_limits` — works, but the API
+   surface scales linearly with new settings. Future settings
+   (theme, default profile, agent defaults, keybind overrides,
+   per-installation flags) need a unified home and an
+   ergonomic accessor.
+   - New `preferences.py`: thin wrapper module providing a
+     `Preferences(home_dir)` dataclass-shaped accessor. Reads/
+     writes the existing `<home>/.cyberdeck/state.json` (no
+     migration needed — the file already exists; we just
+     formalize it).
+   - Semantic API: `prefs = Preferences(home_dir);
+     prefs.brake; prefs.delay_window_seconds; prefs.save()`.
+     Internal: read-merge-write pattern (so concurrent saves
+     of different keys don't clobber each other; same shape
+     as `brake_state.save_limits` today).
+   - Migrate existing brake_state.load/save and
+     brake_state.load_limits/save_limits to flow through
+     Preferences transparently — callers stay unchanged.
+   - File header comment: `# DECK-OWNED PREFERENCES — managed
+     by the deck via preferences.py. Manual edits survive
+     restarts but may be overwritten by the deck on the next
+     setting change. Edit at your own risk.`
+   - The "agents don't touch it mistakenly" concern is already
+     structural: brake_hook.path_is_protected exempts the
+     workspace EXCEPT for `<home>/.cyberdeck/`, so constructs
+     CANNOT write to state.json (writes go through the brake
+     hook, the brake hook denies). Reads stay allowed —
+     useful for an agent inspecting current brake state without
+     compromising integrity.
+   - Future settings to bake into the schema (commented as
+     placeholders, no live wiring yet): `theme`, `default_
+     profile`, `default_tools`, `keybind_overrides`,
+     `agent_defaults`, `last_session_id` (for the morgue
+     when it lands).
+   - ~150 LOC.
+
+1. **Plugin scaffolding** — ✓ shipped (v1: stateless, screenshot
    plugin as first example, brake hook gates invocations naturally
    via existing bash/path patterns). Sub-features still deferred:
    plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`),

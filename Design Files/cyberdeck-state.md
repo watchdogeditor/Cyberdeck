@@ -1729,6 +1729,29 @@ and 11.
   dev, Windows-first), license/contributing. See build-plan
   item 0 in the deferred list for the full section outline.
   Sub-day session, no code changes.
+- **First-run onboarding check** (filed 2026-05-03). Today's
+  deck self-bootstraps file artifacts but doesn't verify
+  Python version, `textual`, `mss`, claude binary on PATH, or
+  Claude Code account auth. Fresh-machine netrunner gets
+  cryptic errors. Right shape: `_first_run_check` inline in
+  tui.py with sentinel at `<home>/.cyberdeck/first_run_complete`,
+  per-prereq PASS/WARN/FAIL with remediation hints, DETECT +
+  SUGGEST not AUTO-INSTALL (npm/pip auto-install is fragile),
+  `--doctor` CLI flag for on-demand re-runs. ~150 LOC. See
+  build-plan item 0a for full design.
+- **Preferences module** (filed 2026-05-03). Persistent settings
+  today scattered across brake_state.load/save and
+  brake_state.load_limits/save_limits — works but doesn't scale.
+  Right shape: new `preferences.py` thin wrapper exposing a
+  `Preferences(home_dir)` accessor with semantic properties
+  (prefs.brake, prefs.delay_window_seconds, prefs.save()),
+  reads/writes existing `<home>/.cyberdeck/state.json` (no
+  migration — already exists), file header marks it
+  deck-owned, brake hook already prevents constructs from
+  writing. Future settings (theme, default_profile,
+  default_tools, keybind_overrides, agent_defaults) bake into
+  the schema as placeholders. ~150 LOC. See build-plan item
+  0b for full design.
 - **Plugins** — third leg of tool registry
 - **Watchdog tripwires + blacklist** — DSL, deterministic matcher
 - **Connection consequences** — spawn-blocking, daemon parking
