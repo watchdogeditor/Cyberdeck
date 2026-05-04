@@ -346,7 +346,13 @@ class SessionManager:
 # pull yet (M5.3c). Cross-restart reuse is M5.3e.
 
 import asyncio
-from typing import Callable as _Callable, Optional as _Optional
+from typing import Callable as _Callable, Optional as _Optional, TYPE_CHECKING as _TYPE_CHECKING
+
+if _TYPE_CHECKING:
+    # Caliber referenced by SessionPool's warm_caliber field +
+    # pull() requested_caliber kwarg signature. TYPE_CHECKING-only
+    # so caliber.py stays an optional dependency for non-TUI runs.
+    from caliber import Caliber
 
 
 @dataclass
@@ -401,6 +407,7 @@ class SessionPool:
         warm_message: str = DEFAULT_WARM_MESSAGE,
         on_event: _Optional[_Callable[[PoolEvent], None]] = None,
         cwd: _Optional[str] = None,
+        warm_caliber: _Optional["Caliber"] = None,
     ) -> None:
         self.manager = manager
         self.target_size = target_size
@@ -411,6 +418,24 @@ class SessionPool:
         # from python's cwd. Pass an explicit home dir to keep warming
         # processes confined alongside the rest of the deck.
         self.cwd = cwd
+        # Caliber Phase 2 (2026-05-04): the model + effort + fast-mode
+        # bundle the pool warms its sessions with. Defaults to
+        # Caliber.default() (sonnet+high) — matches what spawns typically
+        # request, so pool reuse is the common path. pull() gates on
+        # caliber match: a request that matches reuses warm; mismatch
+        # falls through to fresh spawn. Same shape as the existing
+        # profile-only-default pool gating (the pool warms one
+        # configuration; mismatching configurations spawn fresh).
+        if warm_caliber is None:
+            try:
+                from caliber import Caliber as _Caliber
+                warm_caliber = _Caliber.default()
+            except Exception:
+                # caliber.py missing — pool falls back to "no caliber
+                # gating" mode (every pull treated as a match). Keeps
+                # the pool functional for tests / stripped-down runs.
+                warm_caliber = None
+        self.warm_caliber = warm_caliber
         # In-flight warming tasks. We track them so shutdown can cancel
         # cleanly and warming_count reflects real state.
         self._warming_tasks: set = set()
@@ -448,10 +473,47 @@ class SessionPool:
 
     # ---- pull / refill --------------------------------------------------
 
-    async def pull(self) -> _Optional[SessionEntry]:
+    async def pull(
+        self,
+        requested_caliber: _Optional["Caliber"] = None,
+    ) -> _Optional[SessionEntry]:
         """Take the oldest warm session, mark it in_use, and trigger
         a background refill. Returns None if no warm sessions exist —
-        the caller should fall back to a fresh spawn in that case."""
+        OR if `requested_caliber` doesn't match the pool's
+        `warm_caliber`. Caller falls back to fresh spawn in either case.
+
+        Caliber Phase 2 (2026-05-04): pool warms one caliber. A spawn
+        requesting a different caliber falls through to fresh; same
+        shape as the existing "non-default profile spawns fresh"
+        gating. Empirical real-deck observation 2026-05-04 shows
+        Claude Code 2.1.126 actually honors a `--model` change on
+        `--resume`, so the gating here is conservative — we could
+        skip it and let resume + per-turn model do the work — but
+        the design's principle is "pool warms one caliber" and the
+        cache benefit only really materializes when caliber matches.
+        Lean toward the design.
+
+        When `requested_caliber` is None, treat as "no caliber gate"
+        and reuse any warm entry. Same posture for headless tests
+        and the legacy callsite that hasn't been updated.
+        """
+        # Caliber match gate. Pool's warm_caliber is None only in
+        # degraded modes (caliber.py missing); in that case we fall
+        # back to "no gating" so the pool stays functional.
+        if (
+            requested_caliber is not None
+            and self.warm_caliber is not None
+            and requested_caliber != self.warm_caliber
+        ):
+            self._emit(PoolEvent(
+                kind="caliber_mismatch",
+                error=(
+                    f"requested {requested_caliber.display()}; "
+                    f"pool warms {self.warm_caliber.display()}"
+                ),
+            ))
+            return None
+
         warm_entries = self.manager.filter(kind="construct", state="warm")
         if not warm_entries:
             return None
@@ -520,6 +582,12 @@ class SessionPool:
                 # the warming subprocess fast and minimal.
                 tools=[],
                 cwd=self.cwd,
+                # Caliber Phase 2 (2026-05-04): warm with the pool's
+                # configured caliber so resumed spawns can match
+                # cleanly. None warm_caliber falls through to
+                # Construct's default (no --model/--effort args =
+                # Claude Code's runtime default).
+                caliber=self.warm_caliber,
             )
             await c.spawn()
             # Drain events to keep stdout flowing; the subprocess will

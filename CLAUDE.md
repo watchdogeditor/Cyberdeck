@@ -574,10 +574,76 @@ Real-deck verified 2026-05-04:
 
 ~370 LOC across new caliber.py + threading edits in 5 modules.
 
+**✅ CALIBER PHASE 2 SHIPPED 2026-05-04** (uncommitted as of this
+CLAUDE.md update). Pool caliber + warm-pool reuse gating +
+fast_mode emission via per-spawn settings.json overlay.
+
+`SessionPool.warm_caliber` field:
+- Defaults to `Caliber.default()` (sonnet+high) — matches the deck's
+  default_caliber so most spawns hit pool reuse
+- Threaded into `_warm_one`'s Construct() call so warming subprocesses
+  spawn at the right caliber from day one
+- Configurable via constructor kwarg; the App passes
+  `self.default_caliber` so any future Limits-modal-driven change
+  propagates naturally
+
+`SessionPool.pull(requested_caliber=...)`:
+- Match-or-skip gate: requested caliber matches pool's
+  warm_caliber → reuse warm entry; mismatch → returns None,
+  caller falls through to fresh spawn
+- Same shape as the existing default-profile-only gating
+- Emits `pool.caliber_mismatch` bus events for observability so
+  the netrunner sees when pool reuse is falling through to fresh
+  (and can eyeball whether the pool's warm_caliber matches what
+  daemon's actually picking)
+- None caliber requests bypass the gate (back-compat for headless
+  tests + standalone fleet.py runs without the App)
+- Empirical real-deck observation 2026-05-04 (Phase 1 verification
+  log): Claude Code 2.1.126 honors `--model` change on `--resume`,
+  so the pool gate is conservative — we *could* let mismatches
+  reuse and rely on per-turn model change. Sticking with the
+  design's "pool warms one caliber" principle for now; revisit
+  if real-deck shows the gating is too restrictive.
+
+`brake_state.make_spawn_settings(fast_mode=...)`:
+- New optional kwarg. When True, writes a per-spawn override file
+  at `<home>/.cyberdeck/spawns/<cid>.fastmode.json` instead of the
+  cache-stable shared `spawn_settings.json`
+- The shared file's cache-stability (the 2026-05-02 cost fix) is
+  preserved for the common case (fast_mode=False — most spawns)
+- fast_mode=True spawns pay a `--settings` cache miss; acceptable
+  trade because the netrunner has already opted into 10x cost
+  for 2.5x speed
+- YOLO + fast_mode now produces a settings file (just `fastMode:
+  true`, no hook block) — previously YOLO with no delay returned
+  None, but fast mode requires settings.json to take effect
+- cleanup_spawn_settings already handles arbitrary non-shared
+  paths via the existing legacy-cleanup branch — fastMode override
+  files get cleaned up automatically on construct finalize
+
+`Fleet.spawn`:
+- `pool.pull(requested_caliber=caliber)` — gates on caliber match
+- `make_spawn_settings(..., fast_mode=caliber.fast_mode)` —
+  emits the override file when needed
+
+App:
+- `SessionPool(..., warm_caliber=self.default_caliber)` —
+  pool's warm caliber matches the deck's default
+
+Real-deck verified 2026-05-04:
+- `make_spawn_settings` test matrix: shared path for fast_mode=
+  False (caliber-stable), per-spawn override path for True;
+  YOLO+fast still produces a settings file with `fastMode: true`
+  and no hook block.
+- Pool caliber-match gate: matching caliber → returns warm entry,
+  mismatched → returns None, None caliber → bypass gate.
+- Full deck startup: zero errors; existing event flow unchanged.
+
+~120 LOC across 4 modules (caliber.py untouched; threading +
+pool gating + settings extension).
+
 **Next session picks up at: open netrunner choice.** Several
 queued items, no single forced direction:
-  - Caliber Phase 2 (pool caliber + warm-pool reuse + settings
-    JSON fastMode) — natural continuation; ~150 LOC.
   - Caliber Phase 3 (daemon-process caliber + override via
     `T` chat directives) — ~150 LOC.
   - First-run onboarding + preferences module (build-plan

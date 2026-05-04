@@ -852,7 +852,15 @@ class Fleet:
         if (resume_id is None
                 and self.session_pool is not None
                 and pool_eligible):
-            warm_entry = await self.session_pool.pull()
+            # Caliber Phase 2 (2026-05-04): pool gates on caliber
+            # match — pool warms one caliber and a request asking
+            # for a different one falls through to a fresh spawn.
+            # Same shape as the profile gate above. Mismatches
+            # surface as `pool.caliber_mismatch` bus events for
+            # observability.
+            warm_entry = await self.session_pool.pull(
+                requested_caliber=caliber,
+            )
             if warm_entry is not None:
                 resume_id = warm_entry.session_id
 
@@ -895,6 +903,20 @@ class Fleet:
         if (self.brake_state_provider is not None
                 and self.home_dir is not None):
             try:
+                # Caliber Phase 2 (2026-05-04): fast_mode emission.
+                # Fast mode is settable only via settings.json
+                # ("fastMode": true) — there's no CLI flag. When the
+                # caliber for this spawn has fast_mode=True,
+                # make_spawn_settings writes a per-spawn override
+                # file (cid.fastmode.json) instead of using the
+                # cache-stable shared file, isolating the cache
+                # impact to the rare opt-in fast_mode spawns. Most
+                # spawns (caliber.fast_mode=False) keep cache
+                # warmth via the shared spawn_settings.json.
+                spawn_fast_mode = (
+                    bool(caliber.fast_mode) if caliber is not None
+                    else False
+                )
                 settings_path = make_spawn_settings(
                     brake=self.brake_state_provider(),
                     home_dir=self.home_dir,
@@ -906,6 +928,7 @@ class Fleet:
                     # Existing in-flight spawns keep whatever delay
                     # was baked into their per-spawn settings JSON.
                     delay_window_seconds=self.delay_window_seconds,
+                    fast_mode=spawn_fast_mode,
                 )
                 if settings_path is not None:
                     c.settings_path = str(settings_path)

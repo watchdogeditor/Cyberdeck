@@ -4620,6 +4620,13 @@ class CyberdeckApp(App):
                 claude_bin=self.claude_bin,
                 on_event=self._handle_pool_event,
                 cwd=str(self.home_dir),
+                # Caliber Phase 2 (2026-05-04): pool warms at the
+                # deck's default caliber. Spawns that match reuse
+                # warm sessions; mismatches (daemon picked haiku+low
+                # for cheap recon, opus+xhigh for synthesis) fall
+                # through to fresh. Same shape as the existing
+                # default-profile-only gating.
+                warm_caliber=self.default_caliber,
             )
 
         self.fleet = Fleet(

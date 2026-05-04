@@ -353,12 +353,14 @@ def make_spawn_settings(
     home_dir: Path,
     construct_id: str,
     delay_window_seconds: float = 0.0,
+    fast_mode: bool = False,
 ) -> Optional[Path]:
     """Generate (or reuse) a `claude --settings` JSON file for a spawn.
 
     Returns the path to the file, or None if no settings are needed
-    (YOLO brake AND no delay window — the deck installs no hook,
-    claude runs unrestricted save for --permission-mode).
+    (YOLO brake AND no delay window AND no fast_mode — the deck
+    installs no hook, claude runs unrestricted save for
+    --permission-mode).
 
     `construct_id` is accepted for backwards-compatibility with the
     callsite signature but is NO LONGER used in the file path or in
@@ -390,12 +392,18 @@ def make_spawn_settings(
     The hook installs even under YOLO when delay > 0 — that's the
     "pause-before-allowing" lane in the delay matrix.
     """
-    # Hook installs unless: (YOLO brake AND no delay window). With
-    # delay > 0 under YOLO, we still need the hook running so the
-    # delay window mechanism can observe + pause + watch for X-press
-    # overrides. The hook itself short-circuits to allow under YOLO
-    # when no delay is set.
-    if brake == BrakeState.YOLO and delay_window_seconds <= 0:
+    # Hook installs unless: (YOLO brake AND no delay window AND no
+    # fast_mode). With delay > 0 under YOLO, we still need the hook
+    # for the pause-before-allowing lane. With fast_mode=True, we
+    # need a settings file even under YOLO to set "fastMode": true —
+    # there's no CLI flag for fast mode, settings.json is the only
+    # input surface. The hook itself short-circuits to allow under
+    # YOLO when no delay is set.
+    if (
+        brake == BrakeState.YOLO
+        and delay_window_seconds <= 0
+        and not fast_mode
+    ):
         return None
 
     hook_path = Path(__file__).resolve().parent / "brake_hook.py"
@@ -411,8 +419,12 @@ def make_spawn_settings(
     # window): `python <hook> <brake> <delay_seconds>`. Construct_id
     # is NOT in this command — see docstring + brake_hook.py for the
     # session_id → cid runtime resolution path.
-    settings = {
-        "hooks": {
+    settings: dict = {}
+    # Hook block only when brake is non-YOLO or delay > 0; fast_mode
+    # alone doesn't need the hook (it's just a behavioral flag).
+    install_hook = brake != BrakeState.YOLO or delay_window_seconds > 0
+    if install_hook:
+        settings["hooks"] = {
             "PreToolUse": [
                 {
                     "matcher": "*",
@@ -427,8 +439,14 @@ def make_spawn_settings(
                     ],
                 },
             ],
-        },
-    }
+        }
+
+    # Caliber Phase 2 (2026-05-04): fast_mode emission. Anthropic's
+    # surface for fast mode is `"fastMode": true` in settings.json
+    # OR the `/fast on|off` slash command — no CLI flag. So when
+    # fast_mode=True, we set it here.
+    if fast_mode:
+        settings["fastMode"] = True
 
     cyberdeck_dir = Path(home_dir) / ".cyberdeck"
     try:
@@ -441,12 +459,48 @@ def make_spawn_settings(
         )
         return None
 
-    # Stable path — same for every spawn under the same (brake,
-    # delay) config. Content is idempotent for the same config; if
-    # brake or delay flip, the next spawn rewrites the same file
-    # with the new content. Multiple concurrent spawns writing the
-    # same content are safe (last-writer-wins; content is identical).
-    settings_path = cyberdeck_dir / "spawn_settings.json"
+    # Path selection: cache-stable shared path for the common case;
+    # per-spawn override file when fast_mode=True.
+    #
+    # The shared `spawn_settings.json` is what the cache-cost fix
+    # (2026-05-02) stabilized — same path AND same content across
+    # spawns under a given (brake, delay) config means Anthropic's
+    # prompt cache hits cleanly. Adding a fastMode flag flips the
+    # content, so a fast_mode=True spawn that wrote to the shared
+    # file would invalidate cache for every subsequent fast_mode=
+    # False spawn. To avoid that contamination, fast_mode spawns
+    # write to a per-spawn override file (`<cid>.fastmode.json`)
+    # that's NOT shared.
+    #
+    # Cache trade-off: fast_mode spawns pay a cache miss on
+    # `--settings`. Acceptable: fast mode is the rare deliberate-
+    # cost-for-speed lane; the netrunner already opted into 10x
+    # cost for 2.5x speed, an additional ~30k token cache miss is
+    # rounding error. Most spawns (fast_mode=False) keep the cache
+    # warmth.
+    if fast_mode:
+        spawns_dir = cyberdeck_dir / "spawns"
+        try:
+            spawns_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"brake_state: could not create {spawns_dir}: {exc!r} — "
+                f"falling back to shared settings (fastMode lost)",
+                file=sys.stderr,
+            )
+            settings_path = cyberdeck_dir / "spawn_settings.json"
+        else:
+            settings_path = (
+                spawns_dir / f"{construct_id}.fastmode.json"
+            )
+    else:
+        # Stable path — same for every spawn under the same (brake,
+        # delay) config. Content is idempotent for the same config;
+        # if brake or delay flip, the next spawn rewrites the same
+        # file with the new content. Multiple concurrent spawns
+        # writing the same content are safe (last-writer-wins;
+        # content is identical).
+        settings_path = cyberdeck_dir / "spawn_settings.json"
     try:
         settings_path.write_text(
             json.dumps(settings, indent=2), encoding="utf-8",

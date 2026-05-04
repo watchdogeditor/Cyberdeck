@@ -579,9 +579,58 @@ construct command builder picks up caliber args correctly,
 deck startup zero errors. ~370 LOC across caliber.py + 5
 modules edited.
 
+**✅ CALIBER PHASE 2 SHIPPED 2026-05-04** (uncommitted as of this
+state.md update). Pool caliber + warm-pool reuse gating +
+fast_mode emission via per-spawn settings.json overlay.
+
+`SessionPool` grew a `warm_caliber: Caliber` field defaulting to
+`Caliber.default()` (sonnet+high). `_warm_one` warms with that
+caliber so warm sessions are spawned at the right grade.
+`pull(requested_caliber=)` gates on match: matching caliber reuses
+warm; mismatch returns None and the caller spawns fresh. Same
+shape as the existing default-profile-only gating. Mismatches
+emit `pool.caliber_mismatch` bus events for observability.
+
+Empirical observation from Phase 1's real-deck verification log
+(2026-05-04): Claude Code 2.1.126 honors `--model` change on
+`--resume`, so the pool gate is conservative — we *could* skip
+the gate and rely on per-turn model change to do the work. The
+design's principle is "pool warms one caliber"; sticking with
+that for now. Revisit if real-deck shows over-conservative
+fall-throughs to fresh.
+
+`brake_state.make_spawn_settings` grew optional `fast_mode: bool`.
+When True, writes a per-spawn override file at
+`<home>/.cyberdeck/spawns/<cid>.fastmode.json` instead of the
+cache-stable shared `spawn_settings.json`. The shared file's
+cache-stability (the 2026-05-02 cost fix) is preserved for
+fast_mode=False — the common case. fast_mode=True spawns pay a
+`--settings` cache miss; acceptable since fast mode itself is
+the deliberate-cost-for-speed lane (10x cost for 2.5x speed),
+and adding ~30k tokens of cache miss is rounding error against
+that. YOLO + fast_mode now produces a settings file (just
+`fastMode: true`, no hook block).
+
+`Fleet.spawn` threads the bits through:
+  - `pool.pull(requested_caliber=caliber)`
+  - `make_spawn_settings(..., fast_mode=caliber.fast_mode)`
+
+`App` constructs `SessionPool(..., warm_caliber=self.default_caliber)`.
+
+Real-deck verified 2026-05-04:
+  - make_spawn_settings test matrix: shared path for fast_mode
+    =False (caliber-stable), per-spawn override path for True;
+    YOLO+fast still produces a settings file with fastMode: true
+    and no hook block. cleanup_spawn_settings handles override
+    files via the existing non-shared-path branch.
+  - Pool caliber-match gate: matching → returns warm entry,
+    mismatched → returns None, None → bypass gate.
+  - Full deck startup: zero errors, existing event flow
+    unchanged.
+
+~120 LOC across 4 modules.
+
 **Next session picks up at: open netrunner choice.**
-  - Caliber Phase 2 (pool + warm-pool reuse + settings JSON
-    fastMode) — natural continuation
   - Caliber Phase 3 (daemon-process caliber + T-chat directive
     override)
   - First-run onboarding + preferences module (build-plan
