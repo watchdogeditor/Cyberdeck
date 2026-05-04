@@ -336,12 +336,15 @@ def caliber_from_dict(raw: Optional[dict]) -> Optional[Caliber]:
     Field aliases for the daemon's convenience:
       model     | model_alias
       effort    | effort_level
-      fast_mode | fast | fastMode
 
-    Deliberately tolerant: Claude itself may emit settings-style
-    field names (`fastMode`) when paraphrasing the docs, and the
-    deck-side parser swallowing those gracefully is cheaper than
-    debugging "why did my spawn ignore fast_mode."
+    `fast_mode` is INTENTIONALLY NOT PARSED here. Per the netrunner's
+    2026-05-04 reframing, fast_mode is a deck-wide cost governor —
+    it's a 6x-cost-for-2.5x-speed budget switch, not a routing
+    decision. The daemon picks model + effort based on task; the
+    netrunner toggles fast_mode at the deck level. If the daemon
+    emits fast_mode in its spawn JSON, we ignore it silently — the
+    deck applies fast_mode from its own state at spawn time, gated
+    on Opus 4.6 model eligibility.
     """
     if not raw:
         return None
@@ -354,35 +357,25 @@ def caliber_from_dict(raw: Optional[dict]) -> Optional[Caliber]:
 
     model = raw.get("model") or raw.get("model_alias")
     effort = raw.get("effort") or raw.get("effort_level")
-    fast_mode = raw.get("fast_mode")
-    if fast_mode is None:
-        fast_mode = raw.get("fast")
-    if fast_mode is None:
-        fast_mode = raw.get("fastMode")
 
-    # If literally none of the three were specified, return None —
+    # If neither model nor effort was specified, return None —
     # caller knows to use deck default. Distinguishes "daemon
     # explicitly said model=haiku" from "daemon said nothing about
-    # caliber for this spawn."
-    if model is None and effort is None and fast_mode is None:
+    # caliber for this spawn." fast_mode never participates in
+    # this distinction (it's deck-side, not daemon-side).
+    if model is None and effort is None:
         return None
 
-    # Fall through to defaults for unspecified fields.
+    # Fall through to defaults for unspecified fields. fast_mode
+    # always starts False here — the deck-side governor overlays
+    # the actual value at fleet-spawn time.
     if model is None:
         model = DEFAULT_MODEL
     if effort is None:
         effort = DEFAULT_EFFORT
-    if fast_mode is None:
-        fast_mode = DEFAULT_FAST_MODE
-
-    # Type coercion — accept "true"/"false" strings for fast_mode
-    # because the daemon occasionally emits bool-as-string.
-    if isinstance(fast_mode, str):
-        fast_mode = fast_mode.lower() in ("true", "1", "yes", "on")
-    fast_mode = bool(fast_mode)
 
     return Caliber(
         model=str(model),
         effort=str(effort),
-        fast_mode=fast_mode,
+        fast_mode=False,
     )

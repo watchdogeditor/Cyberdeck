@@ -192,6 +192,7 @@ class Fleet:
         bus: Optional["EventBus"] = None,
         wedge_timeout_seconds: float = 30.0,
         delay_window_seconds: float = 0.0,
+        fast_mode_provider: Optional[Callable[[], bool]] = None,
     ):
         self.run_id = f"run-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -246,6 +247,18 @@ class Fleet:
         # spawns get blocked. None means no gating (e.g., fleet.py
         # console runs without a TUI to host the monitor).
         self.connection_state_provider = connection_state_provider
+
+        # Caliber Phase 2 (2026-05-04): fast_mode is a deck-wide cost
+        # governor — netrunner-controlled, not daemon-pickable. The
+        # provider returns the current deck-global state at each
+        # spawn (closes over App.fast_mode, mutable from Limits modal
+        # / future toggle). When the provider returns True AND the
+        # spawn's caliber resolves to an Opus-4.6-compatible model,
+        # the per-spawn settings.json gets `fastMode: true`. When the
+        # provider returns False or the model is incompatible, no
+        # fast mode applied. None provider = always-off (back-compat
+        # for headless tests + fleet.py standalone).
+        self.fast_mode_provider = fast_mode_provider
 
         # Bus is the only fan-out path. Phase 8 of the unified-event-
         # stream slice retired the legacy `on_event=` kwarg + `_listeners`
@@ -868,6 +881,52 @@ class Fleet:
         # filename), then generate the per-spawn brake settings file
         # and attach. Doing it in this order keeps the construct id
         # canonical (Construct mints one in __init__ if not given).
+        # Caliber Phase 2 (2026-05-04): apply deck-global fast_mode
+        # policy. The caliber kwarg carries what the daemon picked
+        # (model + effort, plus fast_mode=False since daemon can't
+        # request fast). Here we overlay the deck's cost-governor
+        # state, gated on Opus-4.6 model eligibility, to produce the
+        # "effective" caliber actually used for the spawn. This is
+        # what gets stored on the Construct, threaded into the
+        # spawned meta event, and displayed in chatlog markers.
+        # Eligibility check: if governor is on but model is
+        # incompatible, fire a `caliber.fast_skipped` bus event so
+        # the netrunner sees fast was wanted but ineligible.
+        effective_caliber = caliber
+        if self.fast_mode_provider is not None and caliber is not None:
+            try:
+                deck_wants_fast = bool(self.fast_mode_provider())
+            except Exception:
+                deck_wants_fast = False
+            if deck_wants_fast:
+                try:
+                    from caliber import (
+                        Caliber as _Caliber,
+                        _is_fast_mode_compatible,
+                    )
+                    if _is_fast_mode_compatible(caliber.model):
+                        effective_caliber = _Caliber(
+                            model=caliber.model,
+                            effort=caliber.effort,
+                            fast_mode=True,
+                        )
+                    elif self.bus is not None:
+                        try:
+                            from event_bus import DeckEvent
+                            self.bus.publish(DeckEvent(
+                                kind="caliber.fast_skipped",
+                                source="fleet",
+                                severity="info",
+                                payload={
+                                    "reason": "model not Opus 4.6",
+                                    "model": caliber.model,
+                                },
+                            ))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
         # Compose deck addendum + per-spawn addendum (the latter is
         # the TUI-rendered tools list with descriptions + per-spawn
         # plugins selection from P4 of the retool). Both are pre-
@@ -892,7 +951,7 @@ class Fleet:
             cwd=self.cwd,
             profile=profile,
             deck_addendum=composed_deck_addendum,
-            caliber=caliber,
+            caliber=effective_caliber,
         )
 
         # Generate the brake-hook --settings file for this spawn, if
@@ -903,18 +962,15 @@ class Fleet:
         if (self.brake_state_provider is not None
                 and self.home_dir is not None):
             try:
-                # Caliber Phase 2 (2026-05-04): fast_mode emission.
-                # Fast mode is settable only via settings.json
-                # ("fastMode": true) — there's no CLI flag. When the
-                # caliber for this spawn has fast_mode=True,
-                # make_spawn_settings writes a per-spawn override
-                # file (cid.fastmode.json) instead of using the
-                # cache-stable shared file, isolating the cache
-                # impact to the rare opt-in fast_mode spawns. Most
-                # spawns (caliber.fast_mode=False) keep cache
-                # warmth via the shared spawn_settings.json.
+                # Caliber Phase 2 (2026-05-04): fast_mode emission
+                # reads off effective_caliber.fast_mode, which was
+                # set above by overlaying the deck-global cost
+                # governor onto the daemon's pick (gated on Opus
+                # 4.6 model eligibility). True → per-spawn override
+                # file; False → shared cache-stable settings.json.
                 spawn_fast_mode = (
-                    bool(caliber.fast_mode) if caliber is not None
+                    bool(effective_caliber.fast_mode)
+                    if effective_caliber is not None
                     else False
                 )
                 settings_path = make_spawn_settings(
@@ -1016,7 +1072,17 @@ class Fleet:
                 # raw fields would bloat the payload across thousands
                 # of spawn events. None when no caliber was passed
                 # (Claude Code's runtime default applies).
-                "caliber": caliber.display() if caliber is not None else None,
+                #
+                # Phase 2: report the EFFECTIVE caliber (with deck-
+                # global fast_mode overlaid + eligibility-gated), not
+                # the raw daemon pick. So a daemon picking opus[4.6]
+                # while the netrunner's cost governor is on shows
+                # "opus[4.6]·high·fast" in the log; same daemon pick
+                # with governor off shows "opus[4.6]·high".
+                "caliber": (
+                    effective_caliber.display()
+                    if effective_caliber is not None else None
+                ),
             },
         ))
         consumer = asyncio.create_task(self._consume(c))

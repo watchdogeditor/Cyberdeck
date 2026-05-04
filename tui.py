@@ -3297,6 +3297,8 @@ class CyberdeckApp(App):
         home_dir: Optional[Path] = None,
         profiles_dir: Optional[Path] = None,
         default_profile_name: Optional[str] = None,
+        fast_mode: Optional[bool] = None,
+        fast_mode_explicit: bool = False,
     ) -> None:
         super().__init__()
         self.tasks = tasks
@@ -3385,6 +3387,17 @@ class CyberdeckApp(App):
             # Constructs spawn without --model/--effort and Claude
             # Code applies its own runtime default.
             self.default_caliber = None
+        # Caliber Phase 2 (2026-05-04): fast_mode is a deck-wide cost
+        # governor — netrunner-controlled, defaults OFF. The daemon
+        # never picks fast_mode autonomously; it's a 6x-cost-for-2.5x-
+        # speed trade the netrunner opts into deliberately. Initial
+        # value comes from CLI flag (if explicitly passed); otherwise
+        # the persisted state.json value loaded later (in on_mount,
+        # via load_limits) overrides this default. Explicit-CLI wins
+        # over persisted to make `--fast-mode` / `--no-fast-mode`
+        # one-shot overrides usable.
+        self.fast_mode: bool = bool(fast_mode) if fast_mode is not None else False
+        self._fast_mode_explicit = fast_mode_explicit
         # Phase 7 of the unified-event-stream slice: per-launch log
         # files in `<deck source>/logs/` (operational artifacts, not
         # deck-content). Defaults to a `logs/` directory next to the
@@ -3650,6 +3663,25 @@ class CyberdeckApp(App):
             wt = persisted.get("wedge_timeout_seconds")
             if isinstance(wt, (int, float)) and wt >= 0:
                 self.wedge_timeout_seconds = float(wt)
+            # Caliber Phase 2 (2026-05-04): fast_mode is a deck-wide
+            # cost governor — netrunner-controlled, defaults OFF. The
+            # daemon does NOT pick fast_mode autonomously; it's a
+            # budget switch, not a routing decision. When on, eligible
+            # spawns (Opus 4.6) get the speed boost; everything else
+            # silently spawns at standard. Explicit CLI flag wins over
+            # persisted value so the netrunner can override per-launch
+            # without affecting the persisted default.
+            fm = persisted.get("fast_mode")
+            if isinstance(fm, bool) and not self._fast_mode_explicit:
+                self.fast_mode = fm
+            # If the netrunner DID pass --fast-mode / --no-fast-mode
+            # explicitly, persist their choice now so the next launch
+            # without the flag picks it up.
+            if self._fast_mode_explicit:
+                save_limits(
+                    self.home_dir / ".cyberdeck" / "state.json",
+                    fast_mode=self.fast_mode,
+                )
         except Exception:
             # load_limits is already best-effort, but wrap one more
             # layer here so a malformed entry can't break startup.
@@ -4672,6 +4704,14 @@ class CyberdeckApp(App):
             # modal updates fleet.delay_window_seconds; new spawns
             # pick up the new value, in-flight spawns keep theirs.
             delay_window_seconds=self.delay_window_seconds,
+            # Caliber Phase 2 (2026-05-04): deck-global fast_mode
+            # cost governor. Read fresh per spawn (lambda closes
+            # over self, so a runtime toggle takes effect on the
+            # next spawn). Fleet gates on Opus 4.6 eligibility:
+            # incompatible spawns silently skip fast and log a
+            # `caliber.fast_skipped` event so the netrunner sees
+            # when fast was wanted but ineligible.
+            fast_mode_provider=lambda: self.fast_mode,
         )
         # Phase 8: subscribe via the bus instead of fleet.add_listener.
         # `fleet.*` matches every dotted-namespace fleet kind
@@ -9940,6 +9980,20 @@ if __name__ == "__main__":
              "path if streaming misbehaves on a particular claude version.",
     )
     parser.add_argument(
+        "--fast-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Cost governor for fast mode (default: OFF, persists across "
+             "restarts). Fast mode runs Opus 4.6 at up to 2.5x output speed "
+             "for 6x cost; netrunner-only switch — daemon never picks fast "
+             "autonomously. When ON, spawns whose model resolves to Opus "
+             "4.6 use fast inference; other models silently run standard. "
+             "Beta / requires Anthropic waitlist access. Default value is "
+             "loaded from state.json's limits namespace; this flag overrides "
+             "for the current session only (passing --fast-mode also "
+             "persists the new value to state.json).",
+    )
+    parser.add_argument(
         "--no-pool",
         action="store_true",
         help="Disable the session pool. Without the pool, every construct "
@@ -9984,6 +10038,8 @@ if __name__ == "__main__":
         streaming_mode=args.streaming,
         use_pool=not args.no_pool,
         pool_size=args.pool_size,
+        fast_mode=args.fast_mode,
+        fast_mode_explicit=(args.fast_mode is not None),
         home_dir=home_dir,
         profiles_dir=(
             Path(args.profiles_dir).expanduser()
