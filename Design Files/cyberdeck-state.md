@@ -534,15 +534,66 @@ profiles → home/profiles/), one invocation surface per kind
 path, profiles through daemon system prompt), one UI surface
 per concept (Profiles tab + unified Tools tab).
 
-**Next session picks up at: open netrunner choice.** Several
-queued items, no single forced direction:
-  - Caliber selection (cyberdeck-model-effort-design.md)
-  - First-run onboarding check + preferences module (build-plan
+**✅ CALIBER PHASE 1 SHIPPED 2026-05-04** (uncommitted as of this
+state.md update). Per-spawn model + effort + fast-mode bundle
+threaded through the deck's spawn pipeline.
+
+New `caliber.py` module (~250 LOC): `Caliber` frozen dataclass
+(model + effort + fast_mode), `KNOWN_MODELS` / `KNOWN_EFFORTS`
+soft-validation sets, `to_claude_args()` for the CLI flag pair,
+`caliber_from_dict()` for parsing daemon spawn-action JSON
+(tolerant: accepts model_alias, effort_level, fast / fastMode
+field aliases), `merge()` for the override hierarchy, `display()`
+for chatlog/pane rendering ("sonnet·high", "opus·xhigh·fast").
+
+Plumbing threads `caliber: Optional[Caliber]` through:
+  - `Construct.__init__` — appends `caliber.to_claude_args()` to
+    the claude command line when set
+  - `Fleet.spawn` — passes to Construct + emits caliber.display()
+    in the `spawned` meta event payload
+  - `DaemonSession.__init__` — `default_caliber` kwarg + parsing
+    of the daemon's optional model/effort/fast_mode fields via
+    caliber_from_dict
+  - `App.__init__` — `self.default_caliber = Caliber.default()`,
+    threaded to DaemonSession + the three netrunner-direct
+    fleet.spawn call sites
+
+DAEMON_SYSTEM_PROMPT grows CALIBER SELECTION section with the
+four spawn-action fields (model, effort, fast_mode) and
+task→caliber suggested mappings (single-file recon → haiku+low;
+synthesis → opus+high; netrunner-blocked → fast_mode=true on opus).
+Cost asymmetry note included: Haiku ~30x cheaper per token than
+Opus.
+
+Phase 1 explicit non-goals (deferred):
+  - Pool caliber + warm-pool reuse (Phase 2)
+  - Daemon-process caliber (Phase 3)
+  - Quota-aware fallback (Phase 4, blocked on build-plan
+    item 13)
+  - UI surfaces — pane caliber suffix, sidebar line (Phase 5)
+  - fast_mode CLI emission — to_claude_args skips it; settings
+    JSON path lands in Phase 2
+
+Real-deck verified 2026-05-04: caliber unit tests all pass,
+construct command builder picks up caliber args correctly,
+deck startup zero errors. ~370 LOC across caliber.py + 5
+modules edited.
+
+**Next session picks up at: open netrunner choice.**
+  - Caliber Phase 2 (pool + warm-pool reuse + settings JSON
+    fastMode) — natural continuation
+  - Caliber Phase 3 (daemon-process caliber + T-chat directive
+    override)
+  - First-run onboarding + preferences module (build-plan
     items 0a + 0b)
   - README restructure for public repo (build-plan item 0)
+  - Tools-UI Thought of Dave (build-plan item 0c) — space-launch
+    + z-info + H-haiku-research
   - Mechanic v0→v1 bridge (liveness heartbeat)
-  - Remaining discrete bugs (kill doesn't interrupt in-flight
-    turns; silent wedge investigation cx-796e0468)
+  - Remaining discrete bugs (kill doesn't interrupt in-flight;
+    silent wedge cx-796e0468)
+
+Architecture review scheduled 2026-06-01 09:00 EDT.
 
 Two discrete bugs from earlier remain deferred (not fixable
 today):

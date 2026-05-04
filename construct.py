@@ -29,6 +29,11 @@ if TYPE_CHECKING:
     # reads .name, .recommended_tools, and .default_construct_addendum
     # off whatever Profile-shaped object it's handed.
     from profiles import Profile
+    # Caliber is the model + effort + fast-mode bundle (Phase 1 of
+    # the caliber slice, 2026-05-04). Same TYPE_CHECKING-only pattern
+    # — the construct just calls `.to_claude_args()` on whatever
+    # caliber-shaped object Fleet hands it.
+    from caliber import Caliber
 
 
 class ConstructState(Enum):
@@ -274,6 +279,7 @@ class Construct:
         profile: Optional["Profile"] = None,
         deck_addendum: Optional[str] = None,
         settings_path: Optional[str] = None,
+        caliber: Optional["Caliber"] = None,
     ):
         self.id = construct_id or f"cx-{uuid.uuid4().hex[:8]}"
         self.task = task
@@ -342,6 +348,16 @@ class Construct:
         # Stored on the instance so Fleet can clean it up after the
         # construct finalizes.
         self.settings_path = settings_path
+
+        # Caliber: model + effort + fast-mode bundle for this spawn.
+        # Phase 1 of the caliber slice (2026-05-04). When set, the
+        # command builder appends `--model <m> --effort <e>` per
+        # `Caliber.to_claude_args()`. None means "use the deck's
+        # default caliber" — the caller (Fleet) typically supplies
+        # one explicitly even for default spawns so the command line
+        # is predictable across versions. fast_mode is tracked but
+        # not yet emitted via CLI (Phase 2 wires settings.json).
+        self.caliber = caliber
 
         self.state = ConstructState.STARTING
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -464,6 +480,17 @@ class Construct:
             # tool call. YOLO brake skips this entirely (settings_path
             # stays None and no --settings is passed).
             cmd += ["--settings", str(self.settings_path)]
+        # Caliber: append `--model <m> --effort <e>` so Claude Code
+        # spawns this construct at the daemon-picked grade. Phase 1
+        # of the caliber slice (2026-05-04). fast_mode is part of
+        # the dataclass but not yet emitted on the CLI — Phase 2
+        # adds it via the per-spawn settings JSON (fastMode field).
+        # When self.caliber is None the deck falls through to Claude
+        # Code's runtime default (sonnet+high as of this writing) —
+        # callers are expected to pass an explicit caliber so the
+        # command line is predictable, but None won't crash.
+        if self.caliber is not None:
+            cmd += self.caliber.to_claude_args()
         cmd += self.extra_args
         return cmd
 

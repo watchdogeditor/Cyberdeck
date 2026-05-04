@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from profiles import Profile
     from watchdog import Blacklist, BlacklistEntry
     from event_bus import EventBus
+    from caliber import Caliber
 
 from daemon import Daemon, DaemonEvent
 from fleet import Fleet, FleetEvent
@@ -55,6 +56,7 @@ class DaemonSession:
         per_spawn_addendum_renderer: Optional[
             Callable[[Optional["Profile"], Optional[list[str]]], str]
         ] = None,
+        default_caliber: Optional["Caliber"] = None,
     ) -> None:
         self.daemon = daemon
         self.fleet = fleet
@@ -127,6 +129,24 @@ class DaemonSession:
         # (no TUI, no registries to resolve against) — fleet then
         # uses its static deck_addendum only.
         self.per_spawn_addendum_renderer = per_spawn_addendum_renderer
+
+        # Caliber Phase 1 (2026-05-04): the deck's default caliber
+        # for spawns where the daemon didn't specify model/effort/
+        # fast_mode. None means "let Claude Code's runtime default
+        # apply" (sonnet+high as of this writing). Real installs
+        # should pass an explicit Caliber so command lines stay
+        # predictable across Claude Code versions; the TUI
+        # constructs Caliber.default() and passes it here.
+        if default_caliber is None:
+            try:
+                from caliber import Caliber as _Caliber
+                default_caliber = _Caliber.default()
+            except Exception:
+                # caliber.py missing or broken — degrade gracefully.
+                # The construct will spawn without --model/--effort
+                # and Claude Code applies its own default.
+                default_caliber = None
+        self.default_caliber = default_caliber
 
         # Track task-per-construct so we can report useful outcomes
         # (the finalized event doesn't carry the original task text).
@@ -519,6 +539,23 @@ class DaemonSession:
                     if isinstance(p, str)
                 ]
 
+            # Caliber Phase 1 (2026-05-04): parse the daemon's
+            # per-spawn caliber pick. The daemon's spawn action JSON
+            # carries optional `model` / `effort` / `fast_mode` fields
+            # at the top level; caliber_from_dict() reads them and
+            # returns None if none specified. When None, the deck's
+            # default caliber applies (set on this DaemonSession at
+            # construction). This is where the daemon's task→caliber
+            # decision actually plumbs into the spawn pipeline.
+            from caliber import caliber_from_dict
+            spawn_caliber = caliber_from_dict(action)
+            if spawn_caliber is None:
+                # Fall through to the session's configured default
+                # so every spawn carries an explicit caliber on the
+                # CLI — predictable command lines beat "rely on
+                # Claude Code's default which may evolve."
+                spawn_caliber = self.default_caliber
+
             # Render per-spawn addendum (profile-tools-with-descriptions
             # + plugins-with-descriptions) via the TUI-supplied
             # callback. None when running headless — fleet falls back
@@ -554,6 +591,7 @@ class DaemonSession:
                 origin="daemon",
                 plugins=spawn_plugins,
                 per_spawn_addendum=per_spawn_addendum,
+                caliber=spawn_caliber,
             )
         # Future action types: kill, wire, inject, etc.
 

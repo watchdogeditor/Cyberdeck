@@ -497,17 +497,102 @@ panels render (tested via the existing 1-unavailable-tool +
   - P5: 4-tab UI (Chatlog/Files/Profiles/Tools) + unified Tools
         ListView with kind glyphs
 
+**✅ CALIBER PHASE 1 SHIPPED 2026-05-04** (uncommitted as of this
+CLAUDE.md update). Per-spawn model + effort + fast-mode bundle
+threaded through Construct → Fleet.spawn → daemon_session.
+
+New `caliber.py` module (~250 LOC) with:
+- `Caliber` frozen dataclass (model + effort + fast_mode)
+- KNOWN_MODELS + KNOWN_EFFORTS soft-validation sets (warn on
+  unknown values; pass through to Claude Code anyway — Anthropic
+  occasionally adds new models, the deck shouldn't gate)
+- `to_claude_args()` → `["--model", "<m>", "--effort", "<e>"]`
+- `caliber_from_dict()` parses the daemon's spawn-action JSON
+  with field aliases (model_alias, effort_level, fast / fastMode)
+- `merge()` for the override hierarchy (deck default ← daemon
+  pick ← netrunner override; future-friendly even though
+  today's three-field merge is total)
+- `display()` → "sonnet·high" / "opus·xhigh·fast" for chatlog +
+  pane headers + log payloads
+
+Plumbing:
+- `Construct.__init__` grows `caliber: Optional[Caliber]`. The
+  command builder appends caliber.to_claude_args() to the
+  claude command line when set; None falls through to Claude
+  Code's runtime default.
+- `Fleet.spawn` grows `caliber` kwarg; threads to Construct +
+  emits the display string into the `spawned` meta event payload
+  so observers can attribute per-spawn caliber from the bus.
+- `DaemonSession` grows `default_caliber` kwarg + parses the
+  daemon's optional `model` / `effort` / `fast_mode` action
+  fields via `caliber_from_dict()`. Falls through to default
+  when the daemon doesn't specify, so every spawn carries
+  explicit CLI args (predictable command lines beat "rely on
+  Claude Code's evolving default").
+- App grows `default_caliber` field, populated with
+  `Caliber.default()` (sonnet+high) on construction. Threaded
+  to DaemonSession + the three netrunner-direct fleet.spawn
+  call sites.
+
+DAEMON_SYSTEM_PROMPT grows a CALIBER SELECTION section
+documenting the four optional spawn-action fields (model,
+effort, fast_mode) plus suggested mappings:
+  Single-file recon → haiku + low
+  Multi-file recon → sonnet + medium
+  Synthesis / review → opus + high
+  Whole-architecture → opus[1m] + xhigh
+  Netrunner-blocked → fast_mode=true on opus
+Plus the cost asymmetry note (Haiku ~30x cheaper than Opus
+per token; don't default to Opus on parallel recon, don't
+default to Haiku on synthesis). Quota awareness deferred to
+Phase 4 behind build-plan item 13.
+
+Phase 1 scope explicit non-goals (deferred):
+- Pool caliber + warm-pool reuse (Phase 2). Today every spawn
+  passes caliber on the CLI; pool warming uses the deck default.
+- Daemon-process caliber + override (Phase 3). Today the
+  daemon subprocess runs at Claude Code's default; only
+  CONSTRUCTS get caliber treatment.
+- Quota-aware fallback (Phase 4 — blocked on build-plan item
+  13's quota signal).
+- UI surfaces — pane caliber suffix, sidebar daemon-caliber
+  line (Phase 5).
+- fast_mode CLI emission. The dataclass tracks it but
+  to_claude_args() doesn't emit it — fast mode requires
+  settings.json (`"fastMode": true`), which composes with the
+  brake-hook settings JSON in Phase 2.
+
+Real-deck verified 2026-05-04:
+- Caliber unit tests: defaults, explicit construction, merge,
+  caliber_from_dict (full / empty / None / bool-as-string),
+  display formatting — all pass.
+- Construct command builder: with caliber=Caliber(haiku, low),
+  command line includes `--model haiku --effort low`. With
+  caliber=None, no caliber args (Claude Code's default applies).
+- Full deck startup: zero errors, all panels render correctly,
+  caliber threading didn't break any existing flow.
+
+~370 LOC across new caliber.py + threading edits in 5 modules.
+
 **Next session picks up at: open netrunner choice.** Several
 queued items, no single forced direction:
-  - Caliber selection (`cyberdeck-model-effort-design.md`) —
-    per-spawn model + effort + fast-mode picked by daemon based
-    on task + remaining quota; biggest user-facing slice.
-  - First-run onboarding check + preferences module
-    (build-plan items 0a + 0b).
+  - Caliber Phase 2 (pool caliber + warm-pool reuse + settings
+    JSON fastMode) — natural continuation; ~150 LOC.
+  - Caliber Phase 3 (daemon-process caliber + override via
+    `T` chat directives) — ~150 LOC.
+  - First-run onboarding + preferences module (build-plan
+    items 0a + 0b).
   - README restructure for public repo (build-plan item 0).
+  - Tools-UI Thought of Dave (build-plan item 0c) — space-
+    launch + z-info + H-haiku-research.
   - Mechanic v0→v1 bridge (liveness heartbeat).
-  - The remaining discrete bugs (kill doesn't interrupt
-    in-flight assistant turns, silent wedge investigation).
+  - Remaining discrete bugs (kill doesn't interrupt in-flight;
+    silent wedge cx-796e0468).
+
+**Architecture review** scheduled to fire 2026-06-01 09:00
+EDT (taskId `cyberdeck-architecture-review`); the agent
+phase-checks first and defers if work is still in flight.
+Manual run anytime via the Scheduled-tasks UI.
 
 **Filed for Mechanic v0→v1 bridge (2026-05-01):** liveness heartbeat.
 Currently Mechanic v0 watches the deck PID — proves the process

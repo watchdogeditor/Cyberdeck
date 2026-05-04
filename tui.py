@@ -3370,6 +3370,21 @@ class CyberdeckApp(App):
         self._default_profile_name = default_profile_name or "default"
         self._default_profile_explicit = default_profile_name is not None
         self.default_profile: Optional[Profile] = None
+        # Caliber Phase 1 (2026-05-04): the deck's default per-spawn
+        # caliber. Used as the fall-through when the daemon doesn't
+        # specify model/effort in its spawn action JSON, and as the
+        # explicit caliber for netrunner-direct spawns. Phase 3 will
+        # add a separate daemon_caliber for the daemon process itself
+        # (different bin invocation); Phase 2 will add pool_caliber
+        # for warm-pool match gating.
+        try:
+            from caliber import Caliber
+            self.default_caliber: Optional[Caliber] = Caliber.default()
+        except Exception:
+            # caliber.py missing or broken — degrade gracefully.
+            # Constructs spawn without --model/--effort and Claude
+            # Code applies its own runtime default.
+            self.default_caliber = None
         # Phase 7 of the unified-event-stream slice: per-launch log
         # files in `<deck source>/logs/` (operational artifacts, not
         # deck-content). Defaults to a `logs/` directory next to the
@@ -5534,6 +5549,12 @@ class CyberdeckApp(App):
             # plugin_registry). Centralizes registry access on the
             # TUI side; daemon-session stays a thin glue layer.
             per_spawn_addendum_renderer=self._build_per_spawn_addendum,
+            # Caliber Phase 1 (2026-05-04): the deck's default
+            # per-spawn caliber. DaemonSession uses this as the
+            # fall-through when the daemon's spawn action doesn't
+            # specify model/effort/fast_mode, so every spawn carries
+            # an explicit caliber on its CLI args.
+            default_caliber=self.default_caliber,
         )
 
         if self.daemon_pane is not None:
@@ -7670,6 +7691,11 @@ class CyberdeckApp(App):
                     per_spawn_addendum=self._build_per_spawn_addendum(
                         spawn_profile, None,
                     ),
+                    # Caliber Phase 1: netrunner-direct spawn — use
+                    # deck default. Future: a launch-modal field for
+                    # one-off caliber overrides on file-launched
+                    # constructs.
+                    caliber=self.default_caliber,
                 ),
                 name="spawn",
             )
@@ -8904,6 +8930,12 @@ class CyberdeckApp(App):
                 resume_session_id=session_id,
                 parent_id=original_id,
                 origin="inject",
+                # Caliber Phase 1: pass deck default. Whether Claude
+                # Code honors a per-turn effort change on `--resume`
+                # is an open question (filed in the caliber design
+                # doc); we pass the args explicitly either way so the
+                # behavior is at least consistent across spawns.
+                caliber=self.default_caliber,
             )
         except Exception as e:
             try:
@@ -9723,6 +9755,10 @@ class CyberdeckApp(App):
                 per_spawn_addendum=self._build_per_spawn_addendum(
                     self.default_profile, None,
                 ),
+                # Caliber Phase 1: netrunner-direct spawn (basic n-key
+                # path) — use deck default. Same rationale as the
+                # file-launcher path.
+                caliber=self.default_caliber,
             ),
             name="spawn",
         )

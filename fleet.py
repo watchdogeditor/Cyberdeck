@@ -43,6 +43,9 @@ if TYPE_CHECKING:
     # deck and imports cleanly without us.
     from profiles import Profile
     from event_bus import EventBus
+    # Caliber: model + effort + fast-mode bundle (Phase 1 of the
+    # caliber slice, 2026-05-04). Same TYPE_CHECKING-only pattern.
+    from caliber import Caliber
 
 from construct import Construct
 from display import summarize
@@ -718,6 +721,7 @@ class Fleet:
         origin: str = "daemon",
         plugins: Optional[list[str]] = None,
         per_spawn_addendum: Optional[str] = None,
+        caliber: Optional["Caliber"] = None,
     ) -> Optional[Construct]:
         """Spawn a single construct and wire its consumer into the fleet.
 
@@ -784,6 +788,19 @@ class Fleet:
         rendering. Concatenated by Construct alongside the static
         deck_addendum + the profile's free-text addendum. None when
         no caller-side rendering is needed.
+
+        `caliber` (Phase 1 of the caliber slice, 2026-05-04): model +
+        effort + fast-mode bundle for this spawn. The construct's
+        command builder appends `--model <m> --effort <e>` from
+        `Caliber.to_claude_args()`. None means "use Claude Code's
+        runtime default" — but callers are expected to pass an
+        explicit caliber (the deck's default if nothing else) so
+        the command line is predictable across versions. Threaded
+        into the spawned meta event so observers can attribute
+        per-spawn caliber. Pool reuse semantics for caliber are
+        Phase 2 territory; today, all spawns get caliber as a fresh
+        CLI arg (warm pool sessions might have been spawned at a
+        different effort, but Phase 1 doesn't gate on that).
         """
         # Connection-aware gate. If the deck's connection isn't ONLINE,
         # remote-model spawns can't reach claude.ai/anthropic — they'd
@@ -867,6 +884,7 @@ class Fleet:
             cwd=self.cwd,
             profile=profile,
             deck_addendum=composed_deck_addendum,
+            caliber=caliber,
         )
 
         # Generate the brake-hook --settings file for this spawn, if
@@ -969,6 +987,13 @@ class Fleet:
                 # means "explicitly no plugins for this spawn." A
                 # non-empty list is the daemon's per-spawn pick.
                 "plugins": list(plugins) if plugins is not None else None,
+                # Caliber Phase 1 (2026-05-04): per-spawn model + effort
+                # + fast-mode the construct ran at. Stored as the
+                # display string ("sonnet·high") for log readability;
+                # raw fields would bloat the payload across thousands
+                # of spawn events. None when no caliber was passed
+                # (Claude Code's runtime default applies).
+                "caliber": caliber.display() if caliber is not None else None,
             },
         ))
         consumer = asyncio.create_task(self._consume(c))
