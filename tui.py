@@ -1809,7 +1809,7 @@ class EffortPickerScreen(ModalScreen[Optional[str]]):
         align: center middle;
     }
     #effort_picker {
-        width: 64;
+        width: 80;
         height: auto;
         padding: 1 2;
         background: $panel;
@@ -1818,15 +1818,18 @@ class EffortPickerScreen(ModalScreen[Optional[str]]):
     #effort_picker_title {
         text-style: bold;
         margin-bottom: 1;
-    }
-    .effort_row {
-        height: 2;
-        margin-bottom: 0;
-    }
-    .effort_row > Label {
         width: 100%;
-        height: 2;
-        content-align: left middle;
+        height: auto;
+    }
+    /* Each row is a Label with class effort_row (no nested Label
+       container). The previous `.effort_row > Label` selector
+       didn't match — these rules apply to the Label-as-row directly.
+       Width 100% + height auto so longer descriptions wrap cleanly
+       inside the 80-wide modal instead of overflowing. */
+    .effort_row {
+        width: 100%;
+        height: auto;
+        margin-bottom: 0;
     }
     .effort_current {
         background: $boost;
@@ -1842,18 +1845,19 @@ class EffortPickerScreen(ModalScreen[Optional[str]]):
         Binding("escape", "cancel", "Cancel", show=True),
     ]
 
-    # Per-level guidance. Short enough to fit comfortably in the
-    # modal; netrunner can read full Anthropic docs if they want
-    # the long version. Order matters — rendered as 1..5.
+    # Per-level guidance. Tuned to fit on one line inside the
+    # 80-wide modal without wrapping (preserves clean column
+    # alignment); netrunner can read full Anthropic docs for the
+    # long version. Order matters — rendered as 1..5.
     LEVELS: tuple[tuple[str, str], ...] = (
         ("low",
          "fast, cheap; short scoped tasks (literal)"),
         ("medium",
          "balanced; moderate token savings (literal)"),
         ("high",
-         "API default; strong reasoning, sweet spot (literal)"),
+         "API default; strong reasoning (literal)"),
         ("xhigh",
-         "long-horizon agentic / coding (conceptual; Opus 4.7 only)"),
+         "long-horizon coding/agentic (conceptual; Opus 4.7)"),
         ("max",
          "frontier problems; deepest reasoning (abstract)"),
     )
