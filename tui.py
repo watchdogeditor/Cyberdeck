@@ -942,6 +942,7 @@ class ConstructPane(Static, can_focus=True):
         task: str,
         injected_from: Optional[str] = None,
         profile_name: Optional[str] = None,
+        caliber: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -953,6 +954,15 @@ class ConstructPane(Static, can_focus=True):
         # glance which steering is active. None or "default" suppresses
         # the badge — only non-default profiles get visual weight.
         self.profile_name: Optional[str] = profile_name
+        # Caliber Phase 5 (2026-05-04): the model + effort + fast-mode
+        # bundle this construct ran at, as a pre-rendered display
+        # string ("haiku·low" / "opus·xhigh" / "opus[4.6]·high·fast").
+        # Sourced from the spawned meta event payload — fleet renders
+        # `effective_caliber.display()` into the event, the TUI just
+        # reads it back. None when no caliber metadata reached the
+        # pane (legacy spawns / pool warming subprocesses); the
+        # header suffix is suppressed in that case.
+        self.caliber: Optional[str] = caliber
         # Inject linkage. injected_from is set at spawn time when this
         # construct is a turn-N+1 follow-up of an injected predecessor.
         # injected_to is set later, when an inject targets THIS construct
@@ -1193,6 +1203,16 @@ class ConstructPane(Static, can_focus=True):
         profile_badge = ""
         if self.profile_name and self.profile_name != "default":
             profile_badge = f"  [yellow]\\[{self.profile_name}][/yellow]"
+        # Caliber Phase 5 (2026-05-04): per-construct caliber suffix.
+        # Cyan to match the header's identity color but dim because
+        # caliber is metadata, not state — the netrunner reads it
+        # secondarily after the [STATE] badge. Suppressed when no
+        # caliber metadata reached the pane (legacy spawns).
+        caliber_badge = ""
+        if self.caliber:
+            caliber_badge = (
+                f"  [dim cyan]· {self.caliber}[/dim cyan]"
+            )
         # Brake-blocked badge. Shows immediately after the state
         # badge (so its color visually amplifies the state's "wait,
         # something's off about this") with the warning glyph and
@@ -1212,7 +1232,7 @@ class ConstructPane(Static, can_focus=True):
         header.update(
             f"[dim]{chev}[/dim] [b]{self.construct_id}[/b]  "
             f"[{style}]\\[{self.state.upper()}][/{style}]"
-            f"{denial_badge}{profile_badge}  "
+            f"{denial_badge}{profile_badge}{caliber_badge}  "
             f"[dim]{task_preview}[/dim]{file_count}{inject_link}"
         )
 
@@ -6176,12 +6196,27 @@ class CyberdeckApp(App):
             "∞" if self.max_total_spawns == 0
             else str(self.max_total_spawns)
         )
+        # Caliber Phase 5 (2026-05-04): daemon caliber line + fast-
+        # mode governor indicator. Daemon model is pinned to opus by
+        # design; effort is the netrunner's power-level knob via the
+        # Limits modal. Fast mode shows `🚀` when on, blank when off
+        # (cost governor; defaults off). Symmetric with the existing
+        # `bin:` / `spawn:` / `cost:` lines.
+        daemon_str = (
+            f"opus·[b]{self.daemon_effort}[/b]"
+            if getattr(self, "daemon_effort", None) else "—"
+        )
+        fast_str = (
+            " · [yellow]fast[/yellow]"
+            if getattr(self, "fast_mode", False) else ""
+        )
         lines = [
-            f"run:  [b]{self.fleet.run_id}[/b]",
-            f"bin:  {self.claude_bin}",
-            f"spawn: {self.fleet.total_spawned}/{spawn_cap_str}  "
+            f"run:    [b]{self.fleet.run_id}[/b]",
+            f"bin:    {self.claude_bin}",
+            f"daemon: {daemon_str}{fast_str}",
+            f"spawn:  {self.fleet.total_spawned}/{spawn_cap_str}  "
             f"live: {active}/{self.max_concurrent}",
-            f"cost: [b]${cost:.2f}[/b]  tok: {tin}→{tout}",
+            f"cost:   [b]${cost:.2f}[/b]  tok: {tin}→{tout}",
         ]
         info.update("\n".join(lines))
 
@@ -6747,6 +6782,12 @@ class CyberdeckApp(App):
                 fevent.construct_id, display_task,
                 injected_from=parent_id,
                 profile_name=fevent.payload.get("profile_name"),
+                # Caliber Phase 5 (2026-05-04): caliber display
+                # string from the spawned meta event (rendered by
+                # fleet.spawn from effective_caliber.display()).
+                # None when no caliber metadata was attached
+                # (legacy spawn path / pool warming).
+                caliber=fevent.payload.get("caliber"),
             )
             # If this spawn has a parent (i.e., it's an inject follow-up),
             # update the parent pane to show the outgoing chevron link.
@@ -6906,6 +6947,7 @@ class CyberdeckApp(App):
         task: str,
         injected_from: Optional[str] = None,
         profile_name: Optional[str] = None,
+        caliber: Optional[str] = None,
     ) -> None:
         # Defensive idempotency: if a pane already exists for this
         # construct_id, don't create another. Belt-and-suspenders
@@ -6930,6 +6972,7 @@ class CyberdeckApp(App):
             construct_id, task,
             injected_from=injected_from,
             profile_name=profile_name,
+            caliber=caliber,
         )
         self.panes[construct_id] = pane
         main = self.query_one("#main", VerticalScroll)
