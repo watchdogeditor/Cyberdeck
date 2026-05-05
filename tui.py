@@ -33,7 +33,7 @@ from textual.containers import Vertical, VerticalScroll, Horizontal
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import (
-    Label, Log, RichLog, Header, Footer, Static, Input,
+    Label, Log, RichLog, Header, Footer, Static, Input, Button,
     TabbedContent, TabPane, ListView, ListItem,
 )
 
@@ -1947,6 +1947,16 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         height: auto;
         padding: 0 1;
     }
+    /* Nested labels inside the columns need width:100% explicitly —
+       the `#limits_dialog > Label` rule above only applies to direct
+       children. Without these the right column was overflowing the
+       50% container instead of wrapping. */
+    .limits_col > Label,
+    .limits_col_title,
+    .power_line {
+        width: 100%;
+        height: auto;
+    }
     .limits_col_title {
         text-style: bold;
         color: $accent;
@@ -1965,7 +1975,11 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         width: 14;
     }
     .power_line {
-        height: auto;
+        margin-bottom: 1;
+    }
+    #effort_button {
+        width: auto;
+        margin-top: 1;
         margin-bottom: 1;
     }
     """
@@ -1973,7 +1987,17 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel", show=True),
         Binding("ctrl+s", "submit", "Save", show=True),
-        Binding("e", "open_effort_picker", "Set daemon effort", show=True),
+        # priority=True so the binding fires even when one of the
+        # numeric Input widgets has focus. Without priority, the
+        # focused Input swallows the `e` keystroke (it gets validated
+        # against type="integer" and silently dropped — the parent
+        # screen never sees it). Same pattern as Ctrl+S / Esc, which
+        # are already handled by Textual's keymap because they're
+        # special keys; bare-letter bindings need the priority hint.
+        Binding(
+            "e", "open_effort_picker", "Set daemon effort",
+            show=True, priority=True,
+        ),
     ]
 
     def __init__(
@@ -2079,10 +2103,18 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                     yield Label(
                         f"Daemon: [b]opus[/b] · "
                         f"[cyan b]{self.daemon_effort}[/cyan b]\n"
-                        f"[dim]model pinned (manager role); set "
-                        f"effort: [b]E[/b][/dim]",
+                        f"[dim]model pinned (manager role)[/dim]",
                         id="daemon_caliber_label",
                         classes="power_line",
+                    )
+                    # Tab-reachable button as a fallback for the
+                    # priority-binding `E` shortcut. The hotkey is
+                    # the fast path; the button is the discoverable
+                    # path. Either invokes the same effort picker.
+                    yield Button(
+                        "Set daemon effort  (E)",
+                        id="effort_button",
+                        variant="primary",
                     )
                     fm_text = (
                         "[green]ON[/green]" if self.fast_mode
@@ -2207,8 +2239,7 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                 lbl.update(
                     f"Daemon: [b]opus[/b] · "
                     f"[cyan b]{self.daemon_effort}[/cyan b]\n"
-                    f"[dim]model pinned (manager role); set "
-                    f"effort: [b]E[/b][/dim]"
+                    f"[dim]model pinned (manager role)[/dim]"
                 )
             except Exception:
                 pass
@@ -2220,6 +2251,13 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             ),
             _picked,
         )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Tab-reachable Button fallback for the E hotkey. Same
+        action; this just gives mouse / Tab-navigation netrunners
+        a discoverable path into the effort picker."""
+        if event.button.id == "effort_button":
+            self.action_open_effort_picker()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
