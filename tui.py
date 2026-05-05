@@ -1782,6 +1782,130 @@ class InjectScreen(ModalScreen[Optional[tuple[str, str, str]]]):
         self.dismiss(None)
 
 
+class EffortPickerScreen(ModalScreen[Optional[str]]):
+    """Reusable effort-level picker — mirrors Claude Code client's
+    1-5 effort selector. Press 1-5 to pick low/medium/high/xhigh/max;
+    Esc to cancel.
+
+    Used by LimitsScreen for daemon effort selection (Caliber Phase 3,
+    2026-05-04). Same modal will surface for manual-construct
+    creation when the caliber-pick UI lands — keeping this one
+    dedicated and parameterized means we don't duplicate the
+    effort-blurb panel in two places.
+
+    Returns the selected effort string ("low" / "medium" / "high" /
+    "xhigh" / "max") on dismiss, or None on cancel.
+
+    Effort guidance (paraphrased from Anthropic's docs +
+    netrunner's framing 2026-05-04):
+      - low/medium/high are mostly LITERAL — model executes the
+        task as written without extra reasoning depth
+      - xhigh/max shift toward CONCEPTUAL / abstract reasoning —
+        model thinks about the problem itself before acting
+    """
+
+    CSS = """
+    EffortPickerScreen {
+        align: center middle;
+    }
+    #effort_picker {
+        width: 64;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: round $primary;
+    }
+    #effort_picker_title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    .effort_row {
+        height: 2;
+        margin-bottom: 0;
+    }
+    .effort_row > Label {
+        width: 100%;
+        height: 2;
+        content-align: left middle;
+    }
+    .effort_current {
+        background: $boost;
+    }
+    """
+
+    BINDINGS = [
+        Binding("1", "pick_low", "Low", show=True),
+        Binding("2", "pick_medium", "Medium", show=True),
+        Binding("3", "pick_high", "High", show=True),
+        Binding("4", "pick_xhigh", "xHigh", show=True),
+        Binding("5", "pick_max", "Max", show=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    # Per-level guidance. Short enough to fit comfortably in the
+    # modal; netrunner can read full Anthropic docs if they want
+    # the long version. Order matters — rendered as 1..5.
+    LEVELS: tuple[tuple[str, str], ...] = (
+        ("low",
+         "fast, cheap; short scoped tasks (literal)"),
+        ("medium",
+         "balanced; moderate token savings (literal)"),
+        ("high",
+         "API default; strong reasoning, sweet spot (literal)"),
+        ("xhigh",
+         "long-horizon agentic / coding (conceptual; Opus 4.7 only)"),
+        ("max",
+         "frontier problems; deepest reasoning (abstract)"),
+    )
+
+    def __init__(
+        self,
+        *,
+        title: str = "Set Effort",
+        current_effort: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.title_text = title
+        self.current_effort = current_effort
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="effort_picker"):
+            yield Label(f"[b]{self.title_text}[/b]", id="effort_picker_title")
+            for i, (level, blurb) in enumerate(self.LEVELS, start=1):
+                marker = "★" if level == self.current_effort else " "
+                cls = "effort_row"
+                if level == self.current_effort:
+                    cls = "effort_row effort_current"
+                yield Label(
+                    f"  [b cyan]\\[{i}][/b cyan]  "
+                    f"[b]{level.upper():<7}[/b] {marker} "
+                    f"[dim]— {blurb}[/dim]",
+                    classes=cls,
+                )
+            yield Label(
+                "[dim]1-5 to pick · Esc to cancel[/dim]",
+            )
+
+    def action_pick_low(self) -> None:
+        self.dismiss("low")
+
+    def action_pick_medium(self) -> None:
+        self.dismiss("medium")
+
+    def action_pick_high(self) -> None:
+        self.dismiss("high")
+
+    def action_pick_xhigh(self) -> None:
+        self.dismiss("xhigh")
+
+    def action_pick_max(self) -> None:
+        self.dismiss("max")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class LimitsScreen(ModalScreen[Optional[dict]]):
     """View and adjust runtime caps for the active session.
 
@@ -1801,7 +1925,7 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         align: center middle;
     }
     #limits_dialog {
-        width: 70;
+        width: 100;
         height: auto;
         padding: 1 2;
         background: $panel;
@@ -1815,23 +1939,41 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
     #limits_title {
         text-style: bold;
     }
+    #limits_columns {
+        height: auto;
+    }
+    .limits_col {
+        width: 50%;
+        height: auto;
+        padding: 0 1;
+    }
+    .limits_col_title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
     .limits_row {
         height: 3;
         margin-bottom: 0;
     }
     .limits_row > Label {
-        width: 32;
+        width: 28;
         height: 3;
         content-align: left middle;
     }
     .limits_row > Input {
-        width: 16;
+        width: 14;
+    }
+    .power_line {
+        height: auto;
+        margin-bottom: 1;
     }
     """
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel", show=True),
         Binding("ctrl+s", "submit", "Save", show=True),
+        Binding("e", "open_effort_picker", "Set daemon effort", show=True),
     ]
 
     def __init__(
@@ -1841,6 +1983,8 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         pool_size: int,
         wedge_timeout_seconds: float,
         delay_window_seconds: float,
+        daemon_effort: str,
+        fast_mode: bool,
         current_live: int,
         current_spawned: int,
         cost_so_far: float,
@@ -1852,6 +1996,15 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
         self.initial_pool_size = pool_size
         self.initial_wedge_timeout_seconds = wedge_timeout_seconds
         self.initial_delay_window_seconds = delay_window_seconds
+        # Caliber Phase 3 (scoped down, 2026-05-04): daemon effort is
+        # the netrunner's power-level knob for the daemon's own
+        # subprocess. Model is pinned to opus by design (daemon is a
+        # manager, not a swappable agent). Effort applies on next
+        # goal start — the streaming subprocess bakes its caliber at
+        # spawn time. Modified state lives in `self.daemon_effort`;
+        # action_submit reads it back into the result dict.
+        self.daemon_effort = daemon_effort
+        self.fast_mode = fast_mode
         self.current_live = current_live
         self.current_spawned = current_spawned
         self.cost_so_far = cost_so_far
@@ -1865,74 +2018,110 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                 f"[cyan]${self.cost_so_far:.4f}[/cyan] cost"
             )
             yield Label(
-                "[dim]Adjust caps below. Tab between fields, Enter or "
-                "Ctrl+S to save, Esc to cancel.[/dim]"
+                "[dim]Adjust caps + power levels. Tab between fields, "
+                "Enter or Ctrl+S to save, Esc to cancel. Press "
+                "[b]E[/b] to set daemon effort.[/dim]"
             )
-            with Horizontal(classes="limits_row"):
-                yield Label("max concurrent constructs:")
-                yield Input(
-                    value=str(self.initial_max_concurrent),
-                    id="input_max_concurrent",
-                    # type="integer" restricts keystrokes to digits +
-                    # optional leading minus. Editing keys (backspace,
-                    # arrows, home/end, etc.) still work. Saves us
-                    # from having to validate in action_submit() —
-                    # bad input can't be entered in the first place.
-                    type="integer",
-                )
-            with Horizontal(classes="limits_row"):
-                yield Label("max total spawns this session:")
-                yield Input(
-                    value=str(self.initial_max_total_spawns),
-                    id="input_max_total_spawns",
-                    type="integer",
-                )
-            with Horizontal(classes="limits_row"):
-                yield Label("pre-warmed session pool size:")
-                yield Input(
-                    value=str(self.initial_pool_size),
-                    id="input_pool_size",
-                    type="integer",
-                )
-            with Horizontal(classes="limits_row"):
-                yield Label("wedge timeout (seconds):")
-                yield Input(
-                    value=str(int(self.initial_wedge_timeout_seconds)),
-                    id="input_wedge_timeout_seconds",
-                    type="integer",
-                )
-            with Horizontal(classes="limits_row"):
-                yield Label("delay window (seconds):")
-                yield Input(
-                    value=str(int(self.initial_delay_window_seconds)),
-                    id="input_delay_window_seconds",
-                    type="integer",
-                )
+            with Horizontal(id="limits_columns"):
+                # ---- Left column: numeric caps -----------------------
+                with Vertical(classes="limits_col"):
+                    yield Label("CAPS", classes="limits_col_title")
+                    with Horizontal(classes="limits_row"):
+                        yield Label("max concurrent:")
+                        yield Input(
+                            value=str(self.initial_max_concurrent),
+                            id="input_max_concurrent",
+                            # type="integer" restricts keystrokes to
+                            # digits + optional leading minus.
+                            # Editing keys (backspace, arrows, etc.)
+                            # still work. Saves us from validating
+                            # in action_submit() — bad input can't
+                            # be entered in the first place.
+                            type="integer",
+                        )
+                    with Horizontal(classes="limits_row"):
+                        yield Label("max total spawns:")
+                        yield Input(
+                            value=str(self.initial_max_total_spawns),
+                            id="input_max_total_spawns",
+                            type="integer",
+                        )
+                    with Horizontal(classes="limits_row"):
+                        yield Label("pool size:")
+                        yield Input(
+                            value=str(self.initial_pool_size),
+                            id="input_pool_size",
+                            type="integer",
+                        )
+                    with Horizontal(classes="limits_row"):
+                        yield Label("wedge timeout (s):")
+                        yield Input(
+                            value=str(int(
+                                self.initial_wedge_timeout_seconds
+                            )),
+                            id="input_wedge_timeout_seconds",
+                            type="integer",
+                        )
+                    with Horizontal(classes="limits_row"):
+                        yield Label("delay window (s):")
+                        yield Input(
+                            value=str(int(
+                                self.initial_delay_window_seconds
+                            )),
+                            id="input_delay_window_seconds",
+                            type="integer",
+                        )
+                # ---- Right column: power levels ----------------------
+                with Vertical(classes="limits_col"):
+                    yield Label(
+                        "POWER LEVELS", classes="limits_col_title",
+                    )
+                    yield Label(
+                        f"Daemon: [b]opus[/b] · "
+                        f"[cyan b]{self.daemon_effort}[/cyan b]\n"
+                        f"[dim]model pinned (manager role); set "
+                        f"effort: [b]E[/b][/dim]",
+                        id="daemon_caliber_label",
+                        classes="power_line",
+                    )
+                    fm_text = (
+                        "[green]ON[/green]" if self.fast_mode
+                        else "[dim]off[/dim]"
+                    )
+                    yield Label(
+                        f"Fast-mode governor: {fm_text}\n"
+                        f"[dim]Opus 4.6 only · 6x cost / 2.5x speed · "
+                        f"toggle via --fast-mode CLI[/dim]",
+                        classes="power_line",
+                    )
+                    yield Label(
+                        "[dim]Construct calibers are daemon-controlled "
+                        "per task (haiku/sonnet/opus + matching "
+                        "effort). Pool warms at sonnet·high; "
+                        "non-default-caliber spawns fall through to "
+                        "fresh.[/dim]",
+                        classes="power_line",
+                    )
+                    yield Label(
+                        "[b]Effort guidance:[/b]\n"
+                        "[dim]low/medium/high → mostly literal "
+                        "execution. xhigh/max → conceptual/abstract "
+                        "reasoning. high is the API default and the "
+                        "sweet spot for routine work.[/dim]",
+                        classes="power_line",
+                    )
             yield Label(
-                "[dim]No hard ceilings. max_concurrent and "
-                "max_total_spawns each accept 0 = 'no cap' (use with "
-                "caution — burst spawn + cloud quota is a real cost). "
-                "pool_size is the number of pre-warmed claude "
-                "subprocesses kept hot for snappy spawns; 0 disables "
-                "the pool. Raising pool_size mid-session tops up to "
-                "the new target; lowering leaves existing warm sessions "
-                "intact (they'll be consumed naturally). "
-                "wedge_timeout is how long fleet waits for a construct "
-                "to exit after its stdout closes before force-killing "
-                "(kill_source=fleet_wedge_timeout). Raise it if you're "
-                "seeing legitimate slow shutdowns get killed; lower it "
-                "for snappier shutdown at the cost of less stderr "
-                "post-mortem. 0 disables (debug only — a real wedge "
-                "will block deck shutdown). "
-                "delay_window is the variable-outcome pause UX (slice "
-                "3, default 5s): brake hook holds interesting tool "
-                "calls for N seconds, watching for an X-press override. "
-                "Under YOLO every side-effect call gets the delay "
-                "(default=allow, X=block); under default only would-deny "
-                "calls (default=deny, X=approve); paranoid same as "
-                "default. 0 = no delay = pre-slice-3 behavior. Applies "
-                "to NEW spawns only (existing in-flight constructs keep "
-                "what they spawned with). Persisted across restarts.[/dim]"
+                "[dim]Caps notes: max_concurrent and max_total_spawns "
+                "each accept 0 = 'no cap' (burst spawn + cloud quota "
+                "is a real cost). pool_size is pre-warmed claude "
+                "subprocesses kept hot for snappy spawns; 0 disables. "
+                "wedge_timeout is the post-stdout-close ceiling "
+                "before fleet force-kills (kill_source=fleet_wedge_"
+                "timeout); 0 disables (debug only). delay_window is "
+                "the variable-outcome pause UX (slice 3, default 5s) "
+                "— brake hook holds interesting tool calls for N "
+                "seconds watching for an X-press override. All "
+                "persist across restarts.[/dim]"
             )
 
     def on_mount(self) -> None:
@@ -2001,7 +2190,36 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             "pool_size": ps,
             "wedge_timeout_seconds": float(wt),
             "delay_window_seconds": float(dw),
+            "daemon_effort": self.daemon_effort,
         })
+
+    def action_open_effort_picker(self) -> None:
+        """Push the EffortPickerScreen for daemon effort selection.
+        Selection persists into self.daemon_effort + the displayed
+        Daemon row updates. The actual apply-to-deck happens when
+        the netrunner submits the LimitsScreen (Ctrl+S / Enter)."""
+        def _picked(result: Optional[str]) -> None:
+            if result is None:
+                return
+            self.daemon_effort = result
+            try:
+                lbl = self.query_one("#daemon_caliber_label", Label)
+                lbl.update(
+                    f"Daemon: [b]opus[/b] · "
+                    f"[cyan b]{self.daemon_effort}[/cyan b]\n"
+                    f"[dim]model pinned (manager role); set "
+                    f"effort: [b]E[/b][/dim]"
+                )
+            except Exception:
+                pass
+
+        self.app.push_screen(
+            EffortPickerScreen(
+                title="Set Daemon Effort",
+                current_effort=self.daemon_effort,
+            ),
+            _picked,
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -3299,7 +3517,6 @@ class CyberdeckApp(App):
         default_profile_name: Optional[str] = None,
         fast_mode: Optional[bool] = None,
         fast_mode_explicit: bool = False,
-        daemon_model: Optional[str] = None,
         daemon_effort: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -3384,14 +3601,19 @@ class CyberdeckApp(App):
         try:
             from caliber import Caliber
             self.default_caliber: Optional[Caliber] = Caliber.default()
-            # Caliber Phase 3 (2026-05-04): the daemon's own model +
-            # effort. The daemon's job is decomposition + dispatch —
-            # benefits from strong reasoning but doesn't need
-            # max-effort. Default opus + high per the design doc;
-            # netrunner can override via CLI flags or T-chat
-            # directive ("switch daemon to sonnet medium" etc.).
+            # Caliber Phase 3 (2026-05-04, scoped down): the daemon's
+            # subprocess caliber. MODEL IS PINNED to opus by design —
+            # the daemon is a manager doing decomposition + dispatch,
+            # not a swappable agent; capability matters, model
+            # variability doesn't. EFFORT is the netrunner's power-
+            # level knob, surfaced in the Limits modal alongside
+            # max_concurrent / pool_size / etc. Defaults to high.
+            # Stored as a Caliber object so the existing
+            # to_claude_args plumbing in Daemon._spawn_streaming
+            # works unchanged; effort is the only mutable field.
+            self.daemon_effort: str = "high"
             self.daemon_caliber: Optional[Caliber] = Caliber(
-                model="opus", effort="high",
+                model="opus", effort=self.daemon_effort,
             )
         except Exception:
             # caliber.py missing or broken — degrade gracefully.
@@ -3399,6 +3621,7 @@ class CyberdeckApp(App):
             # Code applies its own runtime default.
             self.default_caliber = None
             self.daemon_caliber = None
+            self.daemon_effort = "high"
         # Caliber Phase 2 (2026-05-04): fast_mode is a deck-wide cost
         # governor — netrunner-controlled, defaults OFF. The daemon
         # never picks fast_mode autonomously; it's a 6x-cost-for-2.5x-
@@ -3410,24 +3633,22 @@ class CyberdeckApp(App):
         # one-shot overrides usable.
         self.fast_mode: bool = bool(fast_mode) if fast_mode is not None else False
         self._fast_mode_explicit = fast_mode_explicit
-        # Caliber Phase 3 (2026-05-04): apply --daemon-model /
-        # --daemon-effort CLI overrides if passed. Either (or both)
-        # being non-None means the netrunner was explicit at this
-        # launch and the persisted-state path should defer to them.
-        self._daemon_caliber_explicit = (
-            daemon_model is not None or daemon_effort is not None
-        )
+        # Caliber Phase 3 (scoped down): apply --daemon-effort CLI
+        # override when passed. Model is always opus — not netrunner-
+        # configurable. The explicit flag wins over the persisted
+        # value loaded later (in on_mount via load_limits) and also
+        # writes back to state.json so the new value persists.
+        self._daemon_effort_explicit = daemon_effort is not None
         if (
             self.daemon_caliber is not None
-            and self._daemon_caliber_explicit
+            and daemon_effort is not None
         ):
             try:
                 from caliber import Caliber as _C
+                self.daemon_effort = daemon_effort
                 self.daemon_caliber = _C(
-                    model=daemon_model if daemon_model is not None
-                    else self.daemon_caliber.model,
-                    effort=daemon_effort if daemon_effort is not None
-                    else self.daemon_caliber.effort,
+                    model="opus",
+                    effort=daemon_effort,
                 )
             except Exception:
                 pass
@@ -3715,32 +3936,28 @@ class CyberdeckApp(App):
                     self.home_dir / ".cyberdeck" / "state.json",
                     fast_mode=self.fast_mode,
                 )
-            # Caliber Phase 3 (2026-05-04): persisted daemon caliber
-            # from prior T-chat directives or --daemon-model /
-            # --daemon-effort flags. CLI-explicit (via the
-            # _daemon_caliber_explicit flag set during App
-            # construction) wins; persisted values fill in otherwise.
-            dm = persisted.get("daemon_model")
+            # Caliber Phase 3 (scoped down, 2026-05-04): persisted
+            # daemon_effort from prior CLI flag or Limits-modal
+            # change. Model is always opus — not configurable. CLI-
+            # explicit wins over persisted; persisted-only loads
+            # otherwise.
             de = persisted.get("daemon_effort")
             if (
                 self.daemon_caliber is not None
-                and not self._daemon_caliber_explicit
-                and (isinstance(dm, str) or isinstance(de, str))
+                and not self._daemon_effort_explicit
+                and isinstance(de, str)
             ):
                 try:
                     from caliber import Caliber as _C
+                    self.daemon_effort = de
                     self.daemon_caliber = _C(
-                        model=dm if isinstance(dm, str)
-                        else self.daemon_caliber.model,
-                        effort=de if isinstance(de, str)
-                        else self.daemon_caliber.effort,
+                        model="opus", effort=de,
                     )
                 except Exception:
                     pass
-            if self._daemon_caliber_explicit and self.daemon_caliber:
+            if self._daemon_effort_explicit and self.daemon_caliber:
                 save_limits(
                     self.home_dir / ".cyberdeck" / "state.json",
-                    daemon_model=self.daemon_caliber.model,
                     daemon_effort=self.daemon_caliber.effort,
                 )
         except Exception:
@@ -9395,75 +9612,6 @@ class CyberdeckApp(App):
         except Exception:
             pass
 
-        # Caliber Phase 3 (2026-05-04): scan the message for a
-        # caliber-shift directive. Recognized phrasings ("switch
-        # daemon to opus xhigh", "use sonnet", "drop to medium
-        # effort", etc.) update self.daemon_caliber and surface a
-        # chatlog notice. The change applies to the NEXT goal /
-        # daemon restart — the running streaming subprocess keeps
-        # its original caliber baked at spawn time. Mid-flight
-        # mid-turn application is a future slice (depends on
-        # whether Claude Code's streaming-json input format
-        # accepts per-turn effort/model overrides; not verified).
-        # The directive scanner runs BEFORE delivering to the
-        # daemon — directive-shaped messages don't get sent as
-        # ordinary chat (the netrunner's intent was control, not
-        # conversation).
-        try:
-            from caliber import parse_caliber_directive, Caliber
-            directive = parse_caliber_directive(message)
-        except Exception:
-            directive = None
-        if directive:
-            old = self.daemon_caliber
-            new_model = directive.get("model") or (
-                old.model if old else "sonnet"
-            )
-            new_effort = directive.get("effort") or (
-                old.effort if old else "high"
-            )
-            try:
-                self.daemon_caliber = Caliber(
-                    model=new_model,
-                    effort=new_effort,
-                )
-            except Exception:
-                pass
-            else:
-                # Persist + emit + chatlog. Persist via save_limits
-                # so the change survives restart.
-                try:
-                    save_limits(
-                        self.home_dir / ".cyberdeck" / "state.json",
-                        daemon_model=new_model,
-                        daemon_effort=new_effort,
-                    )
-                except Exception:
-                    pass
-                try:
-                    self.bus.publish(DeckEvent(
-                        kind="caliber.daemon_change",
-                        source="tui",
-                        severity="info",
-                        payload={
-                            "old": old.display() if old else None,
-                            "new": self.daemon_caliber.display(),
-                            "directive": message,
-                        },
-                    ))
-                except Exception:
-                    pass
-                old_disp = old.display() if old else "(none)"
-                self._chatlog_write(
-                    f"[yellow]daemon caliber:[/yellow] "
-                    f"{old_disp} → {self.daemon_caliber.display()} "
-                    f"[dim](applies on next goal / daemon "
-                    f"restart)[/dim]"
-                )
-                # Don't deliver the directive as chat — the netrunner
-                # was issuing a control command, not conversation.
-                return
-
         # Stash for next outcome turn delivery
         self.session.set_pending_netrunner_message(message)
 
@@ -9709,6 +9857,10 @@ class CyberdeckApp(App):
                 pool_size=self.pool_size,
                 wedge_timeout_seconds=self.wedge_timeout_seconds,
                 delay_window_seconds=self.delay_window_seconds,
+                # Caliber Phase 3 (scoped down): daemon effort.
+                # Daemon model is always opus, not configurable.
+                daemon_effort=self.daemon_effort,
+                fast_mode=self.fast_mode,
                 current_live=live,
                 current_spawned=spawned,
                 cost_so_far=cost,
@@ -9840,21 +9992,44 @@ class CyberdeckApp(App):
                 except Exception:
                     pass
 
+        # Caliber Phase 3 (scoped down, 2026-05-04): daemon effort.
+        # Applies on next goal start — the streaming daemon
+        # subprocess bakes its caliber at spawn time. Mid-flight
+        # daemon restart was tried + reverted as overengineered;
+        # the next-goal apply is consistent with how max_concurrent
+        # / pool_size also work at this layer.
+        new_de = result.get("daemon_effort", self.daemon_effort)
+        if new_de != self.daemon_effort:
+            changes.append(
+                f"daemon effort: {self.daemon_effort} → {new_de} "
+                f"(applies on next goal start)"
+            )
+            self.daemon_effort = new_de
+            if self.daemon_caliber is not None:
+                try:
+                    from caliber import Caliber as _C
+                    self.daemon_caliber = _C(
+                        model="opus", effort=new_de,
+                    )
+                except Exception:
+                    pass
+
         if not changes:
             return
 
         # Phase 1.5: persist the runtime tunables so a deck restart
-        # doesn't lose the netrunner's just-submitted values. Only
-        # delay_window_seconds + wedge_timeout_seconds are persisted —
-        # max_concurrent / max_total_spawns / pool_size are
-        # session-scoped (the netrunner sets caps for THIS goal; the
-        # next session might want different caps). save_limits is
-        # best-effort; failures don't block the in-session apply.
+        # doesn't lose the netrunner's just-submitted values.
+        # delay_window_seconds + wedge_timeout_seconds + daemon_effort
+        # are persisted; max_concurrent / max_total_spawns / pool_size
+        # are session-scoped (the netrunner sets caps for THIS goal;
+        # the next session might want different caps). save_limits
+        # is best-effort; failures don't block the in-session apply.
         try:
             save_limits(
                 self.home_dir / ".cyberdeck" / "state.json",
                 delay_window_seconds=self.delay_window_seconds,
                 wedge_timeout_seconds=self.wedge_timeout_seconds,
+                daemon_effort=self.daemon_effort,
             )
         except Exception:
             pass
@@ -10130,23 +10305,16 @@ if __name__ == "__main__":
              "persists the new value to state.json).",
     )
     parser.add_argument(
-        "--daemon-model",
-        type=str,
-        default=None,
-        help="Model the daemon's own subprocess runs at (default: opus). "
-             "The daemon does decomposition + dispatch — strong reasoning "
-             "helps. Valid: haiku / sonnet / opus / opus[4.6] / sonnet[1m] "
-             "/ opus[1m]. Persisted to state.json; T-chat directives "
-             "(\"switch daemon to sonnet medium\") override at runtime.",
-    )
-    parser.add_argument(
         "--daemon-effort",
         type=str,
         default=None,
-        help="Effort the daemon's subprocess runs at (default: high). "
-             "Valid: low / medium / high / xhigh / max. xhigh is Opus "
-             "4.7-only; max is Sonnet 4.6 / Opus 4.6 / Opus 4.7 only. "
-             "Persisted to state.json.",
+        help="Power level for the daemon's subprocess (default: high). "
+             "The daemon is always Opus — model is pinned because the "
+             "daemon is a manager doing decomposition + dispatch, not a "
+             "swappable agent. Effort is the netrunner's power-level "
+             "knob: low / medium / high / xhigh / max. Also editable "
+             "live via the Limits modal (`l`); persisted to state.json. "
+             "Applies on next goal start.",
     )
     parser.add_argument(
         "--no-pool",
@@ -10195,7 +10363,6 @@ if __name__ == "__main__":
         pool_size=args.pool_size,
         fast_mode=args.fast_mode,
         fast_mode_explicit=(args.fast_mode is not None),
-        daemon_model=args.daemon_model,
         daemon_effort=args.daemon_effort,
         home_dir=home_dir,
         profiles_dir=(

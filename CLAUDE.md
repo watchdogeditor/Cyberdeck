@@ -642,74 +642,82 @@ Real-deck verified 2026-05-04:
 ~120 LOC across 4 modules (caliber.py untouched; threading +
 pool gating + settings extension).
 
-**✅ CALIBER PHASE 3 SHIPPED 2026-05-04** (uncommitted as of this
-CLAUDE.md update). Daemon-process caliber + T-chat directive
-override.
+**✅ CALIBER PHASE 3 SHIPPED 2026-05-04** (scoped down per
+netrunner direction; uncommitted as of this CLAUDE.md update).
+Daemon caliber: model PINNED to opus, effort is the netrunner's
+power-level knob.
 
-`Daemon` class grows a `caliber: Optional[Caliber]` kwarg.
-Subprocess command builders (both streaming and one-shot paths)
-append `caliber.to_claude_args()` so the daemon's `claude`
-process runs at the configured model + effort. fast_mode is
-NOT honored on the daemon caliber — the daemon is dispatch-
-shaped work; speed-vs-cost trade is for constructs running
-under the netrunner's cost governor.
+Design correction made mid-implementation: an earlier draft of
+Phase 3 had T-chat directive parsing + mid-flight subprocess
+restart + a `--daemon-model` flag that let the daemon switch
+models. The netrunner correctly flagged this as overengineered:
+"the daemon should always be opus, and its effort should be
+controllable via limits (dictates power level) - it is making
+management decisions. The construct governor can be controlled
+by daemon and that's the thing I want to have utilizing all
+the models."
 
-`App.daemon_caliber: Optional[Caliber]` defaults to opus+high
-per the design doc (the daemon does decomposition + dispatch,
-benefits from strong reasoning). Configurable via:
-- CLI flags `--daemon-model` / `--daemon-effort` (each
-  optional; explicit value persists to state.json's limits
-  namespace)
-- T-chat directive parsing (`parse_caliber_directive` in
-  caliber.py): recognized phrasings update `App.daemon_caliber`
-  + persist + emit `caliber.daemon_change` bus event + chatlog
-  notice ("daemon caliber: opus·high → sonnet·medium · applies
-  on next goal / daemon restart")
+Reverted that scope. Final shape:
 
-Directive grammar (deliberately narrow — wide regex up front
-catches too many false positives):
-  - Verb gate: at least one of `switch / use / drop to / go to
-    / set / run / put` must appear
-  - Model match: `\b(haiku|sonnet|opus)(\[suffix\])?\b` (with
-    bracket-suffix path tried first so `opus[4.6]` survives)
-  - Effort match: any of `low / medium / high / xhigh / max`
-    PLUS one of:
-      - `effort` word follows ("medium effort")
-      - directive cue (preposition / verb) immediately precedes
-      - the matched model is adjacent (e.g. "opus xhigh")
-  - At least one of (model, effort) must match for the
-    directive to fire
+- `Daemon` class accepts `caliber` kwarg; both subprocess
+  command builders (streaming + one-shot) emit
+  `caliber.to_claude_args()` (--model + --effort flags). No
+  fast_mode (that's a netrunner cost governor for constructs).
+- App.daemon_caliber pinned to `Caliber("opus", self.daemon_effort)`.
+  Effort defaults to "high".
+- CLI flag `--daemon-effort` (low/medium/high/xhigh/max).
+  Persisted in state.json's limits namespace alongside
+  `delay_window_seconds`, `wedge_timeout_seconds`, `fast_mode`.
+- New `EffortPickerScreen` modal — reusable. Press 1-5 to pick
+  level; current selection starred + highlighted. Bakes
+  Anthropic's effort guidance per level + the "literal
+  vs conceptual" framing the netrunner articulated. Designed
+  to be reused for future construct-creation modal where the
+  netrunner picks a manual construct's caliber.
+- `LimitsScreen` restructured to two-column panel (was
+  single-column). Left column: existing numeric caps. Right
+  column: power levels — Daemon row showing
+  "opus · <effort>", Fast-mode governor state, construct-caliber
+  reminder, effort guidance. New `E` keybind on the modal opens
+  EffortPickerScreen for the daemon effort. Selection updates
+  the displayed row immediately; Save/Ctrl+S commits to deck +
+  persists.
+- `_handle_limits_submitted` extended: daemon_effort change
+  applies on next goal start (consistent with how
+  max_concurrent / pool_size apply). The streaming daemon
+  bakes its caliber at spawn time; mid-flight subprocess
+  restart was tried + reverted as overengineered.
+- DAEMON_SYSTEM_PROMPT grew a "NOTE on YOUR OWN caliber"
+  paragraph: model pinned, effort is netrunner's knob; daemon
+  picks caliber for CONSTRUCTS, not for itself.
 
-Tested across positive cases ("switch daemon to opus xhigh",
-"set daemon caliber to opus[4.6] high", "put the daemon on
-haiku low", "use opus[1m] for the daemon") and negative cases
-("the opus result was good", "i think haiku would be cheaper",
-"whats the current model?") — all parsed correctly.
+Removed (overengineered, reverted):
+  - `parse_caliber_directive` function from caliber.py
+  - T-chat directive scanning block in tui.py
+  - `Daemon.update_caliber` mid-flight method
+  - `_pending_daemon_caliber` + apply-at-turn-boundary in
+    DaemonSession
+  - `--daemon-model` CLI flag
+  - daemon_model persistence in state.json
+  - --resume injection on streaming subprocess respawn (not
+    needed without mid-flight restart)
+  - First-turn-detection split (first-ever vs first-after-
+    restart)
 
-Mid-flight application is deferred. The streaming daemon
-subprocess bakes its caliber at spawn time; T-chat directives
-update `self.daemon_caliber` and the change applies on the
-NEXT goal session / daemon restart. Within the current goal,
-the daemon keeps its original caliber. Mid-flight per-turn
-caliber injection (via per-turn JSON input fields if Claude
-Code's streaming-json format supports it) is a future slice.
-
-Persistence: `state.json` grows `daemon_model` and
-`daemon_effort` keys in the `limits` namespace alongside
-`fast_mode`. Explicit CLI flags persist immediately;
-T-chat directives persist on each change. Loader prefers
-explicit-CLI over persisted (per-launch override).
-
-~280 LOC across caliber.py (directive parser) + daemon.py
-(caliber kwarg + subprocess command extension) + tui.py
-(field + CLI flags + persistence load/save + T-chat handler).
+Net delta: ~+374 / ~−306 across 3 files. Heavy add in tui.py
+(EffortPickerScreen + Limits panel restructure); heavy remove
+in caliber.py (directive parser).
 
 **Next session picks up at: open netrunner choice.**
   - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
     build-plan item 13's quota signal.
-  - Caliber Phase 5 (UI surfaces — sidebar daemon-caliber line,
-    pane caliber suffix, Limits-modal fields, watchdog Q&A
-    awareness) — ~150 LOC, no blockers.
+  - Caliber Phase 5 (UI surfaces — sidebar daemon caliber line,
+    pane caliber suffix on construct headers, watchdog Q&A
+    caliber awareness) — ~100 LOC, no blockers. Limits modal
+    already covers most of the original Phase 5 UI scope.
+  - Reuse `EffortPickerScreen` for manual-construct creation
+    modal when that lands (build plan item 0c overlap with
+    "Tools UI Thought of Dave").
   - First-run onboarding + preferences module (build-plan
     items 0a + 0b).
   - README restructure for public repo (build-plan item 0).

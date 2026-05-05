@@ -167,6 +167,13 @@ inference (netrunner blocked, latency-sensitive interactive
 work), say so in `chat` — the netrunner decides whether to lift
 the governor, you don't.
 
+NOTE on YOUR OWN caliber: your subprocess always runs at Opus
++ a netrunner-set effort level. You don't pick or adjust your
+own caliber — model is pinned (you're a manager, not a swappable
+agent), effort is the netrunner's power-level knob via the
+Limits modal. You DO pick caliber for CONSTRUCTS — that's the
+spawn-action surface above.
+
 CALIBER SELECTION (picking model + effort per spawn):
 The combined bundle is the construct's "caliber." Picking right is
 high-leverage — wrong picks either burn budget on cheap parallel
@@ -659,11 +666,13 @@ class Daemon:
             "--permission-mode", "acceptEdits",
         ]
         # Caliber Phase 3 (2026-05-04): apply daemon caliber to the
-        # subprocess command line. None falls through to Claude Code's
-        # runtime default; an explicit caliber emits --model + --effort.
-        # fast_mode in the caliber is ignored here — daemon never gets
-        # fast inference (it's a budget switch the netrunner controls;
-        # daemon's role is dispatch, not output throughput).
+        # subprocess command line. The daemon is always Opus per
+        # design (it's a manager — capability matters, model
+        # variability doesn't). Effort is the netrunner's power-
+        # level knob via Limits modal. None caliber falls through
+        # to Claude Code's runtime default. fast_mode is ignored
+        # here — that's a netrunner cost governor for constructs,
+        # not the daemon.
         if self.caliber is not None:
             cmd += self.caliber.to_claude_args()
 
