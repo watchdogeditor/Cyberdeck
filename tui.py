@@ -3299,6 +3299,8 @@ class CyberdeckApp(App):
         default_profile_name: Optional[str] = None,
         fast_mode: Optional[bool] = None,
         fast_mode_explicit: bool = False,
+        daemon_model: Optional[str] = None,
+        daemon_effort: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.tasks = tasks
@@ -3382,11 +3384,21 @@ class CyberdeckApp(App):
         try:
             from caliber import Caliber
             self.default_caliber: Optional[Caliber] = Caliber.default()
+            # Caliber Phase 3 (2026-05-04): the daemon's own model +
+            # effort. The daemon's job is decomposition + dispatch —
+            # benefits from strong reasoning but doesn't need
+            # max-effort. Default opus + high per the design doc;
+            # netrunner can override via CLI flags or T-chat
+            # directive ("switch daemon to sonnet medium" etc.).
+            self.daemon_caliber: Optional[Caliber] = Caliber(
+                model="opus", effort="high",
+            )
         except Exception:
             # caliber.py missing or broken — degrade gracefully.
             # Constructs spawn without --model/--effort and Claude
             # Code applies its own runtime default.
             self.default_caliber = None
+            self.daemon_caliber = None
         # Caliber Phase 2 (2026-05-04): fast_mode is a deck-wide cost
         # governor — netrunner-controlled, defaults OFF. The daemon
         # never picks fast_mode autonomously; it's a 6x-cost-for-2.5x-
@@ -3398,6 +3410,27 @@ class CyberdeckApp(App):
         # one-shot overrides usable.
         self.fast_mode: bool = bool(fast_mode) if fast_mode is not None else False
         self._fast_mode_explicit = fast_mode_explicit
+        # Caliber Phase 3 (2026-05-04): apply --daemon-model /
+        # --daemon-effort CLI overrides if passed. Either (or both)
+        # being non-None means the netrunner was explicit at this
+        # launch and the persisted-state path should defer to them.
+        self._daemon_caliber_explicit = (
+            daemon_model is not None or daemon_effort is not None
+        )
+        if (
+            self.daemon_caliber is not None
+            and self._daemon_caliber_explicit
+        ):
+            try:
+                from caliber import Caliber as _C
+                self.daemon_caliber = _C(
+                    model=daemon_model if daemon_model is not None
+                    else self.daemon_caliber.model,
+                    effort=daemon_effort if daemon_effort is not None
+                    else self.daemon_caliber.effort,
+                )
+            except Exception:
+                pass
         # Phase 7 of the unified-event-stream slice: per-launch log
         # files in `<deck source>/logs/` (operational artifacts, not
         # deck-content). Defaults to a `logs/` directory next to the
@@ -3681,6 +3714,34 @@ class CyberdeckApp(App):
                 save_limits(
                     self.home_dir / ".cyberdeck" / "state.json",
                     fast_mode=self.fast_mode,
+                )
+            # Caliber Phase 3 (2026-05-04): persisted daemon caliber
+            # from prior T-chat directives or --daemon-model /
+            # --daemon-effort flags. CLI-explicit (via the
+            # _daemon_caliber_explicit flag set during App
+            # construction) wins; persisted values fill in otherwise.
+            dm = persisted.get("daemon_model")
+            de = persisted.get("daemon_effort")
+            if (
+                self.daemon_caliber is not None
+                and not self._daemon_caliber_explicit
+                and (isinstance(dm, str) or isinstance(de, str))
+            ):
+                try:
+                    from caliber import Caliber as _C
+                    self.daemon_caliber = _C(
+                        model=dm if isinstance(dm, str)
+                        else self.daemon_caliber.model,
+                        effort=de if isinstance(de, str)
+                        else self.daemon_caliber.effort,
+                    )
+                except Exception:
+                    pass
+            if self._daemon_caliber_explicit and self.daemon_caliber:
+                save_limits(
+                    self.home_dir / ".cyberdeck" / "state.json",
+                    daemon_model=self.daemon_caliber.model,
+                    daemon_effort=self.daemon_caliber.effort,
                 )
         except Exception:
             # load_limits is already best-effort, but wrap one more
@@ -5557,6 +5618,12 @@ class CyberdeckApp(App):
             streaming_mode=self.streaming_mode,
             cwd=str(self.home_dir),
             system_prompt=system_prompt,
+            # Caliber Phase 3 (2026-05-04): apply the deck's
+            # daemon_caliber to the subprocess command line. This
+            # bakes at subprocess-start time — T-chat directives
+            # mutating self.daemon_caliber take effect on the NEXT
+            # daemon run / goal restart, not mid-flight.
+            caliber=self.daemon_caliber,
         )
         self.session = DaemonSession(
             daemon=self.daemon,
@@ -9328,6 +9395,75 @@ class CyberdeckApp(App):
         except Exception:
             pass
 
+        # Caliber Phase 3 (2026-05-04): scan the message for a
+        # caliber-shift directive. Recognized phrasings ("switch
+        # daemon to opus xhigh", "use sonnet", "drop to medium
+        # effort", etc.) update self.daemon_caliber and surface a
+        # chatlog notice. The change applies to the NEXT goal /
+        # daemon restart — the running streaming subprocess keeps
+        # its original caliber baked at spawn time. Mid-flight
+        # mid-turn application is a future slice (depends on
+        # whether Claude Code's streaming-json input format
+        # accepts per-turn effort/model overrides; not verified).
+        # The directive scanner runs BEFORE delivering to the
+        # daemon — directive-shaped messages don't get sent as
+        # ordinary chat (the netrunner's intent was control, not
+        # conversation).
+        try:
+            from caliber import parse_caliber_directive, Caliber
+            directive = parse_caliber_directive(message)
+        except Exception:
+            directive = None
+        if directive:
+            old = self.daemon_caliber
+            new_model = directive.get("model") or (
+                old.model if old else "sonnet"
+            )
+            new_effort = directive.get("effort") or (
+                old.effort if old else "high"
+            )
+            try:
+                self.daemon_caliber = Caliber(
+                    model=new_model,
+                    effort=new_effort,
+                )
+            except Exception:
+                pass
+            else:
+                # Persist + emit + chatlog. Persist via save_limits
+                # so the change survives restart.
+                try:
+                    save_limits(
+                        self.home_dir / ".cyberdeck" / "state.json",
+                        daemon_model=new_model,
+                        daemon_effort=new_effort,
+                    )
+                except Exception:
+                    pass
+                try:
+                    self.bus.publish(DeckEvent(
+                        kind="caliber.daemon_change",
+                        source="tui",
+                        severity="info",
+                        payload={
+                            "old": old.display() if old else None,
+                            "new": self.daemon_caliber.display(),
+                            "directive": message,
+                        },
+                    ))
+                except Exception:
+                    pass
+                old_disp = old.display() if old else "(none)"
+                self._chatlog_write(
+                    f"[yellow]daemon caliber:[/yellow] "
+                    f"{old_disp} → {self.daemon_caliber.display()} "
+                    f"[dim](applies on next goal / daemon "
+                    f"restart)[/dim]"
+                )
+                # Don't deliver the directive as chat — the netrunner
+                # was issuing a control command, not conversation.
+                return
+
         # Stash for next outcome turn delivery
         self.session.set_pending_netrunner_message(message)
 
@@ -9994,6 +10130,25 @@ if __name__ == "__main__":
              "persists the new value to state.json).",
     )
     parser.add_argument(
+        "--daemon-model",
+        type=str,
+        default=None,
+        help="Model the daemon's own subprocess runs at (default: opus). "
+             "The daemon does decomposition + dispatch — strong reasoning "
+             "helps. Valid: haiku / sonnet / opus / opus[4.6] / sonnet[1m] "
+             "/ opus[1m]. Persisted to state.json; T-chat directives "
+             "(\"switch daemon to sonnet medium\") override at runtime.",
+    )
+    parser.add_argument(
+        "--daemon-effort",
+        type=str,
+        default=None,
+        help="Effort the daemon's subprocess runs at (default: high). "
+             "Valid: low / medium / high / xhigh / max. xhigh is Opus "
+             "4.7-only; max is Sonnet 4.6 / Opus 4.6 / Opus 4.7 only. "
+             "Persisted to state.json.",
+    )
+    parser.add_argument(
         "--no-pool",
         action="store_true",
         help="Disable the session pool. Without the pool, every construct "
@@ -10040,6 +10195,8 @@ if __name__ == "__main__":
         pool_size=args.pool_size,
         fast_mode=args.fast_mode,
         fast_mode_explicit=(args.fast_mode is not None),
+        daemon_model=args.daemon_model,
+        daemon_effort=args.daemon_effort,
         home_dir=home_dir,
         profiles_dir=(
             Path(args.profiles_dir).expanduser()

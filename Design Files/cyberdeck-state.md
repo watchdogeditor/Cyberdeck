@@ -630,9 +630,53 @@ Real-deck verified 2026-05-04:
 
 ~120 LOC across 4 modules.
 
+**✅ CALIBER PHASE 3 SHIPPED 2026-05-04** (uncommitted as of this
+state.md update). Daemon-process caliber + T-chat directive
+override.
+
+`Daemon` class accepts `caliber` kwarg; subprocess command
+builders (both streaming + one-shot paths) append
+`caliber.to_claude_args()`. App grows `daemon_caliber` field,
+default opus+high per the design (daemon does decomposition +
+dispatch, benefits from strong reasoning). fast_mode is NOT
+honored on the daemon caliber — that's a netrunner cost
+governor; daemon is dispatch-shaped work where speed-vs-cost
+isn't relevant.
+
+Override paths:
+  - CLI flags `--daemon-model` / `--daemon-effort`
+  - T-chat directive parsing (`parse_caliber_directive` in
+    caliber.py): regex-based, narrow grammar designed to avoid
+    false positives. Verb gate (switch/use/drop to/go to/set/
+    run/put) plus model and/or effort match. Bracket-suffix
+    aliases survive (`opus[4.6]`, `sonnet[1m]`). Effort match
+    requires either the word "effort", a directive preposition,
+    or adjacency to a matched model.
+
+Tested grammar coverage: positive cases like "switch daemon
+to opus xhigh", "set daemon caliber to opus[4.6] high",
+"put the daemon on haiku low" all parse correctly; negative
+cases like "the opus result was good", "i think haiku would
+be cheaper" return None.
+
+Application timing: T-chat directives apply to the NEXT goal
+/ daemon restart. The streaming daemon subprocess bakes its
+caliber at spawn time; mid-turn caliber injection is deferred
+(would require per-turn override fields in Claude Code's
+streaming-json input format; unverified).
+
+Persistence: `state.json` grows `daemon_model` + `daemon_effort`
+in the `limits` namespace. Explicit CLI flags persist
+immediately; T-chat directives persist on each change.
+
+~280 LOC across caliber.py + daemon.py + tui.py.
+
 **Next session picks up at: open netrunner choice.**
-  - Caliber Phase 3 (daemon-process caliber + T-chat directive
-    override)
+  - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
+    build-plan item 13.
+  - Caliber Phase 5 (UI surfaces — sidebar daemon-caliber line,
+    pane caliber suffix, Limits-modal fields, watchdog Q&A
+    awareness) — ~150 LOC, no blockers.
   - First-run onboarding + preferences module (build-plan
     items 0a + 0b)
   - README restructure for public repo (build-plan item 0)

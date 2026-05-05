@@ -32,9 +32,15 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, TYPE_CHECKING
 
 from construct import Construct
+
+if TYPE_CHECKING:
+    # Caliber: daemon-process model + effort bundle (Phase 3 of the
+    # caliber slice, 2026-05-04). TYPE_CHECKING-only so caliber.py
+    # stays an optional dep for non-TUI runs.
+    from caliber import Caliber
 
 
 DAEMON_SYSTEM_PROMPT = """\
@@ -329,6 +335,7 @@ class Daemon:
         system_prompt: str = DAEMON_SYSTEM_PROMPT,
         streaming_mode: bool = True,
         first_turn_timeout: float = 120.0,
+        caliber: Optional["Caliber"] = None,
     ) -> None:
         self.id = f"dm-{uuid.uuid4().hex[:8]}"
         self.claude_bin = claude_bin
@@ -336,6 +343,17 @@ class Daemon:
         self.system_prompt = system_prompt
         self.streaming_mode = streaming_mode
         self.first_turn_timeout = first_turn_timeout
+        # Caliber Phase 3 (2026-05-04): the model + effort bundle
+        # the daemon's own subprocess runs at. The daemon does
+        # decomposition + dispatch — strong reasoning helps but
+        # max-effort is overkill. Design default is opus + high.
+        # Threaded through to the daemon's `claude` command line
+        # via --model + --effort flags. None means "Claude Code's
+        # runtime default" (sonnet+high as of this writing).
+        # fast_mode is intentionally NOT honored on the daemon
+        # caliber — fast_mode is a netrunner-controlled cost
+        # governor, not a routing decision (see Phase 2 reframe).
+        self.caliber = caliber
 
         self.state = DaemonState.IDLE
         self._started_at: Optional[float] = None
@@ -457,6 +475,13 @@ class Daemon:
             tools=[],  # daemon reasons, doesn't execute
             cwd=self.cwd,
             extra_args=extra_args,
+            # Caliber Phase 3 (2026-05-04): daemon turns inherit the
+            # daemon's configured caliber. One-shot mode spawns a
+            # fresh subprocess per turn so the caliber can shift on
+            # the next turn if mutated mid-session (T-chat directive).
+            # Streaming mode bakes caliber at subprocess-start time,
+            # so changes apply to the next goal/restart.
+            caliber=self.caliber,
         )
         self._current_construct = construct
 
@@ -633,6 +658,14 @@ class Daemon:
             "--verbose",
             "--permission-mode", "acceptEdits",
         ]
+        # Caliber Phase 3 (2026-05-04): apply daemon caliber to the
+        # subprocess command line. None falls through to Claude Code's
+        # runtime default; an explicit caliber emits --model + --effort.
+        # fast_mode in the caliber is ignored here — daemon never gets
+        # fast inference (it's a budget switch the netrunner controls;
+        # daemon's role is dispatch, not output throughput).
+        if self.caliber is not None:
+            cmd += self.caliber.to_claude_args()
 
         self._streaming_proc = await asyncio.create_subprocess_exec(
             *cmd,

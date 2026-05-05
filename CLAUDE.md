@@ -642,10 +642,74 @@ Real-deck verified 2026-05-04:
 ~120 LOC across 4 modules (caliber.py untouched; threading +
 pool gating + settings extension).
 
-**Next session picks up at: open netrunner choice.** Several
-queued items, no single forced direction:
-  - Caliber Phase 3 (daemon-process caliber + override via
-    `T` chat directives) — ~150 LOC.
+**✅ CALIBER PHASE 3 SHIPPED 2026-05-04** (uncommitted as of this
+CLAUDE.md update). Daemon-process caliber + T-chat directive
+override.
+
+`Daemon` class grows a `caliber: Optional[Caliber]` kwarg.
+Subprocess command builders (both streaming and one-shot paths)
+append `caliber.to_claude_args()` so the daemon's `claude`
+process runs at the configured model + effort. fast_mode is
+NOT honored on the daemon caliber — the daemon is dispatch-
+shaped work; speed-vs-cost trade is for constructs running
+under the netrunner's cost governor.
+
+`App.daemon_caliber: Optional[Caliber]` defaults to opus+high
+per the design doc (the daemon does decomposition + dispatch,
+benefits from strong reasoning). Configurable via:
+- CLI flags `--daemon-model` / `--daemon-effort` (each
+  optional; explicit value persists to state.json's limits
+  namespace)
+- T-chat directive parsing (`parse_caliber_directive` in
+  caliber.py): recognized phrasings update `App.daemon_caliber`
+  + persist + emit `caliber.daemon_change` bus event + chatlog
+  notice ("daemon caliber: opus·high → sonnet·medium · applies
+  on next goal / daemon restart")
+
+Directive grammar (deliberately narrow — wide regex up front
+catches too many false positives):
+  - Verb gate: at least one of `switch / use / drop to / go to
+    / set / run / put` must appear
+  - Model match: `\b(haiku|sonnet|opus)(\[suffix\])?\b` (with
+    bracket-suffix path tried first so `opus[4.6]` survives)
+  - Effort match: any of `low / medium / high / xhigh / max`
+    PLUS one of:
+      - `effort` word follows ("medium effort")
+      - directive cue (preposition / verb) immediately precedes
+      - the matched model is adjacent (e.g. "opus xhigh")
+  - At least one of (model, effort) must match for the
+    directive to fire
+
+Tested across positive cases ("switch daemon to opus xhigh",
+"set daemon caliber to opus[4.6] high", "put the daemon on
+haiku low", "use opus[1m] for the daemon") and negative cases
+("the opus result was good", "i think haiku would be cheaper",
+"whats the current model?") — all parsed correctly.
+
+Mid-flight application is deferred. The streaming daemon
+subprocess bakes its caliber at spawn time; T-chat directives
+update `self.daemon_caliber` and the change applies on the
+NEXT goal session / daemon restart. Within the current goal,
+the daemon keeps its original caliber. Mid-flight per-turn
+caliber injection (via per-turn JSON input fields if Claude
+Code's streaming-json format supports it) is a future slice.
+
+Persistence: `state.json` grows `daemon_model` and
+`daemon_effort` keys in the `limits` namespace alongside
+`fast_mode`. Explicit CLI flags persist immediately;
+T-chat directives persist on each change. Loader prefers
+explicit-CLI over persisted (per-launch override).
+
+~280 LOC across caliber.py (directive parser) + daemon.py
+(caliber kwarg + subprocess command extension) + tui.py
+(field + CLI flags + persistence load/save + T-chat handler).
+
+**Next session picks up at: open netrunner choice.**
+  - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
+    build-plan item 13's quota signal.
+  - Caliber Phase 5 (UI surfaces — sidebar daemon-caliber line,
+    pane caliber suffix, Limits-modal fields, watchdog Q&A
+    awareness) — ~150 LOC, no blockers.
   - First-run onboarding + preferences module (build-plan
     items 0a + 0b).
   - README restructure for public repo (build-plan item 0).

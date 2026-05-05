@@ -56,6 +56,7 @@ fleet/daemon/TUI; pure dataclass.
 """
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
@@ -322,6 +323,113 @@ class Caliber:
         if self.fast_mode:
             base += "·fast"
         return base
+
+
+def parse_caliber_directive(text: str) -> Optional[dict]:
+    """Detect a caliber-shift directive in netrunner free-text (T-chat).
+
+    Returns a dict with `model` and/or `effort` keys when the message
+    looks like an explicit caliber directive. Returns None when the
+    message doesn't match any known directive pattern — caller treats
+    it as ordinary chat content.
+
+    The matching is intentionally narrow:
+      - Phrases must mention "switch", "use", "drop to", "go to",
+        "set" + "daemon" or just the bare model/effort with explicit
+        verbs. Naked `opus` in a sentence shouldn't trigger.
+      - Both an explicit model and effort can appear in one phrase
+        ("switch the daemon to opus xhigh").
+      - At least one of (model, effort) must be present and recognized.
+
+    Examples that match:
+      "switch the daemon to opus"           → {"model": "opus"}
+      "use sonnet for the daemon"           → {"model": "sonnet"}
+      "drop to medium effort"               → {"effort": "medium"}
+      "switch daemon to opus xhigh"         → {"model": "opus",
+                                              "effort": "xhigh"}
+      "set daemon caliber to opus[4.6] high" → {"model": "opus[4.6]",
+                                                "effort": "high"}
+
+    Examples that DON'T match (return None):
+      "the opus result was good"             → too oblique
+      "i think haiku would be cheaper"       → no directive verb
+      "what's the current model?"            → it's a question
+
+    Phase 3 of the caliber slice (2026-05-04). Built deliberately
+    simple — if the netrunner reaches for grammar this misses,
+    we'll grow it. A wide regex up front would catch too many
+    false positives.
+    """
+    if not text:
+        return None
+    lowered = text.strip().lower()
+
+    # Verb gate: at least one of these tokens must appear, ANCHORED
+    # to a directive intent. "switch / use / drop to / go to / set"
+    # plus "daemon" or "caliber" or "effort" / "model" as the noun.
+    verb_pattern = re.compile(
+        r"\b(?:switch|use|drop\s+to|go\s+to|set|run|put)\b",
+    )
+    if not verb_pattern.search(lowered):
+        return None
+
+    result: dict = {}
+
+    # Model match: try the bracket-suffix form first (e.g.
+    # `opus[4.6]`, `sonnet[1m]`). Falls through to the bare-alias
+    # form if no bracket suffix is present. The trailing `\b` was
+    # dropped because `]` + space isn't a word boundary, so a single
+    # combined regex with an optional bracket group + trailing `\b`
+    # silently dropped the suffix.
+    bracketed_model = re.search(
+        r"\b(haiku|sonnet|opus)(\[[^\]]+\])(?=\s|$|[.,!?;])",
+        lowered,
+    )
+    if bracketed_model:
+        result["model"] = bracketed_model.group(1) + bracketed_model.group(2)
+        model_match_end = bracketed_model.end()
+    else:
+        bare_model = re.search(
+            r"\b(haiku|sonnet|opus)\b",
+            lowered,
+        )
+        if bare_model:
+            result["model"] = bare_model.group(1)
+            model_match_end = bare_model.end()
+        else:
+            model_match_end = -1
+
+    # Effort match. Two valid shapes:
+    #   (a) "X effort" — explicit suffix word
+    #   (b) directive cue (preposition / verb) just before X
+    #   (c) X immediately follows the matched model (e.g.
+    #       "opus xhigh") — once we've seen a model in directive
+    #       context, an adjacent effort token is implicitly part of
+    #       the same directive.
+    effort_pattern = re.compile(
+        r"\b(low|medium|high|xhigh|max)(\s+effort)?\b"
+    )
+    for effort_match in effort_pattern.finditer(lowered):
+        candidate = effort_match.group(1)
+        has_effort_word = effort_match.group(2) is not None
+        # Check the ~25 chars before the match for a directive cue.
+        before = lowered[max(0, effort_match.start() - 25):
+                          effort_match.start()]
+        directive_cues = re.compile(
+            r"\b(?:to|at|in|run|use|switch|drop|set|put)\b\s*$"
+        )
+        cue_present = directive_cues.search(before) is not None
+        # Adjacent to the matched model: the effort token starts
+        # within ~3 chars (whitespace) of where the model ended.
+        adjacent_to_model = (
+            model_match_end >= 0
+            and 0 < effort_match.start() - model_match_end <= 3
+        )
+        if has_effort_word or cue_present or adjacent_to_model:
+            result["effort"] = candidate
+            break
+
+    return result if result else None
 
 
 def caliber_from_dict(raw: Optional[dict]) -> Optional[Caliber]:
