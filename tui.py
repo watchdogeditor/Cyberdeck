@@ -10615,6 +10615,25 @@ if __name__ == "__main__":
              "Applies on next goal start.",
     )
     parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run the prerequisite check and exit. Reports Python "
+             "version, textual + mss library presence, claude CLI on "
+             "PATH, and `claude --version` health. Use to diagnose a "
+             "fresh install or after an upgrade. The check also runs "
+             "automatically on first launch + on detected failure; "
+             "this flag re-runs on demand.",
+    )
+    parser.add_argument(
+        "--no-doctor",
+        action="store_true",
+        help="Skip the prerequisite check entirely. Escape hatch for "
+             "environments where the probe itself is broken (e.g., "
+             "claude binary present but rejects --version on stdin "
+             "in a way the doctor misreads). Most netrunners should "
+             "leave this off.",
+    )
+    parser.add_argument(
         "--no-pool",
         action="store_true",
         help="Disable the session pool. Without the pool, every construct "
@@ -10640,6 +10659,55 @@ if __name__ == "__main__":
     # Resolve the home dir first — _resolve_home_dir creates the dir
     # if missing so subsequent writes can assume it's there.
     home_dir = _resolve_home_dir(args.home)
+
+    # Build-plan item 0a: first-run prerequisite check. Runs BEFORE
+    # the TUI mounts so a missing Python/textual/claude binary
+    # produces a clean error message + exit instead of an opaque
+    # crash deep in async setup.
+    #
+    # Display rules:
+    #   --doctor flag: always show, then exit (don't launch TUI)
+    #   --no-doctor flag: skip entirely
+    #   first run (no sentinel): always show
+    #   subsequent runs: show ONLY on FAIL (silent on PASS/WARN)
+    #
+    # On FAIL: print report, exit(1) before TUI construction.
+    # On PASS: write the sentinel so subsequent runs stay quiet.
+    # WARN doesn't block — the netrunner sees it once, then the
+    # next launch is silent (mss missing → screenshot plugin
+    # unavailable, but the deck still runs).
+    if not args.no_doctor:
+        from doctor import (
+            run_checks, format_report, has_failure, has_warning,
+            is_first_run, mark_first_run_complete,
+        )
+        results = run_checks(claude_bin=args.claude_bin)
+        force_show = args.doctor or is_first_run(home_dir)
+        failed = has_failure(results)
+        if force_show or failed:
+            # Color only when stdout is a TTY (skip in CI / piped)
+            color = sys.stdout.isatty()
+            print(format_report(results, color=color))
+            print()
+        if args.doctor:
+            # --doctor flag: print report and exit cleanly.
+            # Exit 0 if no FAIL; exit 1 if FAIL so the netrunner
+            # can use it in scripts (`python tui.py --doctor &&
+            # python tui.py --goal ...`).
+            sys.exit(1 if failed else 0)
+        if failed:
+            print(
+                "cyberdeck: hard prerequisites failed. Fix the "
+                "FAIL items above and re-run.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # PASS (and WARN-only) → mark first-run done so future
+        # launches stay quiet. Best-effort (mark function swallows
+        # OSError); a write failure just means the diagnostics
+        # show again next launch.
+        mark_first_run_complete(home_dir)
+
     # Phase 7: log directory defaults to <deck source>/logs/ inside
     # CyberdeckApp.__init__ when log_dir is None. Explicit
     # --log-dir / CYBERDECK_LOG_DIR overrides for testing or
