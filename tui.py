@@ -288,6 +288,26 @@ class PluginListItem(ListItem):
         self.plugin = plugin
 
 
+class ToolListItem(ListItem):
+    """A focusable row in the unified Tools tab for a registry-backed
+    binary or script tool. Tools-UI Thought of Dave (build-plan item
+    0c) shipped 2026-05-04: wires space-launch and z-info on these
+    rows.
+
+    Pre-0c the tool rows were bare ListItem(Label(...)) with `.tool`
+    set as an arbitrary attribute. Promoting to a real class makes
+    `isinstance` dispatch in action_primary / action_expand work
+    cleanly — same pattern as PluginListItem and FileListItem.
+
+    Stashes the Tool dataclass so launch/info modals can read
+    name + description + command + path + availability without a
+    registry round-trip."""
+
+    def __init__(self, tool, label_markup: str) -> None:
+        super().__init__(Label(label_markup, markup=True))
+        self.tool = tool
+
+
 class ScriptListItem(ListItem):
     """A focusable row in the Tools tab's Scripts section. Each script
     lives at <home>/tools/<category>/<filename> and is invokable by
@@ -4501,9 +4521,11 @@ class CyberdeckApp(App):
             f"{avail_marker} "
             f"[{name_color}]{tool.name}[/{name_color}]"
         )
-        item = ListItem(Label(label_markup, markup=True))
-        item.tool = tool  # type: ignore[attr-defined]
-        list_view.append(item)
+        # Tools-UI Thought of Dave (build-plan 0c): use ToolListItem
+        # so action_primary / action_expand can isinstance-dispatch
+        # cleanly. Tool object stashed on .tool for downstream
+        # readers (launch modal, info modal).
+        list_view.append(ToolListItem(tool, label_markup))
 
     def _append_plugin_row(
         self, list_view: "ListView", pl,
@@ -8021,6 +8043,54 @@ class CyberdeckApp(App):
                     ),
                 )
                 return
+            if isinstance(highlighted, ToolListItem):
+                # Tools-UI Thought of Dave (build-plan 0c): space on a
+                # tool row → spawn-targeting NewConstructScreen with
+                # the tool name pre-set in the task body via the
+                # TOOL: envelope. The construct gets a "you should use
+                # <tool>" steering hint by default; netrunner edits
+                # the task before submitting.
+                tool = highlighted.tool
+                avail_note = (
+                    "" if tool.available
+                    else " [red](unavailable)[/red]"
+                )
+                self.push_screen(
+                    LaunchScreen(
+                        header_markup="Launch with tool",
+                        context_markup=(
+                            f"[cyan]{tool.name}[/cyan]  "
+                            f"[dim]({tool.kind}: {tool.command})[/dim]"
+                            f"{avail_note}"
+                        ),
+                    ),
+                    self._make_launch_handler(tool=tool),
+                )
+                return
+            if isinstance(highlighted, PluginListItem):
+                # Tools-UI Thought of Dave (build-plan 0c): space on a
+                # plugin row → spawn-targeting NewConstructScreen with
+                # the plugin pre-selected (passed as `plugins=[name]`
+                # to fleet.spawn so the per-spawn addendum renders
+                # ONLY this plugin, not the full registry).
+                pl = highlighted.plugin
+                avail_note = (
+                    "" if pl.available
+                    else f" [red](unavailable: "
+                    f"{pl.unavailable_reason})[/red]"
+                )
+                self.push_screen(
+                    LaunchScreen(
+                        header_markup="Launch with plugin",
+                        context_markup=(
+                            f"[cyan]{pl.name}[/cyan]  "
+                            f"[dim]({pl.category})[/dim]"
+                            f"{avail_note}"
+                        ),
+                    ),
+                    self._make_launch_handler(plugin=pl),
+                )
+                return
             # Other ListView (none today) — no-op.
             return
         # No primary action defined for whatever is focused.
@@ -8042,6 +8112,8 @@ class CyberdeckApp(App):
         *,
         profile=None,
         file_path: Optional[str] = None,
+        tool=None,
+        plugin=None,
     ):
         """Build a callback for LaunchScreen.dismiss() that knows how
         to compose the spawn for the given context.
@@ -8050,10 +8122,17 @@ class CyberdeckApp(App):
         - file_path=<str>: spawn with the active default profile,
           task wrapped in the FILE: envelope so the construct's
           initial prompt makes the file context explicit.
-        - Both: profile takes precedence on profile selection; file
-          envelope still applies to the task. (Today we don't push
-          this combination from anywhere — list items are
-          single-context — but the helper handles it cleanly.)
+        - tool=<Tool>: spawn with a TOOL: envelope (build-plan 0c).
+          The construct's initial prompt names the tool +
+          description so the model knows what to reach for first.
+          Tool-launched spawns surface all available plugins via
+          plugins=None (same as other netrunner-direct spawns).
+        - plugin=<Plugin>: spawn with a PLUGIN: envelope. The
+          per-spawn addendum scopes to ONLY this plugin (passed
+          as plugins=[plugin.name] to fleet.spawn) so the construct
+          sees just the relevant capability, not the full registry.
+        - Multiple contexts: not currently combined from any list
+          item, but the helper handles each independently.
 
         Returning a closure keeps the spawn logic out of the modal
         itself (the modal only collects a string). The closure
@@ -8068,23 +8147,55 @@ class CyberdeckApp(App):
                     "[dim]no active fleet (set a goal first?)[/dim]"
                 )
                 return
-            # Compose the final task. File context goes in front of
-            # the user's input as a one-shot framing line — the
-            # construct sees it as part of the initial prompt and
-            # treats the file as a primary input.
+            # Compose the final task. File / tool / plugin contexts
+            # go in front of the user's input as one-shot framing
+            # lines — the construct sees them as part of the initial
+            # prompt and treats the named context as primary input.
             final_task = task
             if file_path:
                 final_task = f"FILE: {file_path}\n\n{task}"
+            elif tool is not None:
+                # Construct sees: "TOOL: <name> — <description>".
+                # The name is the registry key (what the construct
+                # invokes); the description is the tool's one-line
+                # blurb so the model has the context at the top of
+                # its prompt. Construct can run `<command> --help`
+                # for the full interface.
+                final_task = (
+                    f"TOOL: {tool.name} — {tool.description}\n"
+                    f"command: {tool.command}\n\n{task}"
+                )
+            elif plugin is not None:
+                # Construct sees plugin name + the bridge invocation
+                # pattern. The per-spawn addendum (rendered below
+                # via plugins=[plugin.name]) carries the full
+                # plugin metadata + bridge usage example.
+                final_task = (
+                    f"PLUGIN: {plugin.name} — {plugin.description}"
+                    f"\n\n{task}"
+                )
             # Profile picks: explicit (from list item) > default.
             spawn_profile = profile if profile is not None else self.default_profile
+            # Plugins selection: when launching with a plugin, scope
+            # the per-spawn addendum to ONLY that plugin (the netrunner
+            # picked it deliberately; surfacing the full registry
+            # would dilute focus). Otherwise None = all available.
+            spawn_plugins = (
+                [plugin.name] if plugin is not None else None
+            )
             # Fleet log status line so the netrunner sees the spawn
             # ack — same shape as _handle_new_task (the n-key path).
             preview = task[:24] + ("..." if len(task) > 24 else "")
-            origin_label = (
-                f"profile={profile.name}" if profile is not None
-                else f"file={file_path}" if file_path
-                else "n-key"
-            )
+            if profile is not None:
+                origin_label = f"profile={profile.name}"
+            elif file_path:
+                origin_label = f"file={file_path}"
+            elif tool is not None:
+                origin_label = f"tool={tool.name}"
+            elif plugin is not None:
+                origin_label = f"plugin={plugin.name}"
+            else:
+                origin_label = "n-key"
             self._notify_fleet_log(
                 f"[bright_blue]⟳[/bright_blue] launch ({origin_label}): {preview}"
             )
@@ -8098,19 +8209,19 @@ class CyberdeckApp(App):
                     final_task,
                     profile=spawn_profile,
                     origin="netrunner",
+                    plugins=spawn_plugins,
                     # P4 retool: render per-spawn addendum (profile.tools
-                    # resolved + all available plugins) for this
-                    # netrunner-direct spawn. plugins=None means
-                    # "surface all available" — netrunner-direct
-                    # spawns don't go through daemon's per-spawn
-                    # plugin selection.
+                    # resolved + plugins). plugins=spawn_plugins means
+                    # "surface only the daemon-selected (or netrunner-
+                    # picked) plugin". None falls through to all
+                    # available — same as the n-key / file-launch path.
                     per_spawn_addendum=self._build_per_spawn_addendum(
-                        spawn_profile, None,
+                        spawn_profile, spawn_plugins,
                     ),
                     # Caliber Phase 1: netrunner-direct spawn — use
                     # deck default. Future: a launch-modal field for
-                    # one-off caliber overrides on file-launched
-                    # constructs.
+                    # one-off caliber overrides (the new EffortPicker-
+                    # Screen is designed to be reused here).
                     caliber=self.default_caliber,
                 ),
                 name="spawn",
@@ -8239,6 +8350,41 @@ class CyberdeckApp(App):
                     highlighted.script_path, title=title,
                 )
                 return
+            if isinstance(highlighted, ToolListItem):
+                # Tools-UI Thought of Dave (build-plan 0c): z on a
+                # tool row → info modal showing manifest fields +
+                # availability. Tools aren't file-backed (they're
+                # entries in tools.toml), so we synthesize text
+                # rather than opening a file. The full registry
+                # entry is in <home>/tools/tools.toml; netrunner
+                # can navigate there if they want the raw source.
+                self._open_text_view(
+                    title=f"Tool: {highlighted.tool.name}",
+                    text=self._render_tool_info(highlighted.tool),
+                )
+                return
+            if isinstance(highlighted, PluginListItem):
+                # Tools-UI Thought of Dave (build-plan 0c): z on a
+                # plugin row → info modal with manifest + README.
+                # README is the LLM-facing interface doc; netrunner
+                # reads it for invocation details. When no README,
+                # falls back to manifest-only synthesis.
+                pl = highlighted.plugin
+                readme_path = (
+                    pl.source_dir / "README.md"
+                    if pl.source_dir is not None else None
+                )
+                if readme_path and readme_path.is_file():
+                    self._open_file_view(
+                        str(readme_path),
+                        title=f"Plugin: {pl.category}/{pl.name}",
+                    )
+                else:
+                    self._open_text_view(
+                        title=f"Plugin: {pl.category}/{pl.name}",
+                        text=self._render_plugin_info(pl),
+                    )
+                return
             return  # ListView with non-viewable item → no-op
 
     def action_copy_focused(self) -> None:
@@ -8329,6 +8475,73 @@ class CyberdeckApp(App):
             snapshot_lines=lines,
             source_widget_id=None,
         ))
+
+    def _render_tool_info(self, tool) -> str:
+        """Synthesize an info-view text for a registry-backed tool.
+        Tools-UI Thought of Dave (build-plan 0c). Tools live in
+        tools.toml so they're not file-backed individually; this
+        renders the dataclass fields as a readable info page.
+
+        Format mirrors what a netrunner would see if they read
+        tools.toml directly, plus an availability summary the
+        registry computed at scan time."""
+        avail = (
+            "[green]available[/green]" if tool.available
+            else f"[red]unavailable[/red] · {tool.unavailable_reason}"
+        )
+        lines: list[str] = [
+            f"[b]{tool.name}[/b]  [dim]({tool.kind})[/dim]",
+            f"status:  {avail}",
+            f"command: {tool.command}",
+        ]
+        if tool.path:
+            lines.append(f"path:    {tool.path}")
+        lines.append("")
+        lines.append("[b]description[/b]")
+        # description is a single line in the registry; render verbatim.
+        lines.append(tool.description or "(no description)")
+        if tool.help_text:
+            lines.append("")
+            lines.append("[b]help[/b]")
+            lines.extend(tool.help_text.splitlines())
+        lines.append("")
+        lines.append("[dim]Edit ~/tools/tools.toml to modify this "
+                     "tool. Press Esc to close.[/dim]")
+        return "\n".join(lines)
+
+    def _render_plugin_info(self, plugin) -> str:
+        """Synthesize an info-view text for a plugin without a
+        README.md. Tools-UI Thought of Dave (build-plan 0c).
+        Mirrors _render_tool_info's shape so the modal layouts
+        match across kinds. When the plugin DOES have a README,
+        the file path opens directly (better view fidelity for
+        markdown — the modal's syntax highlighting handles it)."""
+        avail = (
+            "[green]available[/green]" if plugin.available
+            else f"[red]unavailable[/red] · {plugin.unavailable_reason}"
+        )
+        lines: list[str] = [
+            f"[b]{plugin.name}[/b]  [dim]({plugin.category})[/dim]",
+            f"status:  {avail}",
+        ]
+        if plugin.source_dir is not None:
+            lines.append(f"path:    {plugin.source_dir}")
+        lines.append(f"entry:   {plugin.entry}")
+        if plugin.requires_platforms:
+            lines.append(
+                f"platforms: {', '.join(plugin.requires_platforms)}"
+            )
+        if plugin.requires_python_imports:
+            lines.append(
+                f"requires: {', '.join(plugin.requires_python_imports)}"
+            )
+        lines.append("")
+        lines.append("[b]description[/b]")
+        lines.append(plugin.description or "(no description)")
+        lines.append("")
+        lines.append("[dim](no README.md found at the plugin's source "
+                     "dir; shown synthesized info instead.)[/dim]")
+        return "\n".join(lines)
 
     @staticmethod
     def _load_file_lines(path: str) -> list:
