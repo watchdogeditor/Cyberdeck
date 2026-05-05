@@ -708,24 +708,79 @@ Net delta: ~+374 / ~−306 across 3 files. Heavy add in tui.py
 (EffortPickerScreen + Limits panel restructure); heavy remove
 in caliber.py (directive parser).
 
+**✅ CALIBER PHASE 5 SHIPPED 2026-05-04** (uncommitted as of this
+CLAUDE.md update). UI surfaces — sidebar daemon line + per-pane
+caliber suffix + watchdog Q&A awareness. Caliber slice now 4/5
+shipped (Phase 4 still blocked on quota signal).
+  - Sidebar daemon line: `daemon: opus·high` (plus `· fast`
+    when governor on)
+  - Construct pane caliber suffix: dim cyan `· sonnet·high`
+    after [STATE]/[profile] badges, threaded from spawned
+    event payload's `caliber` field
+  - Watchdog Q&A system prompt grew CALIBER AWARENESS section
+  ~80 LOC across tui.py + watchdog.py.
+
+**✅ TOOLS-UI THOUGHT OF DAVE SHIPPED 2026-05-04** (sub-features
+1+2; sub-feature 3 deferred). Build-plan item 0c.
+  1. **space-launch**: space on tool/plugin row → LaunchScreen
+     with TOOL: / PLUGIN: envelope. Plugin path passes
+     spawn_plugins=[name] so per-spawn addendum scopes to ONLY
+     the picked plugin.
+  2. **z-info**: z on tool row → synthesized info modal
+     (manifest + availability); z on plugin row → README.md
+     view (or synthesized fallback).
+  3. **H haiku research sidebar (DEFERRED)**: needs subprocess
+     management + streaming inline render; bigger lift, filed
+     as follow-up.
+  Plus new `ToolListItem` class (mirrors PluginListItem) for
+  isinstance() dispatch. ~260 LOC.
+
+**✅ README RESTRUCTURE SHIPPED 2026-05-04** (build-plan item 0).
+Public-repo cold-reader rewrite. Pitch + status callout above
+the fold; expanded prerequisites section; Architecture covers
+four runtime entities + spine + brake + mechanic; Design canon
+section reframes Documentation list with "what to read first"
+hints; new Status section (active solo dev, Windows-first,
+breaking changes likely, no release cadence, no telemetry); new
+License + contributing section. Original philosophy + what-this-
+is-not + aesthetic preserved verbatim.
+
+**✅ DOCTOR.PY SHIPPED 2026-05-04** (build-plan item 0a). New
+`doctor.py` module + wire-up in tui.py __main__ block. Five
+prereq checks (python ≥3.11, textual, mss, claude binary,
+claude --version) with PASS/WARN/FAIL + remediation hints.
+DETECT + SUGGEST, not AUTO-INSTALL. Sentinel at
+`<home>/.cyberdeck/first_run_complete`; silent on subsequent
+runs unless FAIL or `--doctor` flag. `--no-doctor` escape
+hatch. ASCII-only output (Windows cp1252 stdout encoding).
+claude_bin check has fallback for development mocks
+(CLAUDE_BIN=./mock_claude.py passes via Path.is_file()). ~280
+LOC.
+
+**✅ PREFERENCES.PY SHIPPED 2026-05-04** (build-plan item 0b).
+New thin wrapper module — single import surface for all
+persistent deck settings. Typed properties (`prefs.fast_mode`,
+`prefs.daemon_effort`, `prefs.brake`, etc.) with default
+fallbacks; `save(**kwargs)` writes deltas through to
+brake_state.save_limits. Schema documented in module docstring
+with future placeholder fields commented (theme,
+default_profile, keybind_overrides, agent_defaults,
+last_session_id for the morgue). NO caller migration in this
+commit — existing brake_state.load_limits / save_limits stay
+for backward compat; new code reaches for Preferences. ~210 LOC.
+
 **Next session picks up at: open netrunner choice.**
   - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
     build-plan item 13's quota signal.
-  - Caliber Phase 5 (UI surfaces — sidebar daemon caliber line,
-    pane caliber suffix on construct headers, watchdog Q&A
-    caliber awareness) — ~100 LOC, no blockers. Limits modal
-    already covers most of the original Phase 5 UI scope.
-  - Reuse `EffortPickerScreen` for manual-construct creation
-    modal when that lands (build plan item 0c overlap with
-    "Tools UI Thought of Dave").
-  - First-run onboarding + preferences module (build-plan
-    items 0a + 0b).
-  - README restructure for public repo (build-plan item 0).
-  - Tools-UI Thought of Dave (build-plan item 0c) — space-
-    launch + z-info + H-haiku-research.
-  - Mechanic v0→v1 bridge (liveness heartbeat).
+  - Tools-UI sub-feature 3 (H haiku research sidebar) — needs
+    subprocess + streaming render; bigger lift.
+  - Mechanic v0→v1 bridge (liveness heartbeat + LLM session
+    half) — bigger lift, defer until pre-1.0.
+  - Migration of brake_state.load/save callers to flow through
+    Preferences (light refactor; not blocking anything).
   - Remaining discrete bugs (kill doesn't interrupt in-flight;
-    silent wedge cx-796e0468).
+    silent wedge cx-796e0468) — both deferred pending design /
+    more data points.
 
 **Architecture review** scheduled to fire 2026-06-01 09:00
 EDT (taskId `cyberdeck-architecture-review`); the agent
