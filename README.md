@@ -1,24 +1,37 @@
 # Cyberdeck
 
-A keyboard-first TUI that orchestrates Claude Code subprocesses.
+A keyboard-first TUI that orchestrates Claude Code subprocesses — a
+personal AI cockpit that makes one human's attention go further than
+it should.
 
 A *daemon* coordinator decomposes goals; *constructs* execute in
 parallel; a *watchdog* oracle answers questions about fleet activity.
 The user — the *netrunner* — supervises through Textual.
 
-Personal hobby project. Currently in active production use on Windows.
-~12k LOC across 13 modules. Targets Pi-class hardware eventually.
+> **Status:** active personal hobby project, in production use on
+> Windows. Solo development; breaking changes are likely. No PRs
+> solicited; issues welcome but the bar for changes is "does this
+> serve the netrunner running it." Read the [design canon](#design-canon)
+> before assuming any feature is stable.
+
+<!-- Screenshot placeholder — drop a TUI mid-flight capture here. -->
+
+---
 
 ## Contents
 
 - [Why this exists](#why-this-exists)
+- [What it is](#what-it-is)
+- [Run it](#run-it)
+- [Architecture](#architecture)
 - [Design philosophy](#design-philosophy)
 - [What this is not](#what-this-is-not)
-- [Architecture, briefly](#architecture-briefly)
-- [Status](#status)
-- [Running](#running)
-- [Documentation](#documentation)
+- [Design canon](#design-canon)
+- [Status, more concretely](#status-more-concretely)
+- [License + contributing](#license--contributing)
 - [Aesthetic](#aesthetic)
+
+---
 
 ## Why this exists
 
@@ -37,6 +50,94 @@ itself more leverageable.
 
 In one sentence: **a personal AI cockpit that makes one human's
 attention go further than it should.**
+
+## What it is
+
+A Textual TUI that wraps Anthropic's [Claude Code](https://claude.com/claude-code)
+CLI. Each agent ("construct") is a managed `claude -p` subprocess in
+headless stream-json mode; the deck spawns them in parallel and
+renders their event streams in dedicated panes. A persistent
+coordinator ("daemon") plans the work and dispatches structured
+spawn actions; a separate observer ("watchdog") answers questions
+about what the fleet is doing without authority to act. Construct
+caliber (model + effort) is daemon-decided per-task. Tool use is
+gated by a deterministic PreToolUse hook ("brake") with three
+tiers: paranoid / default / yolo.
+
+The deck is keyboard-first by deliberate constraint. There's no
+mouse-driven menu — every operation has a single keypress, and the
+ones that matter most are reachable from any focus. A modal-heavy
+flow keeps the main canvas focused on the work, not on chrome.
+
+## Run it
+
+**Prerequisites:**
+
+- Python 3.11+ (3.14 tested)
+- [Textual](https://textual.textualize.io/) — `pip install textual`
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/quickstart) —
+  `npm install -g @anthropic-ai/claude-code` + a logged-in Max
+  account
+- On Windows, run from Windows Terminal or PowerShell 7 (cmd.exe
+  doesn't render the TUI cleanly)
+
+**Commands:**
+
+```bash
+python tui.py                       # idle — set goal in-app with `e`
+python tui.py "task A" "task B"     # ad-hoc constructs, no daemon
+python tui.py --goal "..."          # daemon-driven mode
+```
+
+**Offline smoke test** (against a mock subprocess; useful for
+development without burning real-claude tokens):
+
+```bash
+CLAUDE_BIN=./mock_claude.py python tui.py "task one" "task two"
+```
+
+**Smaller entry points:**
+
+- `main.py` — one construct, plain console output
+- `fleet.py` — multi-construct, plain console output
+
+**First run:** the deck creates `cyberdeck-home/` next to the source
+on first launch. Profiles seed automatically; brake state, limits,
+and warm pool persist across restarts. Override the working
+directory with `--home <path>` or `$CYBERDECK_HOME`.
+
+## Architecture
+
+Four runtime entities, each with one job:
+
+- **The deck** (the TUI itself). Renders panels, dispatches actions
+  on key presses, mounts modals.
+- **The fleet.** N concurrent construct subprocesses. Crash
+  isolation, hard-kill semantics via SIGTERM/SIGKILL on the PID.
+- **The daemon.** A persistent Claude Code subprocess that decomposes
+  goals into actions and dispatches them as JSON.
+- **The watchdog.** An async question-queue oracle that answers human
+  questions about fleet activity. Independent of the daemon; runs
+  its own claude subprocess.
+
+Plus three load-bearing supporting subsystems:
+
+- **The spine** (`event_bus.py`). All subsystems publish through one
+  canonical bus; consumers subscribe with role-derived filters.
+  Single source of truth for chatlog rendering, watchdog Q&A
+  context, and the per-launch NDJSON log.
+- **The brake** (`brake_hook.py`). Deterministic PreToolUse hook
+  invoked by Claude Code per tool call. Three tiers: paranoid (most
+  side-effect tools denied), default (destructive bash + OS-root
+  paths denied), yolo (no hook installed). Pattern-based; no LLM in
+  the hot path.
+- **The mechanic** (`mechanic.py`). Sibling supervisor process that
+  watches the deck PID and cleans up orphan claude subprocesses on
+  detected deck death. Cross-platform stdlib + ctypes; no claude
+  dependency.
+
+`Design Files/cyberdeck-spec.md` is the canonical reference if any
+of this needs more depth.
 
 ## Design philosophy
 
@@ -82,81 +183,71 @@ that *not being in the loop* fails safely.
   for the netrunner's experience; skip polish where it would only
   matter for adoption.
 
-## Architecture, briefly
+## Design canon
 
-Four runtime entities, each with one job:
+The full design lives in `Design Files/`. If you're starting fresh,
+read in this order:
 
-- **The deck** (the TUI itself). Renders panels, dispatches actions
-  on key presses, mounts modals.
-- **The fleet.** N concurrent construct subprocesses. Crash
-  isolation, hard-kill semantics via SIGKILL on the PID.
-- **The daemon.** A persistent Claude Code subprocess that decomposes
-  goals into actions and dispatches them as JSON.
-- **The watchdog.** An async question-queue oracle that answers human
-  questions about fleet activity. Independent of the daemon; runs its
-  own claude subprocess.
+1. **`cyberdeck-claude-code-orientation.md`** — institutional knowledge,
+   hard-won rules, file map, gotchas. *Read first if you're touching
+   the code.*
+2. **`cyberdeck-state.md`** — current state, design decisions, filed
+   gotchas (cumulative). *Read first if you're trying to understand
+   why something is the way it is.*
+3. **`cyberdeck-build-plan.md`** — milestone status, what's next,
+   what's deferred and why. *Read first if you're trying to
+   understand what's coming.*
+4. **`cyberdeck-spec.md`** — canonical architecture (the *what*).
+   *Read first if you're trying to understand what the deck does
+   structurally.*
+5. **`cyberdeck-philosophy.md`** — convictions that resolve
+   ambiguity (the *why*). *Read first if you're disagreeing with a
+   design decision and want to understand the reasoning.*
 
-Each construct is a managed `claude -p` subprocess in headless
-stream-json mode, scoped via `--allowedTools` and `--permission-mode`.
-The daemon picks a profile (TOML config defining tools, system prompt
-addendum, brake tier) at spawn time. The watchdog reads the same
-event stream the netrunner does and reasons over it without authority
-to act.
+Architecture docs for the major in-flight initiatives:
 
-`Design Files/cyberdeck-spec.md` is the canonical reference if any of
-this needs more depth.
+- `cyberdeck-event-stream-design.md` — the spine
+- `cyberdeck-maintbot-design.md` — the mechanic
+- `cyberdeck-model-effort-design.md` — caliber (per-spawn model +
+  effort + fast-mode)
+- `cyberdeck-tools-plugins-profiles-retool.md` — the three-way split
+  between tools (installed CLIs), plugins (deck-extended capability),
+  and profiles (recipes)
 
-## Status
+Other entries in `Design Files/` cover narrower topics (collaboration
+norms, future-direction stubs, deferred variants).
 
-Tier 1 (constructs, fleet, daemon-driven goals, EJECT, limits) and
-Tier 2 (profiles, brake tiers, hot-reload registry) are shipped.
-Watchdog Q&A oracle, daemon chat, mid-flight goal edits, connection
-monitor, and spawn-origin badges are all in production. Up next:
-plugin scaffolding, connection consequences, local-model substrate.
+## Status, more concretely
 
-See `Design Files/cyberdeck-state.md` for the full state snapshot and
-`Design Files/cyberdeck-build-plan.md` for what's next.
+- **Active solo development.** One netrunner, one developer, both
+  the same person. Issues welcome; PRs not solicited because the
+  bar for changes is "does this serve the netrunner running it"
+  and only one person can answer that.
+- **Windows-first.** Tested on Windows 11 + Windows Terminal +
+  PowerShell 7. Linux/macOS *should* work (no platform-specific
+  imports in core paths) but rough edges aren't polished out yet —
+  the eventual Pi-class deployment will fix that.
+- **Breaking changes likely.** The deck is in active production use
+  but the architecture is still evolving. Recent slices (caliber,
+  tools-plugins-profiles retool, spine) reshaped the codebase; more
+  reshaping is queued. Pin a commit if you're forking; don't expect
+  the next pull to be drop-in.
+- **No release cadence.** Development is goal-driven, not
+  release-driven. The git log is the changelog.
+- **No telemetry.** The deck phones home only to Anthropic for
+  claude-code subprocess work. Everything else stays local.
 
-## Running
+## License + contributing
 
-```bash
-python tui.py                    # idle — set goal in-app with `e`
-python tui.py "task A" "task B"  # ad-hoc constructs, no daemon
-python tui.py --goal "..."       # daemon-driven mode
-```
+No license file yet — defaulting to "all rights reserved" until I
+think about it more deliberately. If you want to use any of this in
+your own project, [open an issue](https://github.com/watchdogeditor/Cyberdeck/issues)
+and we'll talk.
 
-For offline smoke testing against a mock subprocess:
-
-```bash
-CLAUDE_BIN=./mock_claude.py python tui.py "task one" "task two"
-```
-
-Real runs require `npm install -g @anthropic-ai/claude-code` and a
-logged-in Max account. On Windows, run from Windows Terminal or
-PowerShell 7 — old cmd.exe doesn't render the TUI cleanly.
-
-Smaller entry points: `main.py` (one construct, console),
-`fleet.py` (multi-construct, console output).
-
-## Documentation
-
-The design canon lives in `Design Files/`. Read in this order if
-starting fresh:
-
-1. `cyberdeck-claude-code-orientation.md` — institutional knowledge,
-   hard-won rules, file map, gotchas
-2. `cyberdeck-state.md` — current state, design decisions, filed
-   gotchas (cumulative)
-3. `cyberdeck-build-plan.md` — milestone status, what's next, what's
-   deferred and why
-4. `cyberdeck-spec.md` — canonical architecture (the *what*)
-5. `cyberdeck-philosophy.md` — convictions that resolve ambiguity
-   (the *why*)
-
-`cyberdeck-project-instructions.md` covers collaboration norms;
-`cyberdeck-tools-research-seed.md` is a stub for a future
-tools-research conversation; `cyberdeck_arbiter_design.md` is a
-deferred wearable-form-factor variant.
+For contributing: see the status note above. The bar is netrunner
+utility; PRs that don't serve that aren't going to land. Issues
+documenting bugs you've hit on real-deck use, or design questions
+that would help the canon docs improve, are genuinely welcome.
 
 ## Aesthetic
 
