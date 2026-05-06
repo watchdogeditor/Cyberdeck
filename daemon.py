@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import time
@@ -676,12 +677,32 @@ class Daemon:
         if self.caliber is not None:
             cmd += self.caliber.to_claude_args()
 
+        # Per-role spawn-context isolation (build-plan item 000, first
+        # phase shipped 2026-05-05). Suppress claude code's silent
+        # auto-loads. Daemon doesn't need CLAUDE.md / auto-memory /
+        # git-status — the system prompt has the operational protocol,
+        # the per-spawn addendums carry profile/plugin/caliber
+        # awareness. Killing auto-load also recovers the ~19k
+        # cache_creation per spawn we filed on 2026-05-02 as
+        # "Anthropic's court" (it was CLAUDE.md drift invalidating
+        # cache, not actually Anthropic's). Per-subprocess scope; does
+        # not mutate the deck's own env. Watchdog Q&A KEEPS its
+        # CLAUDE.md auto-load (different role, different needs — the
+        # Q&A oracle benefits from knowing the deck's gotchas).
+        env = {
+            **os.environ,
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
+        }
+
         self._streaming_proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.cwd,
+            env=env,
         )
 
     async def _drain_streaming_turn(

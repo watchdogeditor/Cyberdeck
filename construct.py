@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import time
@@ -522,6 +523,30 @@ class Construct:
         cmd = self._build_command(resolved)
         self._started_at = time.time()
 
+        # Per-role spawn-context isolation (build-plan item 000, first
+        # phase shipped 2026-05-05). Suppress claude code's silent
+        # auto-loads so the construct ONLY sees what the deck
+        # explicitly hands it (system prompt + addendum + user task).
+        # Without this, every construct inherits the deck's project-
+        # root CLAUDE.md (~700 lines of build plans, design notes,
+        # gotchas, in-flight slice descriptions) plus user-level
+        # CLAUDE.md plus auto-memory MEMORY.md from disk. Triple-leak:
+        # information disclosure (constructs read our notes), token
+        # cost (~19k cache_creation per spawn), and capability
+        # confusion (constructs reference deck features unrelated to
+        # their task). Per-role policy from netrunner: kill auto-load
+        # for constructs (and daemon, and pool warmers — both routed
+        # through here). Watchdog Q&A KEEPS its CLAUDE.md auto-load
+        # because that role benefits from knowing the deck's gotchas.
+        # Per-subprocess scope (env= kwarg below); does NOT mutate
+        # the deck's own env.
+        env = {
+            **os.environ,
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
+        }
+
         stdin_mode = (
             asyncio.subprocess.PIPE if self.stdin_prompt is not None else None
         )
@@ -531,6 +556,7 @@ class Construct:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.cwd,
+            env=env,
         )
 
         # Feed the stdin prompt now that the subprocess is up. Close

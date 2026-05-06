@@ -871,6 +871,24 @@ class Watchdog:
         if resume_id:
             cmd += ["--resume", resume_id]
 
+        # Per-role spawn-context isolation (build-plan item 000,
+        # 2026-05-05). Tripwire authoring KILLS CLAUDE.md auto-load
+        # to reduce false-positive examples in the model's context —
+        # netrunner observed authoring "seems to be a little
+        # overzealous." Curated tripwire-authoring "gotchas" addendum
+        # is filed as a follow-up (see build-plan); for now, just
+        # suppress the noise. **Watchdog Q&A KEEPS auto-load** (its
+        # spawn paths in `_process_streaming` / `_process_oneshot`
+        # don't set this env block) — the Q&A oracle benefits from
+        # knowing the deck's gotchas. Different roles, different
+        # context needs.
+        env = {
+            **os.environ,
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
+        }
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -878,6 +896,7 @@ class Watchdog:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd,
+                env=env,
             )
         except FileNotFoundError:
             return _wrap(TripwireAuthoringResult(

@@ -142,9 +142,91 @@ watchdog blindfold. Personal use doesn't need it.
 
 Roughly ordered by likely appeal:
 
+0000. **🎯 TRIPWIRE-AUTHORING "GOTCHAS" ADDENDUM** (filed
+    2026-05-05 by netrunner during item-000 work).
+
+    Real-deck observation: the tripwire-authoring spawn "seems to
+    be a little overzealous with what tripwires it authors."
+    Currently the authoring spawn auto-loaded the deck's project-
+    root CLAUDE.md (~700 lines of build plans, design notes,
+    historical bug descriptions, etc.) — a noisy signal that
+    likely encouraged it to invent broad pattern matchers from
+    incidental mentions.
+
+    The auto-load itself is now suppressed (item 000 first phase
+    shipped 2026-05-05; tripwire authoring gets the env-var belt).
+    But the remaining problem is signal: now that the model has
+    LESS context, we want to give it CURATED context — a
+    hand-tuned "gotchas" addendum that teaches it specifically
+    what NOT to be overzealous about, plus what genuine red
+    flags look like.
+
+    Proposed shape:
+
+      <deck-source>/roles/watchdog-authoring-gotchas.md
+        - Examples of patterns that are too broad (false positives
+          we've actually seen)
+        - Examples of patterns that are too narrow (real risks
+          missed in the past)
+        - "Don't fire on X, Y, Z" guidance (substring matches that
+          look dangerous but aren't — e.g. mentions of `rm -rf` in
+          documentation strings)
+        - Format guidance: prefer field-scoped tripwires (selector
+          + event_kind) over deck_global wildcards
+        - Explicit safe-list of common false-positive triggers
+          (curl downloading public release tarballs, Bash arg
+          examples in docstrings, etc.)
+
+    Injection: append via `--append-system-prompt-file` to the
+    authoring spawn (in addition to TRIPWIRE_AUTHORING_SYSTEM_
+    PROMPT and the per-call user prompt). Composes as:
+    AUTHORING_SYSTEM_PROMPT + GOTCHAS_ADDENDUM + per-call user
+    prompt.
+
+    Bootstrap mechanism: same as item 000 role files. Bundled
+    default in deck source, restored on empty. Netrunner edits
+    on disk to tune as patterns evolve.
+
+    Estimated size: ~150 LOC for the bootstrap + injection
+    plumbing, plus iterative content tuning based on real-deck
+    observation. Ships as a small follow-up to item 000 (depends
+    on the role-file infrastructure, so wait for that to land
+    first OR build a one-off injection for tripwire authoring
+    only — depends on item 000's progress).
+
 000. **🚨 AUTO-CONTEXT AUDIT + PER-ROLE SUBPROCESS ISOLATION**
     (filed 2026-05-05 by netrunner; **highest-priority deferred
     slice — ranks above the architecture review**).
+    **First phase shipped 2026-05-05** — env-var belt
+    (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` + auto-memory + git-
+    instructions) applied per-role to the spawn sites that should
+    NOT auto-load context. Per-role policy:
+
+      | Role | CLAUDE.md auto-load | Status |
+      |------|---------------------|--------|
+      | Advisor | KILLED | shipped 2026-05-05 (round-3) |
+      | Construct | KILLED | shipped 2026-05-05 (this slice) |
+      | Daemon (one-shot via Construct) | KILLED | shipped 2026-05-05 (this slice) |
+      | Daemon (streaming) | KILLED | shipped 2026-05-05 (this slice) |
+      | Pool warmers (via Construct) | KILLED | shipped 2026-05-05 (this slice) |
+      | Tripwire-authoring Watchdog | KILLED | shipped 2026-05-05 (this slice) |
+      | Watchdog Q&A (streaming) | **KEPT** | netrunner call: deck's "security analyst" benefits from gotchas + design context |
+      | Watchdog Q&A (one-shot) | **KEPT** | same role as streaming |
+
+    What ships TODAY (the easy phase): env-var suppression for the
+    five "should not see CLAUDE.md" roles. ~80 LOC across
+    construct.py / daemon.py / watchdog.py.
+
+    What's still deferred (the hard phase): the role-injection
+    infrastructure (roles_registry.py, general.toml, role files in
+    `<deck-source>/roles/`). With the per-role policy now selective
+    (Watchdog Q&A keeps CLAUDE.md), the role-injection slice
+    simplifies — Watchdog Q&A doesn't need a role file because it
+    keeps its existing CLAUDE.md context. Constructs/daemon/etc. may
+    still benefit from role-injection (replacing the lost CLAUDE.md
+    content with curated role-specific content), but that's a tuning
+    decision after observing real-deck regressions, not a forced
+    move.
 
     **The problem.** Every `claude` subprocess the deck spawns
     inherits the deck's cwd, which is the deck source directory.

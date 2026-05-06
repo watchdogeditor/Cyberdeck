@@ -957,6 +957,57 @@ reveal under-specified system prompts.
 
 ---
 
+**✅ ITEM 000 — FIRST PHASE SHIPPED 2026-05-05** (uncommitted as
+of this state.md update). Per-role env-var belt applied to the
+spawn sites that should NOT auto-load CLAUDE.md. Driven by the
+netrunner's real-deck observation that constructs still knew
+the deck's project memory after the Advisor-only fix.
+
+**Per-role policy** (netrunner calls 2026-05-05):
+
+  | Role | Auto-load CLAUDE.md | Why |
+  |------|---------------------|-----|
+  | Advisor | KILLED (round-3) | Strict per-tool scope |
+  | Construct | KILLED | Task-scoped; in-flight design notes are not theirs to see; cache cost |
+  | Daemon (both backends) | KILLED | Coordinator already has its operational protocol in system prompt; cache cost |
+  | Pool warmer | KILLED | Becomes a construct on pull |
+  | Tripwire-authoring Watchdog | KILLED | Reduces false-positive examples (netrunner: authoring "seems overzealous"); curated gotchas addendum filed as build-plan 0000 follow-up |
+  | Watchdog Q&A (both) | **KEPT** | Deck's "security analyst" — knowing gotchas + design context helps Q&A reasoning |
+
+**Implementation.** ~80 LOC across three modules:
+
+  - `construct.py` (covers Construct + daemon-one-shot via
+    Construct + pool warmers via Construct): env-var belt
+    threaded through `Construct.spawn`'s `create_subprocess_exec`.
+  - `daemon.py` streaming (`_spawn_streaming`): env-var belt.
+  - `watchdog.py` tripwire authoring (`author_tripwires`): env-
+    var belt. Q&A paths (`_process_streaming` + `_process_oneshot`)
+    deliberately untouched — they KEEP CLAUDE.md.
+
+Each spawn site builds its own per-spawn env dict
+(`{**os.environ, "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1", ...}`)
+and passes via `env=env` to `create_subprocess_exec`. Per-
+subprocess scope; does not mutate the deck's own env or
+anything else on the system.
+
+**Verified**: Python-side audit confirms each spawn site has the
+right env-var presence/absence per the policy table. Real-deck
+verification pending — netrunner will observe whether daemon /
+constructs regress without their CLAUDE.md context (filed as a
+risk in item 000's design doc; the risk reads "may have been
+free-riding"). If they regress, the next slice is role-file
+injection (full item 000) to replace the lost auto-load with
+curated role-specific content.
+
+**Filed as build-plan item 0000** (above 000): tripwire-
+authoring "gotchas" addendum. Real-deck-tunable curated content
+that teaches the authoring spawn what NOT to fire on (false-
+positive guidance) and what genuine red flags look like.
+Composes via `--append-system-prompt-file` on top of the
+existing TRIPWIRE_AUTHORING_SYSTEM_PROMPT.
+
+---
+
 **Next session picks up at: open netrunner choice.**
   - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
     build-plan item 13.

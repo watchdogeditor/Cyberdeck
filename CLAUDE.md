@@ -854,23 +854,36 @@ cache_creation per spawn we filed as "Anthropic's court" on
 2026-05-02. Probably also a major information leak vector.
 
 **Tactical Advisor fix** shipped 2026-05-05 (round 3 — round 2's
-`--bare` broke OAuth; see Filed gotcha). Final recipe:
-`--system-prompt` (full replace), `--tools ""`,
-`--disable-slash-commands`, `--no-session-persistence`, plus
-env-var belt (`CLAUDE_CODE_DISABLE_CLAUDE_MDS`,
-`_DISABLE_AUTO_MEMORY`, `_DISABLE_GIT_INSTRUCTIONS` — scoped
-per-subprocess via `env=` kwarg, no global splash). See
-`advisor.py:_run_one`.
+`--bare` broke OAuth; see Filed gotcha). Round 4 fixed the
+multi-line argv truncation bug (`--system-prompt` → `--system-
+prompt-file`). See `advisor.py:_run_one`.
 
-**Systemic fix** is now build-plan item **000** (highest-priority
-deferred slice — ranks above the architecture review).
-**Programmatic role-prompt injection** from disk-backed role
-files at `<deck-source>/roles/<role>.md` plus a `general.toml`
-for netrunner identity. Composition order at every spawn:
-general → role → profile → per-spawn → plugin. Read
-`Design Files/cyberdeck-spawn-context-isolation.md` for the full
-design before doing ANY subprocess-spawn work. Don't add any
-more spawn sites that auto-load context.
+**Item 000 first phase shipped 2026-05-05.** Per-role env-var
+belt (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` + auto-memory + git-
+instructions) applied to the spawn sites that should NOT auto-
+load CLAUDE.md. **Per-role policy:**
+
+  - **KILL CLAUDE.md auto-load:** Advisor, Construct, Daemon
+    (both backends), Pool warmer, Tripwire-authoring Watchdog
+  - **KEEP CLAUDE.md auto-load:** Watchdog Q&A (deck "security
+    analyst" benefits from knowing gotchas + design context)
+
+Per-subprocess `env=` kwarg scope — does not mutate the deck's
+own env. ~80 LOC across construct.py / daemon.py / watchdog.py.
+
+**Item 000 second phase still deferred** — the role-file
+injection infrastructure (roles_registry.py, general.toml, role
+files in `<deck-source>/roles/`). With the selective per-role
+policy, this simplifies — only the KILL roles might benefit
+from role-injection if they regress without CLAUDE.md content.
+Real-deck observation drives whether we need to ship it. Read
+`Design Files/cyberdeck-spawn-context-isolation.md` for the
+full design before adding any new spawn site.
+
+**Item 0000 filed** — tripwire-authoring "gotchas" addendum.
+Curated real-deck-tunable content teaching the authoring spawn
+what NOT to fire on. Follow-up to first-phase 000 (which already
+killed the noisy CLAUDE.md auto-load for the authoring spawn).
 
 ---
 
