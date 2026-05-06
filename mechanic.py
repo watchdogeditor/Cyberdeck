@@ -307,7 +307,60 @@ def parse_args() -> argparse.Namespace:
             "missing the attach window."
         ),
     )
+    parser.add_argument(
+        "--heartbeat-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to the deck's liveness heartbeat file. Default: "
+            "$CYBERDECK_HOME/.cyberdeck/heartbeat (or "
+            "<deck>/cyberdeck-home/.cyberdeck/heartbeat). The deck "
+            "writes this file every 5s; if its mtime falls more "
+            "than --heartbeat-stale-seconds behind wall-clock, the "
+            "supervisor flags the deck as wedged (PID alive but "
+            "TUI frozen) and logs a one-time diagnostic. v0+1 "
+            "logs only — v1 LLM session (deferred) will decide "
+            "what to do."
+        ),
+    )
+    parser.add_argument(
+        "--heartbeat-stale-seconds",
+        type=float,
+        default=20.0,
+        help=(
+            "How old the heartbeat file's mtime can get before "
+            "the supervisor flags it as stale (default 20s). "
+            "The deck writes every 5s, so 20s = ~4 missed ticks."
+        ),
+    )
     return parser.parse_args()
+
+
+def resolve_heartbeat_path(arg_path: Optional[str]) -> Path:
+    """Resolve the deck heartbeat file path. Mirrors resolve_log_dir
+    in shape — explicit arg wins, then $CYBERDECK_HOME, then the
+    default <deck>/cyberdeck-home/.cyberdeck/heartbeat. The deck
+    writes this file every 5s; the supervisor reads its mtime to
+    detect wedged-TUI cases the PID-only watch misses."""
+    if arg_path:
+        return Path(arg_path)
+    home_env = os.environ.get("CYBERDECK_HOME")
+    if home_env:
+        return Path(home_env) / ".cyberdeck" / "heartbeat"
+    # Default: assume the deck home is alongside the mechanic source
+    # (the launch.bat convention puts both in the same dir).
+    return Path(__file__).resolve().parent / "cyberdeck-home" / ".cyberdeck" / "heartbeat"
+
+
+def heartbeat_age_seconds(path: Path) -> Optional[float]:
+    """Return seconds since the heartbeat file was last touched.
+    None if the file doesn't exist (supervisor pre-attach window,
+    or the deck was launched without the heartbeat writer for any
+    reason)."""
+    try:
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def resolve_log_dir(arg_dir: Optional[str]) -> Path:
@@ -382,10 +435,27 @@ def main() -> int:
         return 1
     print(f"[mechanic] watching deck pid={deck_pid}", file=sys.stderr)
 
+    # Mechanic v0→v1 bridge (2026-05-04): liveness heartbeat. The
+    # deck writes <home>/.cyberdeck/heartbeat every 5s; we read its
+    # mtime each tick. PID alive + heartbeat stale = wedged TUI
+    # (event loop stuck, redraw cycle frozen). v0 catches deck-died;
+    # this catches deck-frozen. Logs a one-time diagnostic when
+    # detected; v1 LLM session (deferred) will decide what to do
+    # about it. Variables track the "have we already warned?" state
+    # so we don't spam stderr every tick on a long wedge.
+    heartbeat_path = resolve_heartbeat_path(args.heartbeat_path)
+    print(
+        f"[mechanic] heartbeat file: {heartbeat_path}",
+        file=sys.stderr,
+    )
+    heartbeat_warned = False  # one-shot warn-then-quiet
+    heartbeat_recovered_at: Optional[float] = None
+
     # Heartbeat loop. Catch up the log on every tick, check deck
-    # liveness, sleep. Ctrl+C on the supervisor terminal breaks out
-    # cleanly without killing tracked subprocesses — interrupting
-    # the supervisor is not the same signal as deck-died.
+    # liveness, check heartbeat freshness, sleep. Ctrl+C on the
+    # supervisor terminal breaks out cleanly without killing tracked
+    # subprocesses — interrupting the supervisor is not the same
+    # signal as deck-died.
     try:
         while True:
             for record in tail.catch_up():
@@ -394,6 +464,37 @@ def main() -> int:
                     clean_close_reason = reason
             if not pid_alive(deck_pid):
                 break
+
+            # Heartbeat-staleness check. Only meaningful AFTER
+            # we've seen at least one fresh heartbeat — a missing
+            # file early in the deck's startup is normal (the
+            # writer hasn't ticked yet). Fresh-once-seen tracks
+            # this implicitly via heartbeat_recovered_at.
+            age = heartbeat_age_seconds(heartbeat_path)
+            if age is not None and age > args.heartbeat_stale_seconds:
+                if not heartbeat_warned:
+                    print(
+                        f"[mechanic] STALE HEARTBEAT detected: "
+                        f"file is {age:.1f}s old "
+                        f"(threshold={args.heartbeat_stale_seconds}s); "
+                        f"deck pid={deck_pid} is alive but TUI may "
+                        f"be wedged. v1 LLM session would triage "
+                        f"here; v0+1 logs only.",
+                        file=sys.stderr,
+                    )
+                    heartbeat_warned = True
+            elif age is not None and heartbeat_warned:
+                # Heartbeat came back. Reset the warn flag so a
+                # future stale event prints again. Also note the
+                # recovery so the netrunner sees the deck unfroze.
+                print(
+                    f"[mechanic] heartbeat recovered ({age:.1f}s "
+                    f"old); deck appears responsive again",
+                    file=sys.stderr,
+                )
+                heartbeat_warned = False
+                heartbeat_recovered_at = time.time()
+
             time.sleep(args.poll_interval)
     except KeyboardInterrupt:
         print(

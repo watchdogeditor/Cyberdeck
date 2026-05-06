@@ -4955,7 +4955,65 @@ class CyberdeckApp(App):
         self._delay_refresh_timer = self.set_interval(
             0.1, self._refresh_delay_countdowns
         )
+        # Mechanic v0→v1 bridge (2026-05-04): liveness heartbeat.
+        # Writes `<home>/.cyberdeck/heartbeat` every 5s with the
+        # current timestamp. Mechanic v0 watches the deck PID
+        # already, but a wedged event loop / hung Textual redraw
+        # cycle keeps the PID alive while the netrunner sees a
+        # frozen TUI — the heartbeat catches that case. Mechanic
+        # v0+1 reads the heartbeat file's mtime and flags as stale
+        # after ~20s; v1 LLM session (deferred) is what'll decide
+        # what to do about it. For now the v0+1 path just logs
+        # "stale heartbeat detected" — diagnostic only, no action.
+        self._heartbeat_timer = self.set_interval(
+            5.0, self._write_heartbeat
+        )
+        # Write once immediately so a fast-launching mechanic that
+        # checks before the first 5s tick doesn't see a missing
+        # heartbeat file.
+        self._write_heartbeat()
         self.run_worker(self._drive_fleet(), exclusive=True, name="fleet")
+
+    def _write_heartbeat(self) -> None:
+        """Touch `<home>/.cyberdeck/heartbeat` with the current
+        timestamp. Mechanic v0→v1 bridge (2026-05-04). Called every
+        5s on a Textual interval timer.
+
+        The Mechanic supervisor (mechanic.py, sibling process)
+        watches this file's mtime. When the deck PID is alive but
+        the heartbeat is older than ~20s, the supervisor knows the
+        TUI is wedged (event loop stuck, Textual redraw cycle
+        frozen, etc.) — a case PID-watching alone misses. Mechanic
+        v0+1 just logs the detection; v1's LLM session (deferred)
+        will decide whether to terminate the wedged deck and
+        restart it.
+
+        Best-effort. Failures (read-only filesystem, permission
+        denied, transient mid-restart races) are swallowed — a
+        missed heartbeat tick is worse-cased as a false-positive
+        wedge detection from the supervisor side, which logs but
+        doesn't act. Better to drop a tick silently than crash the
+        timer task and stop heartbeating entirely.
+        """
+        try:
+            beat_dir = self.home_dir / ".cyberdeck"
+            beat_dir.mkdir(parents=True, exist_ok=True)
+            beat_path = beat_dir / "heartbeat"
+            # Single-line content: ISO timestamp + monotonic. Both
+            # are useful — wall-clock for human inspection, monotonic
+            # for the supervisor's staleness math (avoids clock-skew
+            # surprises on systems where the clock jumps).
+            import time as _time
+            beat_path.write_text(
+                f"{_time.time():.3f} {_time.monotonic():.3f}\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            # See docstring — silently skip. Persistent failures
+            # surface via the supervisor's stale-heartbeat warning,
+            # which is the correct end of the system to notice and
+            # act on this kind of problem.
+            pass
 
     def _refresh_subtitle(self) -> None:
         """Update the window subtitle based on current state."""
