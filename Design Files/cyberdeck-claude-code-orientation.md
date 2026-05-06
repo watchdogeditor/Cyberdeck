@@ -525,6 +525,43 @@ grep for existing similar work — the pattern is almost always there.
 - Pool with manifest, cross-restart reuse, 5h stale window
 - Warms with `default` profile only
 
+### `caliber.py` — per-spawn model + effort + fast-mode primitive (shipped 2026-05-04)
+- `Caliber` frozen dataclass: model + effort + fast_mode bundle.
+- Soft-validation (warn-pass-through) on unknown values — KNOWN_MODELS
+  + KNOWN_EFFORTS + _FAST_MODE_MODELS. Anthropic adds models periodically;
+  the deck shouldn't gate on whether constants got updated.
+- `to_claude_args()` → ["--model", "<m>", "--effort", "<e>"]. Resolves
+  deck-side aliases (`opus[4.6]` → `claude-opus-4-6`) at the CLI boundary.
+- `caliber_from_dict()` parses daemon spawn-action JSON; tolerant of
+  field aliases. fast_mode INTENTIONALLY not parsed — it's a netrunner
+  cost governor, not a daemon decision.
+- `display()` → "sonnet·high" / "opus·xhigh·fast" for chatlog/sidebar/
+  pane headers.
+- Threaded through Construct → Fleet.spawn → DaemonSession.
+
+### `doctor.py` — first-run prerequisite check (shipped 2026-05-04)
+- Five checks: Python ≥3.11, textual, mss, claude binary, claude --version.
+- PASS / WARN / FAIL with remediation hints. DETECT + SUGGEST, not
+  AUTO-INSTALL.
+- Sentinel at `<home>/.cyberdeck/first_run_complete`. Silent on subsequent
+  runs unless FAIL or `--doctor` flag. `--no-doctor` escape hatch.
+- Wired into tui.py's `__main__` block before TUI mount; FAIL exits 1.
+- ASCII-only output (Windows cp1252 stdout encoding when piped). claude_bin
+  check has Path.is_file() fallback for development mocks like
+  CLAUDE_BIN=./mock_claude.py.
+
+### `preferences.py` — typed accessor over state.json (shipped 2026-05-04)
+- `Preferences(home_dir)` with typed properties (`prefs.fast_mode`,
+  `prefs.daemon_effort`, `prefs.brake`, `prefs.delay_window_seconds`,
+  `prefs.wedge_timeout_seconds`) + `save(**kwargs)`.
+- Internally delegates to brake_state.load_limits / save_limits — same
+  state.json shape, same persistence semantics. Preferences is the new
+  single import surface; brake_state's functions stay exported for
+  backward compat (no non-tui callers today).
+- Schema documented in module docstring with future placeholders
+  (theme, default_profile, keybind_overrides, agent_defaults,
+  last_session_id for the morgue when it lands).
+
 ### `clipboard.py` — cross-platform clipboard write (shipped 2026-04-30)
 - Stdlib-only — no third-party dependency.
 - `copy(text) -> (ok, err)` — single entry point.

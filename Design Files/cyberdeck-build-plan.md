@@ -166,144 +166,83 @@ Roughly ordered by likely appeal:
      review windows; this fits before either.
 
 0c. **Tools UI: space-launch + z-info + H-haiku-research**
-   (Thought of Dave, filed 2026-05-04). Tools tab unified-
-   ListView rows (post-P5 retool) get the same focused-action
-   set that file rows have:
-   - **space** on a tool/plugin row → opens
-     NewConstructScreen pre-populated with the tool name
-     in the task body (mirror of the existing FileListItem
-     space-launch). The construct gets a "you should use
-     <tool>" steering hint by default; the netrunner edits
-     the task before submitting.
-   - **z** on a tool/plugin row → opens an info modal showing
-     the tool's name, description, kind, command/path, help_text
-     (if registered), availability + reason. For plugins:
-     plugin manifest + README contents. Same z convention as
-     existing list items. ExpandModal is the right widget.
-   - **H** (uppercase) within the z-modal → opens a sidebar
-     pane that spawns a Haiku one-shot ("haiku bot") with a
-     prompt like "research <tool>: read its manpage / help
-     text / web docs and summarize its uses, common flags, and
-     one practical example invocation." Haiku is cheap and
-     fast — a few cents per query, ~5s response. The result
-     renders in the sidebar as it streams; netrunner can yank
-     (y) it for reference. Brake hook still gates any tool
-     calls the haiku bot might emit (it's just a Bash run of
-     `claude -p ... --model haiku`).
-   - **Why H specifically:** "H for Haiku" is mnemonic + on
-     the home row. Avoids stomping on the deck-wide X-execute
-     convention (the modal isn't a delay/attention surface).
-     Reserved for the modal scope only — not a deck-level
-     keybind.
-   - **Implementation order:** space-launch first (mirrors
-     existing FileListItem path), z-info second (small
-     ExpandModal extension), H-haiku-research third (more
-     scope — needs subprocess management, streaming render,
-     model selection composition with caliber if that lands
-     first). Each shippable independently.
-   - ~250 LOC across the three sub-features.
+   (Thought of Dave, filed 2026-05-04).
+   - **space-launch** ✅ SHIPPED 2026-05-04 (commit 5b30ddd).
+     New ToolListItem class for isinstance dispatch. Tool path
+     uses TOOL: envelope; plugin path uses PLUGIN: envelope +
+     `spawn_plugins=[name]` so the per-spawn addendum scopes
+     to ONLY the picked plugin.
+   - **z-info** ✅ SHIPPED 2026-05-04 (commit 5b30ddd). Tool
+     rows render synthesized manifest text (not file-backed
+     individually); plugin rows open their README.md when
+     present, falling back to synthesized info otherwise.
+     `_render_tool_info` / `_render_plugin_info` helpers.
+   - **H-haiku-research** STILL DEFERRED. Needs subprocess
+     management + streaming inline render in the z-info modal
+     + cancel mechanism. Bigger lift than the other two
+     sub-features. When picking up: open the z-info modal for
+     a tool/plugin, the H key (within modal scope) spawns
+     `claude -p '<research-prompt>' --model haiku --effort low`,
+     streams output into a sidebar Static widget on the modal,
+     y-yanks the result. ~150 LOC.
 
-0. **README restructure for public GitHub repo** (filed 2026-05-02
-   by netrunner). The repo is now public at
-   github.com/watchdogeditor/Cyberdeck. Current README is light
-   and dev-facing — pitch + status + run commands + design-doc
-   index. Public-facing readers landing on the repo cold need a
-   structured walkthrough: what is this, who's it for, what does
-   the screenshot look like, how do I run it, what's the
-   architecture in one paragraph, where do I read more (link to
-   the canon docs in `Design Files/`), what's the current
-   stability story (active personal project, not a packaged
-   product). Tee up sections: **Pitch** (one paragraph + GIF/
-   screenshot of the TUI mid-flight); **What it is** (TUI
-   orchestrating Claude Code subprocesses; daemon decomposes,
-   constructs execute, watchdog observes); **Run it**
-   (prerequisites + commands, currently scattered across
-   CLAUDE.md and existing README); **Architecture sketch**
-   (the four runtime entities + the spine + the brake; one
-   paragraph each); **Design canon** (links to spec /
-   philosophy / state / build-plan / orientation, with a
-   one-line "what to read first" hint for each); **Status**
-   (active solo dev, Windows-first, breaking changes likely);
-   **License + contributing** (single-author project, no PRs
-   solicited but issues welcome). Don't include LOC stats —
-   they go stale fast. Don't write API docs — there's no API.
-   Sub-day session of focused writing; no code changes.
+0. **README restructure for public GitHub repo** ✅ SHIPPED
+   2026-05-04 (commit 1aa7564). Public-repo cold-reader rewrite:
+   pitch + status callout above the fold, expanded prerequisites,
+   architecture covers four runtime entities + spine + brake +
+   mechanic, Design canon section with "what to read first" hints
+   per doc, new Status section (active solo dev, Windows-first,
+   breaking changes likely, no release cadence, no telemetry),
+   new License + contributing section. Original philosophy +
+   what-this-is-not + aesthetic preserved verbatim. Screenshot
+   placeholder noted as TODO.
 
-0a. **First-run onboarding check** (filed 2026-05-03 by
-   netrunner). Today's deck self-bootstraps file artifacts
-   (profiles dir, dispatcher script, plugin bridge, tools.toml,
-   state.json) but doesn't verify external prerequisites. A
-   netrunner who clones the repo to a fresh machine and runs
-   `python tui.py` gets either a cryptic ImportError on Textual
-   missing, or `[Errno 2] No such file or directory: 'claude'`
-   deep in async setup, or — worst case — silent failure modes
-   when claude is on PATH but not logged in. Right shape:
-   - Sentinel at `<home>/.cyberdeck/first_run_complete`
-   - `_first_run_check` runs on every startup; cheap (~50ms,
-     stdlib-only). On first run OR on detected FAIL, surfaces
-     diagnostics; otherwise silent.
-   - Probes: Python version (3.11+), `import textual`,
-     `import mss` (warn-only — mss is screenshot-plugin-specific),
-     `shutil.which("claude")` for the binary, `claude --version`
-     to verify the install isn't broken, `claude --help | head`
-     to confirm logged-in account (network call; first-run only).
-   - Each prereq → PASS / WARN / FAIL with remediation hint
-     ("install: pip install textual", "install: npm install -g
-     @anthropic-ai/claude-code", "run: claude /login"). DETECT +
-     SUGGEST, NOT AUTO-INSTALL — npm/pip auto-install is fragile
-     across corp firewalls, alternate Python distributions, and
-     environments where the user can't write globally. Better to
-     be the doctor than the surgeon.
-   - `--doctor` CLI flag re-runs the check on demand even after
-     the sentinel is set. `--no-doctor` skips entirely (escape
-     hatch for environments where the probe itself is broken).
-   - Exit before TUI mount on FAIL of hard prereqs (Python
-     version, textual, claude binary). On WARN (mss missing,
-     auth uncertain), surface a chatlog notice and continue.
-   ~150 LOC, mostly inline `subprocess.run([..., '--version'],
-   timeout=5, capture_output=True)` checks + a small reporter
-   function.
+0a. **First-run onboarding check** ✅ SHIPPED 2026-05-04 (commit
+   cddae01). New `doctor.py` module + wire-up in tui.py __main__.
+   Five prereq checks (python ≥3.11, textual, mss, claude binary,
+   claude --version) with PASS/WARN/FAIL + remediation hints.
+   DETECT + SUGGEST, not AUTO-INSTALL. Sentinel at
+   `<home>/.cyberdeck/first_run_complete`; silent on subsequent
+   runs unless FAIL or `--doctor` flag. `--no-doctor` escape
+   hatch. ASCII-only output (Windows cp1252 stdout). claude_bin
+   check has fallback for development mocks (Path.is_file()
+   passes when shutil.which doesn't). ~280 LOC.
 
-0b. **Preferences module** (filed 2026-05-03 by netrunner).
-   Today's persistent settings are scattered: brake state lives
-   under `<home>/.cyberdeck/state.json`'s `brake` key,
-   delay/wedge timeouts under the `limits` namespace in the
-   same file. Modified through `brake_state.load/save` +
-   `brake_state.load_limits/save_limits` — works, but the API
-   surface scales linearly with new settings. Future settings
-   (theme, default profile, agent defaults, keybind overrides,
-   per-installation flags) need a unified home and an
-   ergonomic accessor.
-   - New `preferences.py`: thin wrapper module providing a
-     `Preferences(home_dir)` dataclass-shaped accessor. Reads/
-     writes the existing `<home>/.cyberdeck/state.json` (no
-     migration needed — the file already exists; we just
-     formalize it).
-   - Semantic API: `prefs = Preferences(home_dir);
-     prefs.brake; prefs.delay_window_seconds; prefs.save()`.
-     Internal: read-merge-write pattern (so concurrent saves
-     of different keys don't clobber each other; same shape
-     as `brake_state.save_limits` today).
-   - Migrate existing brake_state.load/save and
-     brake_state.load_limits/save_limits to flow through
-     Preferences transparently — callers stay unchanged.
-   - File header comment: `# DECK-OWNED PREFERENCES — managed
-     by the deck via preferences.py. Manual edits survive
-     restarts but may be overwritten by the deck on the next
-     setting change. Edit at your own risk.`
-   - The "agents don't touch it mistakenly" concern is already
-     structural: brake_hook.path_is_protected exempts the
-     workspace EXCEPT for `<home>/.cyberdeck/`, so constructs
-     CANNOT write to state.json (writes go through the brake
-     hook, the brake hook denies). Reads stay allowed —
-     useful for an agent inspecting current brake state without
-     compromising integrity.
-   - Future settings to bake into the schema (commented as
-     placeholders, no live wiring yet): `theme`, `default_
-     profile`, `default_tools`, `keybind_overrides`,
-     `agent_defaults`, `last_session_id` (for the morgue
-     when it lands).
-   - ~150 LOC.
+0b. **Preferences module** ✅ SHIPPED 2026-05-04 (commit 213ae90;
+   migration in 9195ceb). New `preferences.py` thin wrapper —
+   single import surface for all persistent deck settings. Typed
+   properties (`prefs.fast_mode`, `prefs.daemon_effort`,
+   `prefs.brake`, etc.) with default fallbacks; `save(**kwargs)`
+   writes deltas through brake_state.save_limits. Schema
+   documented in module docstring with future placeholders
+   (theme, default_profile, keybind_overrides, agent_defaults,
+   last_session_id). tui.py callers migrated; brake_state's
+   load_limits / save_limits still exported for any non-tui
+   caller. ~210 LOC + ~40 LOC migration.
+
+0d. **Mechanic v0→v1 bridge: liveness heartbeat** ✅ SHIPPED
+   2026-05-04 (commit ecead5a). v0 watches the deck PID — proves
+   the process exists, doesn't prove the UI is responsive. Bridge
+   slice closes that gap with a heartbeat file. Deck writes
+   `<home>/.cyberdeck/heartbeat` every 5s on a Textual interval
+   timer (timestamp + monotonic). Mechanic reads mtime each tick;
+   logs "STALE HEARTBEAT" warn after 20s (4 missed ticks); logs
+   "heartbeat recovered" on return. v0+1 LOGS ONLY — no automatic
+   action; v1 LLM session triage is the deferred follow-up.
+   ~80 LOC across tui.py + mechanic.py.
+
+0e. **Mechanic v1 LLM-session half** (filed 2026-05-04 — bigger
+   lift, deferred). With the bridge slice now providing the
+   detection signal (PID alive + heartbeat stale), v1 is "what
+   to do when triggered." Spawns a fresh `claude -p` subprocess
+   on the supervisor side; reads the deck's recent log records
+   to give the triage model context; emits a structured triage
+   report; optionally terminates the wedged deck. Subprocess
+   management on the supervisor side (no Construct primitive
+   available there — supervisor is mechanic.py, not part of the
+   deck), claude prompt for triage decisions, threading +
+   timeout. ~300 LOC. Design needs more thought; revisit
+   pre-1.0.
 
 1. **Plugin scaffolding** — ✓ shipped (v1: stateless, screenshot
    plugin as first example, brake hook gates invocations naturally

@@ -765,22 +765,88 @@ fallbacks; `save(**kwargs)` writes deltas through to
 brake_state.save_limits. Schema documented in module docstring
 with future placeholder fields commented (theme,
 default_profile, keybind_overrides, agent_defaults,
-last_session_id for the morgue). NO caller migration in this
-commit — existing brake_state.load_limits / save_limits stay
-for backward compat; new code reaches for Preferences. ~210 LOC.
+last_session_id for the morgue). ~210 LOC.
 
-**Next session picks up at: open netrunner choice.**
-  - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
-    build-plan item 13's quota signal.
-  - Tools-UI sub-feature 3 (H haiku research sidebar) — needs
-    subprocess + streaming render; bigger lift.
-  - Mechanic v0→v1 bridge (liveness heartbeat + LLM session
-    half) — bigger lift, defer until pre-1.0.
-  - Migration of brake_state.load/save callers to flow through
-    Preferences (light refactor; not blocking anything).
-  - Remaining discrete bugs (kill doesn't interrupt in-flight;
-    silent wedge cx-796e0468) — both deferred pending design /
-    more data points.
+**✅ MECHANIC v0→v1 BRIDGE SHIPPED 2026-05-04** (build-plan item
+0d, commit ecead5a). Liveness heartbeat. Deck writes
+`<home>/.cyberdeck/heartbeat` every 5s on a Textual interval
+timer (timestamp + monotonic clock). Mechanic reads mtime each
+tick; logs "STALE HEARTBEAT" warning after 20s threshold (~4
+missed ticks); logs "heartbeat recovered" when fresh again.
+v0+1 LOGS ONLY — no automatic action on detected wedge.
+Catches the case PID-watching alone misses: deck PID alive but
+TUI event loop frozen. v1 LLM-session triage (build-plan item
+0e) is deferred — bigger lift, design-first. ~80 LOC across
+tui.py + mechanic.py.
+
+**✅ PREFERENCES MIGRATION SHIPPED 2026-05-04** (commit 9195ceb).
+tui.py callsites of `brake_state.load_limits / save_limits`
+migrated to `self.prefs.<field>` accessors + `self.prefs.save()`.
+Persistence semantics unchanged (Preferences delegates
+internally); same state.json shape. brake_state's load/save_limits
+still exported for any non-tui caller (none today). ~40 LOC
+delta.
+
+---
+
+## Next session battle plan
+
+The deck is at a clean phase point. Caliber slice is 4/5 shipped;
+all build-plan items 0/0a/0b/0c-partial/0d closed. Recommended
+order for the next push, ranked by tractability:
+
+1. **Tools-UI sub-feature 3 (H haiku research sidebar)** — the
+   one piece of build-plan 0c that's still open. ~150 LOC, but
+   real complexity: subprocess management within a modal, streaming
+   inline render, cancel mechanism, brake-hook integration for
+   the Haiku spawn (it's `claude -p ... --model haiku`). Design-
+   first work. The reusable EffortPickerScreen could pair
+   naturally if you decide the sidebar needs an effort picker.
+
+2. **Mechanic v1 LLM-session half** (build-plan 0e). The bridge
+   slice now provides the trigger signal; v1 is "what to do." Spawn
+   fresh claude on the supervisor side, read deck log for context,
+   emit triage report. ~300 LOC. Design needs more thought —
+   subprocess primitives differ on the supervisor side (no Construct
+   available; mechanic.py is sibling-process, not part of deck).
+
+3. **Caliber Phase 4** — STILL BLOCKED on build-plan item 13
+   (quota signal). Don't pick this up until item 13 lands.
+
+4. **Discrete bugs** — both still deferred:
+   - Kill doesn't interrupt in-flight assistant turns (needs
+     design alongside future inject-and-interrupt v2)
+   - Silent wedge investigation cx-796e0468 (needs more
+     real-deck data points)
+
+5. **Architecture review** fires automatically 2026-06-01 09:00
+   EDT (taskId `cyberdeck-architecture-review`). The agent
+   phase-checks first; expect findings on the heavy churn from
+   this session (tools/plugins/profiles retool + caliber slice +
+   doctor + preferences + mechanic bridge).
+
+**Real-deck verification opportunities** for the netrunner's next
+session:
+- **Limits modal panel** — press `l`, verify two-column layout;
+  press `E` to open EffortPickerScreen (1-5 buttons), verify
+  selection updates Daemon row inline; Ctrl+S commits
+- **Caliber Phase 5 surfaces** — sidebar should show
+  `daemon: opus·high`, construct panes should render `· caliber`
+  suffix in headers when constructs spawn
+- **Tools-UI** — open Tools tab, press space on a tool/plugin
+  row (LaunchScreen with envelope), press z (info modal)
+- **Doctor** — `python tui.py --doctor` should print 5 PASS
+  rows; first run after deleting `<home>/.cyberdeck/first_run_complete`
+  should show diagnostics then proceed
+- **Mechanic heartbeat** — run via launch.bat, check mechanic
+  stderr for "heartbeat file: ..." line; under normal operation,
+  no STALE warnings should appear
+
+**Branch state**: `claude/trusting-meitner-f701eb` ahead of
+`origin/main` by ~30 commits. Most recent slice + summary
+docs in CLAUDE.md / cyberdeck-state.md / cyberdeck-build-plan.md.
+The single context window for this session got expensive — picking
+up in a fresh chat is cheaper.
 
 **Architecture review** scheduled to fire 2026-06-01 09:00
 EDT (taskId `cyberdeck-architecture-review`); the agent
