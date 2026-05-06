@@ -2010,6 +2010,79 @@ and 11.
   splits it into Strips, so scrolling stays line-by-line.
 
 ### Async / subprocess
+- **🚨 MULTI-LINE ARGV ON WINDOWS — TRUNCATES AT FIRST NEWLINE.**
+  THE most recurring bug in the project's history. Six or seven
+  separate incidents across chat-era and Claude Code era; we keep
+  re-introducing it because the symptom is silent (no error, no
+  warning — content just disappears). Promoted to a top-level
+  Hard Rule in CLAUDE.md (2026-05-05). Read this entry once,
+  remember the fix forever.
+
+  **Mechanism:** Windows' cmd.exe and CreateProcess argv parsing
+  silently truncate command-line argument values at the first
+  `\n`. POSIX shells (Linux, macOS) handle multi-line argv
+  correctly, so the bug is Windows-specific in symptom — but the
+  fix is platform-agnostic, and the deck targets hardware-agnostic
+  deployment (RPi-Linux is the eventual home), so we always use
+  the platform-agnostic pattern.
+
+  **Most recent diagnosis (2026-05-05, Advisor round 4):**
+  Passing the Advisor's ~5800-char composed system prompt to
+  `claude -p --system-prompt "$prompt"` resulted in the model
+  receiving only the opening sentence — "You are the Advisor for
+  ONE specific tool: <name>." — and absolutely nothing else. The
+  model honestly reported "I don't have a README"; it didn't.
+  Diagnosed by asking the model to verbatim-quote its own
+  EXTENDED DOCUMENTATION block; reply was "NO EXTENDED
+  DOCUMENTATION SECTION." Repro'd cleanly with a synthetic 3-line
+  prompt: lines 2 and 3 silently clipped under `--system-prompt`;
+  both survive intact under `--system-prompt-file`.
+
+  **Symptom checklist** (any of these → suspect this bug):
+  - Subprocess receives only the first line of multi-line content
+    you tried to pass via argv.
+  - Model "honestly reports" missing context that you know you
+    sent (e.g. "I don't have a README" when you injected one).
+  - Behavior changes when you collapse newlines to spaces in your
+    argv value.
+  - "Works on Linux, broken on Windows."
+
+  **Fix (canonical):** Use the `-file` variant of the flag.
+  Claude Code provides `--system-prompt-file` for
+  `--system-prompt`, `--append-system-prompt-file` for
+  `--append-system-prompt`, `--mcp-config <file>` for
+  `--mcp-config <json>`, etc. Write the content to a temp file
+  via `tempfile.mkstemp`, pass the path, unlink in `finally`.
+
+  **Existing examples to copy from:**
+  - `advisor.py:_run_one` — Family A (full replace) pattern.
+  - `watchdog.py:_process_oneshot` — Family B (append) pattern.
+  Both use `tempfile.mkstemp` + `finally: os.unlink(...)` for
+  cleanup.
+
+  **Workarounds we've used in the past (lossy but functional):**
+  - `construct.py:468` collapses all whitespace (including
+    newlines) to single spaces before passing as argv —
+    `addendum_arg = " ".join(joined.split())`. Works (no
+    truncation) but loses paragraph structure. Acceptable for
+    short addenda, lossy for long ones. The systemic spawn-
+    isolation slice (build-plan 000) will upgrade this to
+    `--append-system-prompt-file`.
+  - The watchdog STREAMING path (`_process_streaming`) inlines
+    the system prompt into the first user JSONL message rather
+    than passing it as a flag at all — different mechanism, same
+    rationale (avoid argv-newline issues entirely).
+
+  **The systemic spawn-isolation slice (build-plan 000) inherits
+  this rule** — every role-prompt injection MUST use the file-
+  based flag. The design doc has worked examples for both
+  Family A and Family B.
+
+  **Lesson, paraphrased:** any subprocess flag that takes
+  multi-line content as an argv value is a tripwire on Windows.
+  Always prefer the `-file` variant when one exists. If a flag
+  doesn't have a `-file` variant, inline the content into the
+  user message instead (the streaming-watchdog approach).
 - **`--bare` breaks Claude Max OAuth auth.** Filed 2026-05-05
   during Advisor verification. Quoting `claude --help` directly
   (NOT obvious from the memory docs): `--bare` says *"Anthropic

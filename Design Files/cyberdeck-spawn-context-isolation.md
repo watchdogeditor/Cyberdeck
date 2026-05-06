@@ -284,46 +284,72 @@ preserve claude code's tool-use scaffolding.
 Watchdog tripwire authoring, Mechanic v1.
 
 ```python
-cmd = [
-    "claude", "-p",
-    "--system-prompt", composed_system_prompt,  # general + role + …
-    "--tools", "",
-    "--disable-slash-commands",
-    "--no-session-persistence",
-    "--model", model, "--effort", effort,
-]
-env = {
-    **os.environ,
-    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
-    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-    "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
-}
+# Write composed prompt to temp file (argv truncates at \n —
+# see "--system-prompt truncates at the first newline" gotcha
+# in cyberdeck-state.md). Cleanup in finally.
+fd, sysprompt_path = tempfile.mkstemp(...)
+os.close(fd)
+Path(sysprompt_path).write_text(composed_system_prompt, encoding="utf-8")
+try:
+    cmd = [
+        "claude", "-p",
+        "--system-prompt-file", sysprompt_path,
+        "--tools", "",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--model", model, "--effort", effort,
+    ]
+    env = {
+        **os.environ,
+        "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
+    }
+    # ... spawn, communicate, decode ...
+finally:
+    os.unlink(sysprompt_path)
 ```
 
 **Family B — "CURATED context, tool-using"**: Daemon, Constructs,
 Pool warmers.
 
 ```python
-cmd = [
-    "claude", "-p",   # or streaming flags for the daemon
-    "--append-system-prompt", composed_addendum,  # general + role + profile + …
-    "--disable-slash-commands",   # we don't want skills firing
-    "--model", model, "--effort", effort,
-    # tool restrictions: NOT --tools "" — these roles use tools.
-    # Brake hook still gates per-call decisions.
-]
-env = {
-    **os.environ,
-    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
-    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-    "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
-}
+# Same temp-file pattern for --append-system-prompt-file (the
+# argv-newline-truncation bug applies to --append-system-prompt
+# too — verified via the same diagnostic).
+fd, addendum_path = tempfile.mkstemp(...)
+os.close(fd)
+Path(addendum_path).write_text(composed_addendum, encoding="utf-8")
+try:
+    cmd = [
+        "claude", "-p",   # or streaming flags for the daemon
+        "--append-system-prompt-file", addendum_path,
+        "--disable-slash-commands",
+        "--model", model, "--effort", effort,
+    ]
+    env = {
+        **os.environ,
+        "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
+    }
+    # ... spawn, communicate, decode ...
+finally:
+    os.unlink(addendum_path)
 ```
 
 The key difference: Family A replaces the system prompt
-(`--system-prompt`); Family B appends to it
-(`--append-system-prompt`). Family A roles don't need claude
-code's built-in tool-use scaffolding; Family B roles do.
+(`--system-prompt-file`); Family B appends to it
+(`--append-system-prompt-file`). Family A roles don't need
+claude code's built-in tool-use scaffolding; Family B roles do.
+
+**🚨 Always use the `-file` variants of system-prompt flags.**
+Argv mode silently truncates multi-line content at the first
+newline. Verified on Claude Code 2.1.126 + Windows during
+Advisor round-4 fix (2026-05-05). Filed in `cyberdeck-state.md`
+Filed gotchas. Streaming subprocesses (daemon's stream-json
+backend, watchdog's streaming Q&A) hit the same flag, so this
+applies to them too.
 
 ---
 

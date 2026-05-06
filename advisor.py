@@ -55,9 +55,11 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 
@@ -391,13 +393,35 @@ class Advisor:
         the CLAUDE.md/auto-memory suppression (they're independently
         documented to do exactly that without breaking auth).
 
+        Round-4 caught a critical bug in the round-3 recipe:
+        `--system-prompt <text>` (passing the prompt as an argv
+        value) **truncates at the first newline on Windows**. The
+        Advisor's prompt is ~5800 chars including the plugin
+        README; the first newline is right after the opening
+        line, so the model was receiving only "You are the
+        Advisor for ONE specific tool: <name>." and absolutely
+        nothing else. The model honestly reported "I don't have
+        a README" — it didn't. Diagnosed by asking the model to
+        verbatim-quote its own EXTENDED DOCUMENTATION block; it
+        replied "NO EXTENDED DOCUMENTATION SECTION." Repro'd
+        with a synthetic 3-line prompt: lines 2 and 3 silently
+        clipped under `--system-prompt`; both survive intact
+        under `--system-prompt-file`.
+
+        Fix: write the composed system prompt to a temp file and
+        pass `--system-prompt-file <path>` instead. Cleanup runs
+        in finally so the file is removed even on exception.
+        Filed as a deck gotcha: any subprocess passing
+        multi-line content via argv on Windows is a tripwire.
+
         Final recipe:
 
-          --system-prompt:          REPLACES the default system prompt
-                                    (we don't need claude code's
-                                    default tool-use instructions).
-                                    Verbatim, "Replaces the entire
-                                    default prompt".
+          --system-prompt-file <path>: REPLACES the default system
+                                    prompt with the contents of a
+                                    file. Avoids the argv newline
+                                    truncation that breaks
+                                    --system-prompt with multi-
+                                    line content.
           --tools "":               disables every built-in tool —
                                     verbatim, 'Use "" to disable all'
           --disable-slash-commands: skips skills + slash commands
@@ -427,15 +451,43 @@ class Advisor:
         prior = tuple(t for t in self._turns if t is not turn)
         user_prompt = build_user_prompt(turn.question, prior)
 
+        # Write the system prompt to a temp file. `--system-prompt`
+        # truncates at the first newline when the prompt is passed
+        # as an argv value (Windows argv parsing or claude code's
+        # parser; verified empirically 2026-05-05). `--system-
+        # prompt-file` reads the file and preserves multi-line
+        # content correctly. Use a per-turn temp file so concurrent
+        # turns (shouldn't happen — we serialize via _lock — but be
+        # robust) don't collide.
+        sysprompt_path: Optional[str] = None
+        try:
+            fd, sysprompt_path = tempfile.mkstemp(
+                suffix=".txt", prefix=f"advisor-{self.id}-",
+            )
+            os.close(fd)
+            Path(sysprompt_path).write_text(
+                self.system_prompt, encoding="utf-8",
+            )
+        except Exception as e:
+            turn.failed = True
+            turn.error = f"failed to write system-prompt file: {e}"
+            turn.answered_at = time.time()
+            if sysprompt_path:
+                try:
+                    os.unlink(sysprompt_path)
+                except Exception:
+                    pass
+            return
+
         cmd = [
             bin_path,
             "-p",
-            # FULL system-prompt replacement (not append). The
-            # default Claude Code system prompt is tool-oriented —
-            # encourages exploration, file edits, etc. The Advisor
-            # has none of those duties; replacing the prompt
-            # entirely keeps the model focused on the scope rule.
-            "--system-prompt", self.system_prompt,
+            # FULL system-prompt replacement via FILE (not argv —
+            # argv mode silently truncates at the first newline).
+            # The default Claude Code system prompt is tool-
+            # oriented; replacing it entirely keeps the model
+            # focused on the scope rule.
+            "--system-prompt-file", sysprompt_path,
             # Disable every built-in tool. The Advisor answers from
             # its system prompt alone — no Read/Bash/Edit/etc.
             "--tools", "",
@@ -453,10 +505,10 @@ class Advisor:
         ]
 
         # Belt-and-suspenders env vars for context-leak suppression.
-        # Each one independently kills a different auto-load path;
-        # combined with --bare (which already covers them), this is
-        # defense in depth in case --bare's behavior changes in a
-        # future Claude Code version.
+        # Each one independently kills a different auto-load path.
+        # Per-subprocess scope (passed via env= kwarg below); does
+        # NOT mutate the deck's own env or anything else on the
+        # system.
         env = {
             **os.environ,
             "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
@@ -465,60 +517,71 @@ class Advisor:
         }
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self.cwd,
-                env=env,
-            )
-        except FileNotFoundError:
-            turn.failed = True
-            turn.error = f"claude binary not found: {self.claude_bin}"
-            turn.answered_at = time.time()
-            return
-        except Exception as e:
-            turn.failed = True
-            turn.error = f"subprocess spawn failed: {e}"
-            turn.answered_at = time.time()
-            return
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=user_prompt.encode("utf-8")),
-                timeout=self.timeout,
-            )
-        except asyncio.TimeoutError:
             try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            turn.failed = True
-            turn.error = f"timed out after {self.timeout}s"
-            turn.answered_at = time.time()
-            return
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self.cwd,
+                    env=env,
+                )
+            except FileNotFoundError:
+                turn.failed = True
+                turn.error = f"claude binary not found: {self.claude_bin}"
+                turn.answered_at = time.time()
+                return
+            except Exception as e:
+                turn.failed = True
+                turn.error = f"subprocess spawn failed: {e}"
+                turn.answered_at = time.time()
+                return
 
-        if proc.returncode != 0:
-            err_text = stderr.decode("utf-8", errors="replace").strip()
-            turn.failed = True
-            turn.error = (
-                f"claude exited {proc.returncode}: "
-                f"{err_text[:200] if err_text else '(no stderr)'}"
-            )
-            turn.answered_at = time.time()
-            return
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=user_prompt.encode("utf-8")),
+                    timeout=self.timeout,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                turn.failed = True
+                turn.error = f"timed out after {self.timeout}s"
+                turn.answered_at = time.time()
+                return
 
-        answer = stdout.decode("utf-8", errors="replace").strip()
-        if not answer:
-            turn.failed = True
-            turn.error = "claude returned empty output"
-            turn.answered_at = time.time()
-            return
+            if proc.returncode != 0:
+                err_text = stderr.decode("utf-8", errors="replace").strip()
+                turn.failed = True
+                turn.error = (
+                    f"claude exited {proc.returncode}: "
+                    f"{err_text[:200] if err_text else '(no stderr)'}"
+                )
+                turn.answered_at = time.time()
+                return
 
-        turn.answer = answer
-        turn.answered_at = time.time()
+            answer = stdout.decode("utf-8", errors="replace").strip()
+            if not answer:
+                turn.failed = True
+                turn.error = "claude returned empty output"
+                turn.answered_at = time.time()
+                return
+
+            turn.answer = answer
+            turn.answered_at = time.time()
+        finally:
+            # Always clean up the temp prompt file. Survives
+            # subprocess crashes, timeouts, exceptions during
+            # decode. Best-effort — a leaked temp file is harmless,
+            # but we'd rather not have them.
+            if sysprompt_path:
+                try:
+                    os.unlink(sysprompt_path)
+                except Exception:
+                    pass
 
 
 # ---- target builders -------------------------------------------------------

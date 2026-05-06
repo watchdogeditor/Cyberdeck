@@ -1088,6 +1088,26 @@ vars with `$env:NAME = "..."`, not bash syntax.
 
 The orientation doc explains the reasoning behind each. Condensed:
 
+- **🚨 NEVER pass multi-line content through argv on Windows.**
+  This is the most-recurring bug in the project's history (filed
+  six or seven times across the chat-era and Claude Code era).
+  Windows' cmd.exe / CreateProcess argv parsing **silently
+  truncates at the first `\n`**. Symptom: subprocess receives only
+  the first line of whatever you tried to pass; everything after
+  the first newline is silently absent. Confirmed on Claude Code
+  2.1.126 + Windows 11 (2026-05-05). **The rule:** any time you'd
+  pass a multi-line string as a command-line argument, use the
+  `-file` variant of the flag instead (`--system-prompt-file`,
+  `--append-system-prompt-file`, `--append-system-prompt-file`,
+  `--mcp-config <file>`, etc.) and write the content to a temp
+  file. Cleanup in `finally` so the file is unlinked after the
+  subprocess exits. Linux/macOS handle multi-line argv
+  correctly, so this is Windows-specific in symptom — but the
+  file-based fix is platform-agnostic and the deck targets
+  hardware-agnostic deployment (RPi-Linux is the eventual home).
+  Existing examples: `advisor.py:_run_one`,
+  `watchdog.py:_process_oneshot`. See `cyberdeck-state.md` Filed
+  gotchas → Async / subprocess for the full diagnosis.
 - **Real-claude testing beats mock testing** for anything touching
   subprocess lifecycle, streaming, or Windows quirks.
 - **Close the loop on each refactor before stopping.** Half-finished

@@ -48,7 +48,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -1354,6 +1356,18 @@ class Watchdog:
           - timeout (DEFAULT_TIMEOUT)
           - empty output (treated as failure with a hint, since silent
             success would be confusing)
+
+        System-prompt delivery uses `--append-system-prompt-file`
+        rather than `--append-system-prompt` to dodge Windows argv
+        newline-truncation. Diagnosed during Advisor round-4 fix
+        2026-05-05: argv-mode silently truncates multi-line content
+        at the first \\n. WATCHDOG_SYSTEM_PROMPT is 152 lines, so
+        the watchdog one-shot fallback was previously receiving
+        only its opening sentence. Streaming path inlines the
+        system prompt into user messages, sidestepping the bug,
+        which is why this never manifested — streaming is the
+        default. See cyberdeck-state.md "Filed gotchas → Async /
+        subprocess" for the full diagnosis.
         """
         # Resolve the binary path. This catches "claude not on PATH"
         # cleanly with a clear error, instead of an opaque
@@ -1373,6 +1387,28 @@ class Watchdog:
             f"{wq.question}"
         )
 
+        # Write the system prompt to a temp file (argv truncation
+        # gotcha). Cleanup in finally so failure paths don't leak.
+        sysprompt_path: Optional[str] = None
+        try:
+            fd, sysprompt_path = tempfile.mkstemp(
+                suffix=".txt", prefix=f"watchdog-{self.id}-",
+            )
+            os.close(fd)
+            with open(sysprompt_path, "w", encoding="utf-8") as f:
+                f.write(self.system_prompt)
+        except Exception as e:
+            wq.failed = True
+            wq.error = f"failed to write system-prompt file: {e}"
+            wq.answered_at = time.time()
+            if sysprompt_path:
+                try:
+                    os.unlink(sysprompt_path)
+                except Exception:
+                    pass
+            self._safe_callback(wq)
+            return
+
         cmd = [
             bin_path,
             "-p",
@@ -1388,68 +1424,80 @@ class Watchdog:
             # real problem we've hit elsewhere. Stdin is universally
             # safe.
             "--permission-mode", "bypassPermissions",
-            "--append-system-prompt", self.system_prompt,
+            # System prompt delivered via FILE — argv mode truncates
+            # at the first newline.
+            "--append-system-prompt-file", sysprompt_path,
         ]
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self.cwd,
-            )
-        except FileNotFoundError:
-            wq.failed = True
-            wq.error = f"claude binary not found: {self.claude_bin}"
-            wq.answered_at = time.time()
-            self._safe_callback(wq)
-            return
-        except Exception as e:
-            wq.failed = True
-            wq.error = f"subprocess spawn failed: {e}"
-            wq.answered_at = time.time()
-            self._safe_callback(wq)
-            return
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode("utf-8")),
-                timeout=self.timeout,
-            )
-        except asyncio.TimeoutError:
             try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            wq.failed = True
-            wq.error = f"timed out after {self.timeout}s"
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self.cwd,
+                )
+            except FileNotFoundError:
+                wq.failed = True
+                wq.error = f"claude binary not found: {self.claude_bin}"
+                wq.answered_at = time.time()
+                self._safe_callback(wq)
+                return
+            except Exception as e:
+                wq.failed = True
+                wq.error = f"subprocess spawn failed: {e}"
+                wq.answered_at = time.time()
+                self._safe_callback(wq)
+                return
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=prompt.encode("utf-8")),
+                    timeout=self.timeout,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                wq.failed = True
+                wq.error = f"timed out after {self.timeout}s"
+                wq.answered_at = time.time()
+                self._safe_callback(wq)
+                return
+
+            if proc.returncode != 0:
+                err_text = stderr.decode("utf-8", errors="replace").strip()
+                wq.failed = True
+                wq.error = (
+                    f"claude exited {proc.returncode}: "
+                    f"{err_text[:200] if err_text else '(no stderr)'}"
+                )
+                wq.answered_at = time.time()
+                self._safe_callback(wq)
+                return
+
+            answer = stdout.decode("utf-8", errors="replace").strip()
+            if not answer:
+                wq.failed = True
+                wq.error = "claude returned empty output"
+                wq.answered_at = time.time()
+                self._safe_callback(wq)
+                return
+
+            wq.answer = answer
             wq.answered_at = time.time()
             self._safe_callback(wq)
-            return
-
-        if proc.returncode != 0:
-            err_text = stderr.decode("utf-8", errors="replace").strip()
-            wq.failed = True
-            wq.error = (
-                f"claude exited {proc.returncode}: "
-                f"{err_text[:200] if err_text else '(no stderr)'}"
-            )
-            wq.answered_at = time.time()
-            self._safe_callback(wq)
-            return
-
-        answer = stdout.decode("utf-8", errors="replace").strip()
-        if not answer:
-            wq.failed = True
-            wq.error = "claude returned empty output"
-            wq.answered_at = time.time()
-            self._safe_callback(wq)
-            return
-
-        wq.answer = answer
-        wq.answered_at = time.time()
-        self._safe_callback(wq)
+        finally:
+            # Always clean up the temp prompt file. Best-effort —
+            # leaked temp files are harmless but we'd rather not
+            # have them.
+            if sysprompt_path:
+                try:
+                    os.unlink(sysprompt_path)
+                except Exception:
+                    pass
 
     def _safe_callback(self, wq: WatchdogQuestion) -> None:
         """Fire the question's callback, swallowing exceptions so a
