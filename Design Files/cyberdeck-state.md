@@ -739,12 +739,227 @@ following the netrunner's "in that order" recommendation:
 Total ~1300 LOC across 8 commits. Real-deck verification pending
 on most surfaces — netrunner will validate during normal use.
 
+---
+
+**✅ ADVISOR — H KEY ON TOOL/PLUGIN ROWS SHIPPED 2026-05-05**
+(uncommitted as of this state.md update). Tools-UI Thought of
+Dave sub-feature 3 (build-plan 0c) closed — slice complete.
+
+**Reframe mid-build.** The original 2026-05-04 design called this
+the "H haiku research sidebar" — a streaming claude-haiku panel
+inside the z-info modal. The netrunner reframed it on pickup:
+not a research panel, an **Advisor**. Per their words:
+
+    "It is extremely specific — exclusively dedicated to
+    informing you about that tool. It does nothing else and
+    exclusively takes questions about the tool and its use
+    cases. The most you can ask it is 'how can I use it to do
+    X' and name other tools in the process. The Advisor can
+    see the names of the full tool list if needed."
+
+The reframe is meaningful: a research panel is open-ended ("tell
+me about ripgrep"); an Advisor is bounded ("how do I use ripgrep
+to do X"). The system prompt enforces this — off-topic questions
+get a polite refusal + redirect to the relevant sibling Advisor
+or the daemon. Narrow scope = high signal = cheap per-call =
+exactly the kind of capability accumulation philosophy thesis 2
+calls out.
+
+**Substrate.** Watchdog-pattern one-shot subprocess
+(`claude -p` per question, stdin-piped prompt) — not streaming.
+Three reasons:
+  1. Multiple Advisor sessions can stack across a deck-use
+     session (netrunner asks about ripgrep, then jq, then back
+     to ripgrep on a different question); a streaming subprocess
+     per session would be heavyweight.
+  2. Multi-turn context within ONE Advisor session is cheap to
+     pass in the user prompt itself (PRIOR Q / PRIOR A pairs
+     prepended). No `--resume` machinery needed.
+  3. Total Q&A volume per session is small; one-shot latency
+     (a few seconds on cache hit) beats streaming-subprocess
+     complexity for this use case.
+
+**Caliber.** Forced haiku + low. Tool advice is lookup-and-format,
+not deep reasoning. Cost asymmetry vs Opus (~30x per token) is
+exactly what we want exploited here. Reified as `ADVISOR_MODEL`
++ `ADVISOR_EFFORT` constants in advisor.py — modal renders them
+in the subtitle (`haiku·low · scope: questions about ripgrep
+only`) so the netrunner sees what they're paying for.
+
+**System prompt.** Built per-session from the AdvisorTarget
+view-model (name + kind label + invocation + description +
+help_text + extended_text + availability + source path) plus
+the names of all sibling tools/plugins. Scope rule baked in
+as the centerpiece. Stable across all turns in one session
+(cache-friendly — same shape as the 2026-05-02 cache-fix
+discipline).
+
+**Sibling list — names only.** The Advisor is allowed to
+mention other tools by name when answering "how would I
+combine X with Y" questions, but it must NOT pretend to know
+how those siblings work — its expertise is bounded to the
+target. Names give it enough vocabulary to redirect ("for
+that, you'd want jq — open the Advisor on jq for details")
+without putting unfounded claims in its mouth. Filter
+excludes the target's own name from its sibling block (small
+thing, but the prompt reads cleaner).
+
+**Modal UX.** AdvisorScreen — cyan accent, RichLog scrollback
++ Input pinned below, greeting on mount echoes the scope rule
+("Advisor scoped to ripgrep · available · Ask anything about
+how to use this tool. Off-topic questions are politely
+refused."). y yanks the visible Q&A as plain text (Q: …\nA: …
+per turn); Esc/H closes. Failed turns render as
+`A: advisor failed: <reason>` in red — netrunner can re-ask
+without the modal crashing.
+
+**Wiring — modal-scoped, not App-scoped.** First pass had `H`
+bound at App level firing on the focused list-item. Netrunner
+course-corrected mid-session: "I was hoping this would be
+something contextual for when the tool was in expanded view."
+Reverted that and moved the binding into ExpandModal.
+Final shape:
+
+  1. Press `z` on a tool/plugin row → ExpandModal opens with
+     synthesized info text (existing z-info path, sub-feature
+     2). The modal renders a prominent cyan "press H for
+     interactive help" hint above the manifest text, and `h
+     Advisor` shows up in the bottom hint line. Both are
+     conditional on the modal carrying an `advisor_target` —
+     other ExpandModal modes (chatlog magnify, file viewer,
+     fleet log magnify) leave `advisor_target=None` and the
+     hints are absent.
+  2. Press lowercase `h` inside the modal → ExpandModal
+     dismisses + AdvisorScreen pushes on the App. Netrunner
+     reads about the tool, then asks the Advisor about it —
+     contextual flow.
+
+ExpandModal grows two new constructor params:
+`advisor_target: Optional[AdvisorTarget]` and
+`advisor_siblings: tuple[str, ...]`. Both threaded through
+`_open_text_view` and `_open_file_view` from
+`action_expand`'s ToolListItem and PluginListItem branches.
+New helper `_build_advisor_siblings(target_name)` on the App
+centralises the sibling-name list (filters out target's own
+name; orders tools before plugins to match the unified Tools
+panel ordering).
+
+Lowercase `h` not capital — the netrunner asked for that
+shape; aligns better with future hjkl navigation work, keeps
+the deck-wide keymap lighter, and the "press H" tooltip
+casing is purely a display affordance (uppercase for
+readability — same convention vim uses showing :H even when
+the binding is :h).
+
+**Plugin path** reads README.md at modal-open time (best-effort,
+200KB cap, errors fold to manifest-only system prompt). README
+is the LLM-facing interface doc per plugin spec — feeding it
+into the Advisor's system prompt is what makes plugin Advisors
+actually useful (the dataclass description is one line; READMEs
+have flag tables, examples, troubleshooting).
+
+**Files.** New `advisor.py` (~330 LOC): `AdvisorTarget` dataclass
+(view-model), `AdvisorTurn` dataclass (Q+A record),
+`build_system_prompt`, `build_user_prompt`, `Advisor` class
+(async oracle with asyncio.Lock serialization),
+`target_from_tool` / `target_from_plugin` adapters (duck-typed
+to avoid import cycles). tui.py: `AdvisorScreen` modal (~200
+LOC after AskWatchdogScreen pattern), `action_advise_focused`
+(~70 LOC) + H binding. Total ~600 LOC.
+
+**Real-deck verification pending** — wiring smoke-tested
+(advisor module unit checks all pass: target builders,
+system-prompt composition, multi-turn user prompt with
+failed-turn exclusion, sibling-name filter). AdvisorScreen
+import + H binding registration confirmed. Subprocess path
+mirrors Watchdog._process_oneshot exactly, so behavior parity
+expected.
+
+---
+
+**🚨 ROUND-2 FIX: AUTO-CONTEXT DISCOVERY (2026-05-05).**
+First real-deck Advisor pass exposed two failures:
+
+  1. The model lost track of its scope anchor and asked the
+     netrunner to clarify which plugin — already-told-you-which
+     information. Sonnet/medium follows narrowly-scoped prompts
+     more reliably than Haiku/low; bumped caliber.
+  2. The model answered using content from the deck's project-
+     root CLAUDE.md ("From the CLAUDE.md, I know the deck has a
+     plugin system…"). NOT a tool-use leak — verified against
+     https://code.claude.com/docs/en/memory: **Claude Code
+     auto-loads CLAUDE.md from cwd + walks UP the parent dir
+     tree concatenating all of them**, plus user-level
+     `~/.claude/CLAUDE.md`, plus per-git-repo auto memory
+     (`~/.claude/projects/<repo-key>/memory/MEMORY.md`, first
+     200 lines / 25KB). All silently. None of it is what the
+     Advisor is supposed to know.
+
+Tactical Advisor fix shipped 2026-05-05 (took three rounds):
+  - **Round 2** tried `--bare` for one-flag suppression. Real-deck
+    caught a silent exit-1 on every spawn. Cause: `claude --help`
+    reveals `--bare` "Anthropic auth is strictly ANTHROPIC_API_KEY
+    or apiKeyHelper via --settings (OAuth and keychain are never
+    read)" — and the netrunner's deck uses OAuth/keychain via
+    Claude Max. **Filed as a gotcha** (see Filed gotchas + the
+    `🚨 GOTCHA` block on build-plan item 000): don't `--bare`
+    any OAuth-auth'd subprocess.
+  - **Round 3 (final, working).** Dropped `--bare`; used env
+    vars + `--disable-slash-commands` instead. Each is
+    independently documented and doesn't break auth:
+      - `--system-prompt` (REPLACES the default)
+      - `--tools ""` (disables every built-in tool)
+      - `--disable-slash-commands` (skips skills + slash cmds —
+        what `--bare` was doing for those layers)
+      - `--no-session-persistence` (no transcript per Q)
+      - env: `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` /
+        `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` /
+        `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`
+        (per-subprocess scope via `env=` kwarg to
+        `create_subprocess_exec` — doesn't pollute the deck's
+        own env or anything else on the system)
+  - Caliber bump: haiku/low → sonnet/medium
+  - System prompt rewrite: sharper identity anchor ("YOU ALREADY
+    KNOW WHICH TOOL"), restructured for salience (lead with
+    HARD RULES, then content, then style)
+  - Round-3 verified end-to-end against real claude on the
+    netrunner's machine: ripgrep advice query returns clean
+    formatted answer; "what is the cyberdeck" deck-context query
+    correctly fails to recognize the term (CLAUDE.md properly
+    suppressed).
+
+Plus AdvisorScreen w/s line-scroll bindings (active when Input
+defocused via Tab) — netrunner asked for vim-shaped scroll on
+the scrollback. PgUp/PgDn for paging preserved.
+
+**The systemic discovery is much bigger than the Advisor.**
+Every subprocess the deck spawns — daemon, watchdog,
+constructs, pool warmers, tripwire-authoring spawns — has been
+silently inheriting the deck's project-root CLAUDE.md (~700
+lines of build plans, design notes, gotchas, in-flight slice
+descriptions). Likely explains:
+  - The "mysterious knowledge" the daemon and constructs have
+    always seemed to have of the deck's architecture.
+  - The residual ~19k cache_creation per spawn that the
+    2026-05-02 cache fix left unresolved (filed as "Anthropic's
+    court" — actually CLAUDE.md drift across sessions).
+  - Information leakage of in-flight design work into every
+    spawned construct.
+
+**Filed as build-plan item 000** — highest-priority deferred
+slice, ranks above the architecture review. Per-role spawn
+cwds + per-role CLAUDE.md per role + bootstrap-on-launch
+infrastructure. Estimated 600-1000 LOC across spawn sites +
+new bootstrap module + canon doc updates. Needs careful A/B
+verification because the daemon and constructs may have been
+free-riding on CLAUDE.md content; removing the auto-load will
+reveal under-specified system prompts.
+
+---
+
 **Next session picks up at: open netrunner choice.**
   - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
     build-plan item 13.
-  - Tools-UI sub-feature 3 (H haiku research sidebar) — needs
-    subprocess management + streaming inline render in the
-    z-info modal. Bigger lift; design-first.
   - Mechanic v1 LLM-session half — bigger lift; needs the LLM
     triage flow design + claude subprocess management for the
     supervisor side. The bridge slice (heartbeat) gives v1 its
@@ -1795,6 +2010,25 @@ and 11.
   splits it into Strips, so scrolling stays line-by-line.
 
 ### Async / subprocess
+- **`--bare` breaks Claude Max OAuth auth.** Filed 2026-05-05
+  during Advisor verification. Quoting `claude --help` directly
+  (NOT obvious from the memory docs): `--bare` says *"Anthropic
+  auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via
+  --settings (OAuth and keychain are never read)."* The
+  netrunner's deck uses Claude Max via OAuth/keychain. With
+  `--bare` set, every spawn exits 1 with no stderr because auth
+  never resolves. **Symptom**: `claude exited 1: (no stderr)`
+  on every subprocess call. **Fix**: drop `--bare`, use env
+  vars + `--disable-slash-commands` for the suppression layers
+  `--bare` was covering — they're independently documented and
+  don't break auth (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`,
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`,
+  `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`). Failure mode is
+  particularly nasty because integration tests with API-key
+  auth would pass while the netrunner's actual deck silently
+  fails. **Lesson**: any flag that mentions auth in its help
+  text is a tripwire on this codebase — read the help, not
+  just the docs page.
 - **`stdin.close()` on Windows ProactorEventLoop is fire-and-forget.**
   Always pair with `await stdin.wait_closed()` (with a timeout).
   Without this, transport `__del__` fires on a half-closed socket and

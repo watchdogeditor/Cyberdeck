@@ -62,6 +62,15 @@ from watchdog import (
     _fingerprint as _blacklist_fingerprint,
 )
 from tripwires import TripwireFire, TripwireAuthoringResult
+from advisor import (
+    Advisor,
+    AdvisorTarget,
+    AdvisorTurn,
+    ADVISOR_MODEL,
+    ADVISOR_EFFORT,
+    target_from_tool,
+    target_from_plugin,
+)
 from event_bus import EventBus, DeckEvent
 from logger import DeckLogger
 from connection_monitor import (
@@ -1664,6 +1673,287 @@ class AskWatchdogScreen(ModalScreen[Optional[str]]):
         self.dismiss(None)
 
 
+class AdvisorScreen(ModalScreen[None]):
+    """The Advisor — narrowly-scoped Q&A for one tool or plugin.
+
+    Spec framing (netrunner, 2026-05-05):
+        "It is extremely specific — exclusively dedicated to
+        informing you about that tool. It does nothing else and
+        exclusively takes questions about the tool and its use
+        cases. The most you can ask it is 'how can I use it to do
+        X' and name other tools in the process."
+
+    Tools-UI Thought of Dave sub-feature 3 (build-plan item 0c).
+    Sub-features 1 (space-launch) + 2 (z-info) shipped 2026-05-04;
+    this one closes the trio.
+
+    Substrate: one Advisor instance per modal session, holding a
+    `claude -p` one-shot subprocess pattern (see advisor.py). Each
+    Q is sent fresh; prior Q&As get re-fed in the user prompt so
+    follow-ups have context. Closing the modal kills the Advisor
+    along with it — no persistence across re-opens. The netrunner
+    can ask, learn, and move on; the deck doesn't grow a Q&A archive
+    behind their back.
+
+    Caliber: sonnet + medium (forced — see advisor.py). Originally
+    haiku/low to keep tool advice cheap, but real-deck testing
+    2026-05-05 caught Haiku/low losing track of its scope anchor
+    on vague questions ("what is this plugin?" → asked for
+    clarification despite being explicitly told the target).
+    Sonnet/medium follows the scope rule reliably.
+
+    Visual treatment: cyan accent (matches Tools tab energy), Input
+    pinned at the bottom, scrollback above. Q lines yellow, A lines
+    plain prose. `Esc` closes; `y` yanks the visible scrollback to
+    the clipboard so the netrunner can paste a useful exchange into
+    notes. Two non-resolved turns can stack while one's in flight
+    (the Advisor serializes via its own asyncio.Lock).
+    """
+
+    CSS = """
+    AdvisorScreen {
+        align: center middle;
+    }
+    #advisor_dialog {
+        width: 90%;
+        height: 90%;
+        padding: 1 2;
+        background: $panel;
+        border: round $accent;
+    }
+    #advisor_title {
+        height: 1;
+        margin-bottom: 1;
+        color: $accent;
+    }
+    #advisor_subtitle {
+        height: 1;
+        margin-bottom: 1;
+        color: $text-muted;
+    }
+    #advisor_log {
+        height: 1fr;
+        background: $surface;
+    }
+    #advisor_input {
+        margin-top: 1;
+    }
+    #advisor_hint {
+        height: 1;
+        margin-top: 1;
+        color: $text-muted;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close", show=True),
+        # `h` toggles closed too — same key opens it from the
+        # ExpandModal. Mirrors z/space pattern (open with same
+        # key as close).
+        Binding("h", "dismiss", "Close", show=False),
+        # Yank the scrollback. Useful when the Advisor produces a
+        # one-liner the netrunner wants to paste into notes or a
+        # construct prompt.
+        Binding("y", "copy", "Copy", show=True),
+        # Scroll the log. w/s = line scroll, PgUp/PgDn = page scroll
+        # — same convention as ExpandModal. The Input widget
+        # consumes typing chars while it has focus, so w/s only fire
+        # at the screen level when the netrunner has Tab'd out of
+        # the input. Mirrors the deck-wide vim-shaped scroll story.
+        Binding("w", "scroll_up", "↑", show=False),
+        Binding("s", "scroll_down", "↓", show=False),
+        Binding("pageup", "page_up", "Page ↑", show=False),
+        Binding("pagedown", "page_down", "Page ↓", show=False),
+    ]
+
+    def __init__(
+        self,
+        target: AdvisorTarget,
+        sibling_tool_names: tuple[str, ...] = (),
+        claude_bin: str = "claude",
+    ) -> None:
+        super().__init__()
+        self.advisor = Advisor(
+            target=target,
+            sibling_tool_names=sibling_tool_names,
+            claude_bin=claude_bin,
+        )
+        # Pre-render the title once; it doesn't change per session.
+        self._title = f"Advisor: {target.name}"
+        self._subtitle = (
+            f"{target.kind_label} · "
+            f"{ADVISOR_MODEL}·{ADVISOR_EFFORT} · "
+            f"scope: questions about {target.name} only"
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="advisor_dialog"):
+            yield Label(f"[b]{self._title}[/b]", id="advisor_title")
+            yield Label(self._subtitle, id="advisor_subtitle")
+            yield RichLog(
+                id="advisor_log",
+                max_lines=2000,
+                markup=True,
+                wrap=True,
+                min_width=40,
+                auto_scroll=True,
+            )
+            yield Input(
+                placeholder=(
+                    "how can I use it to do X? … (Enter to ask, Esc to close)"
+                ),
+                id="advisor_input",
+            )
+            yield Label(
+                "[dim]Esc / h close · Enter to ask · "
+                "y copy · w/s line · PgUp/PgDn page · "
+                "Tab to defocus input[/dim]",
+                id="advisor_hint",
+            )
+
+    def on_mount(self) -> None:
+        # Greet the netrunner so the empty modal isn't visually
+        # confusing. The greeting echoes the scope rule the Advisor
+        # itself enforces — sets expectations before the first Q.
+        log = self._log()
+        if log is not None:
+            t = self.advisor.target
+            avail = (
+                "[green]available[/green]"
+                if t.available else
+                f"[red]unavailable[/red] ({t.unavailable_reason})"
+            )
+            log.write(
+                f"[dim]Advisor scoped to[/dim] [b]{t.name}[/b] "
+                f"· {avail}"
+            )
+            log.write(f"[dim]{t.description}[/dim]")
+            log.write("")
+            log.write(
+                "[dim]Ask anything about how to use this tool. "
+                "Off-topic questions are politely refused.[/dim]"
+            )
+        try:
+            self.query_one("#advisor_input", Input).focus()
+        except Exception:
+            pass
+
+    def _log(self) -> Optional[RichLog]:
+        try:
+            return self.query_one("#advisor_log", RichLog)
+        except Exception:
+            return None
+
+    def action_scroll_up(self) -> None:
+        # w/s only fire at screen level when Input doesn't have
+        # focus (Input consumes typing chars first). Tab defocuses.
+        log = self._log()
+        if log is not None:
+            log.scroll_up(animate=False)
+
+    def action_scroll_down(self) -> None:
+        log = self._log()
+        if log is not None:
+            log.scroll_down(animate=False)
+
+    def action_page_up(self) -> None:
+        log = self._log()
+        if log is not None:
+            log.scroll_page_up(animate=False)
+
+    def action_page_down(self) -> None:
+        log = self._log()
+        if log is not None:
+            log.scroll_page_down(animate=False)
+
+    def action_copy(self) -> None:
+        """y: yank the visible Q&A exchange to the clipboard.
+
+        Format: plain text, "Q: ... / A: ..." per turn. The netrunner
+        wants this when an answer is worth pasting into a construct
+        prompt or notes file. Failed turns get a tagged line so the
+        copy isn't silently lossy."""
+        lines: list[str] = []
+        for t in self.advisor.turns:
+            lines.append(f"Q: {t.question}")
+            if t.failed:
+                lines.append(f"A: [advisor error: {t.error}]")
+            elif t.answer is not None:
+                lines.append(f"A: {t.answer}")
+            else:
+                lines.append("A: [pending]")
+            lines.append("")
+        if not lines:
+            self.app.notify("nothing to copy yet", severity="warning")
+            return
+        text = "\n".join(lines).rstrip() + "\n"
+        ok, err = clipboard.copy(text)
+        if ok:
+            self.app.notify(f"yanked {len(text)} chars to clipboard")
+        else:
+            self.app.notify(f"copy failed: {err}", severity="error")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        question = event.value.strip()
+        if not question:
+            return
+        # Clear the input immediately so the netrunner can keep typing
+        # before the answer comes back. Their next thought shouldn't
+        # be blocked on the previous one resolving.
+        try:
+            self.query_one("#advisor_input", Input).value = ""
+        except Exception:
+            pass
+        log = self._log()
+        if log is not None:
+            log.write(f"[yellow]Q:[/yellow] {question}")
+            log.write("[dim]… thinking[/dim]")
+        # Fire-and-forget worker. The Advisor serializes its own
+        # subprocess work via asyncio.Lock, so even if the netrunner
+        # spams Enter, only one claude -p runs at a time per Advisor.
+        self.run_worker(
+            self._ask_and_render(question),
+            exclusive=False,
+            group="advisor",
+            description=f"advisor question: {question[:60]}",
+        )
+
+    async def _ask_and_render(self, question: str) -> None:
+        """Worker body: send the question, render the result.
+
+        We don't pass the turn handle through ask() — Advisor.ask()
+        appends to its own internal turn list and returns the
+        resolved turn. We just render whatever comes back.
+        """
+        try:
+            turn = await self.advisor.ask(question)
+        except Exception as e:
+            log = self._log()
+            if log is not None:
+                # The "thinking" line is the most recent in the log;
+                # we can't rewrite it cheaply (RichLog doesn't expose
+                # line-edit), but appending an error keeps the
+                # exchange readable. Same posture as a failed turn
+                # below.
+                log.write(f"[red]A: advisor crashed: {e}[/red]")
+                log.write("")
+            return
+        log = self._log()
+        if log is None:
+            return
+        if turn.failed:
+            log.write(f"[red]A: advisor failed:[/red] {turn.error}")
+        else:
+            # Render the answer prose. The system prompt asks for
+            # plain prose with optional fenced code blocks; both
+            # render fine through RichLog with markup=True (the
+            # answer text doesn't contain Rich markup tokens, and
+            # Markdown's backticks don't conflict with [bracket]
+            # markup syntax — RichLog ignores them as plain chars).
+            log.write(f"[green]A:[/green] {turn.answer}")
+        log.write("")
+
+
 class GoalSetScreen(ModalScreen[Optional[str]]):
     """Modal prompt for setting (or replacing) the daemon's goal.
     Returns the goal text on submit, or None if cancelled."""
@@ -2830,6 +3120,11 @@ class ExpandModal(ModalScreen[None]):
         margin-top: 1;
         color: $text-muted;
     }
+    #expand_advisor_hint {
+        height: 1;
+        margin-bottom: 1;
+        color: $accent;
+    }
     #expand_body {
         height: 1fr;
         background: $surface;
@@ -2841,6 +3136,17 @@ class ExpandModal(ModalScreen[None]):
         # `z` toggles the modal — same key opens it (action_expand on
         # the App), pressing again closes. Mirrors the muscle memory.
         Binding("z", "dismiss", "Close", show=False),
+        # `h` — open the Advisor on the modal's target. Only fires
+        # when the modal was opened on a tool or plugin info view
+        # (advisor_target set by the caller). Other expand modes
+        # (chatlog magnify, file viewer, fleet log magnify) leave
+        # advisor_target=None, and the action no-ops with a toast.
+        # Tools-UI Thought of Dave sub-feature 3 (build-plan 0c).
+        # Modal-scoped per the netrunner's intent: the Advisor is a
+        # contextual feature of the expanded view — you read about
+        # the tool, then you ask the Advisor about it. Putting `h`
+        # at App level was the wrong shape (corrected 2026-05-05).
+        Binding("h", "advise", "Advisor", show=True),
         Binding("r", "refresh", "Refresh", show=True),
         # `y` — yank the modal's full content to the clipboard.
         # The magnified view is the prime target surface for copy
@@ -2876,6 +3182,8 @@ class ExpandModal(ModalScreen[None]):
         source_widget_id: Optional[str] = None,
         provider: Optional["Callable[[], list]"] = None,
         start_at_end: bool = False,
+        advisor_target: Optional[AdvisorTarget] = None,
+        advisor_siblings: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self.title_text = title
@@ -2886,8 +3194,25 @@ class ExpandModal(ModalScreen[None]):
         # random-access list views (files, profiles, scripts) still
         # open at the top. Only applied on initial mount — refresh
         # preserves whatever scroll position the netrunner was at,
-        # so a mid-read refresh doesn't yank them away.
+        # so a mid-read refresh doesn't jump them away.
         self.start_at_end = start_at_end
+        # Advisor target — set by the caller when the modal is
+        # opened on a tool or plugin info view (Tools-UI Thought of
+        # Dave sub-feature 3, build-plan 0c). When set:
+        #   - the `h` binding becomes meaningful — pressing it
+        #     dismisses this modal and pushes AdvisorScreen on the
+        #     target.
+        #   - a prominent "press H for interactive help" hint
+        #     renders above the body so the affordance is visible
+        #     to the netrunner while they're reading manifest text.
+        # When None: `h` no-ops with a toast; the hint is hidden.
+        # advisor_siblings is the (name-only) list of OTHER tools
+        # the Advisor is allowed to mention — see advisor.py for
+        # the scope rules. Caller (action_expand) builds it from
+        # tool_registry + plugin_registry with the target's own
+        # name filtered out.
+        self.advisor_target = advisor_target
+        self.advisor_siblings = advisor_siblings
         # The snapshot is a list of pre-rendered lines. Each entry can
         # be either:
         #   - a markup string (from chatlog provider): RichLog parses
@@ -2915,6 +3240,21 @@ class ExpandModal(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="expand_dialog"):
             yield Label(f"[b]{self.title_text}[/b]", id="expand_title")
+            # Tooltip — "press H for interactive help" — only when
+            # the modal carries an Advisor target. Sits between the
+            # title and the body so it's the first thing the
+            # netrunner reads alongside the manifest text. Cyan
+            # accent + bold → unmistakably interactive affordance.
+            # Hidden when advisor_target is None, so chatlog
+            # magnify / file viewer / fleet log magnify all stay
+            # visually clean.
+            if self.advisor_target is not None:
+                yield Label(
+                    "[b]press H for interactive help[/b] "
+                    f"[dim]· Advisor scoped to "
+                    f"{self.advisor_target.name}[/dim]",
+                    id="expand_advisor_hint",
+                )
             yield RichLog(
                 id="expand_body",
                 max_lines=10000,
@@ -2931,11 +3271,16 @@ class ExpandModal(ModalScreen[None]):
                 min_width=40,
                 auto_scroll=False,
             )
-            yield Label(
-                "[dim]Esc / z close · r refresh · y copy · "
-                "Y copy-json · w/s scroll · PgUp/PgDn page[/dim]",
-                id="expand_hint",
+            # Hint line at the bottom. `h Advisor` only appears when
+            # the modal has a target; otherwise it'd be a misleading
+            # affordance.
+            base_hint = (
+                "Esc / z close · r refresh · y copy · "
+                "Y copy-json · w/s scroll · PgUp/PgDn page"
             )
+            if self.advisor_target is not None:
+                base_hint += " · h Advisor"
+            yield Label(f"[dim]{base_hint}[/dim]", id="expand_hint")
 
     def on_mount(self) -> None:
         self._populate()
@@ -3079,6 +3424,48 @@ class ExpandModal(ModalScreen[None]):
                     app._toast(f"copy-json: failed — {err}")
         except Exception:
             pass
+
+    def action_advise(self) -> None:
+        """h: open the Advisor on the modal's target.
+
+        Only meaningful when advisor_target was set at modal-open
+        time (tools/plugins z-info path). Other expand modes
+        (chatlog magnify, file viewer, fleet log magnify) leave
+        advisor_target=None — pressing h there is a no-op with a
+        toast, since the affordance is absent from the hint line
+        and a quiet failure is the right shape.
+
+        Flow: dismiss this modal first, then push AdvisorScreen on
+        the App. Stacking AdvisorScreen on top of ExpandModal would
+        work but feels wrong — the netrunner is going from "reading
+        about the tool" to "talking to the tool's Advisor"; that's
+        a context shift, not a sub-modal. Esc out of the Advisor
+        returns to the panel they were on, not back into the
+        expanded view.
+        """
+        if self.advisor_target is None:
+            try:
+                self.app.notify(
+                    "Advisor only available on tool / plugin info views",
+                    severity="warning",
+                )
+            except Exception:
+                pass
+            return
+        target = self.advisor_target
+        siblings = self.advisor_siblings
+        # Snapshot the App reference before dismiss — Textual's
+        # ModalScreen detaches self.app during dismiss(), so we
+        # need to grab it now.
+        app = self.app
+        claude_bin = getattr(app, "claude_bin", "claude")
+        self.dismiss()
+        if app is not None:
+            app.push_screen(AdvisorScreen(
+                target=target,
+                sibling_tool_names=siblings,
+                claude_bin=claude_bin,
+            ))
 
     def action_refresh(self) -> None:
         """Re-fetch content. Uses the provider if registered (re-renders
@@ -8408,9 +8795,19 @@ class CyberdeckApp(App):
                 # rather than opening a file. The full registry
                 # entry is in <home>/tools/tools.toml; netrunner
                 # can navigate there if they want the raw source.
+                #
+                # sub-feature 3 (2026-05-05): the info modal also
+                # carries an Advisor handle — pressing `h` from
+                # inside the modal opens AdvisorScreen scoped to
+                # this tool. The "press H for interactive help"
+                # tooltip renders alongside the manifest text.
+                target = target_from_tool(highlighted.tool)
+                siblings = self._build_advisor_siblings(target.name)
                 self._open_text_view(
                     title=f"Tool: {highlighted.tool.name}",
                     text=self._render_tool_info(highlighted.tool),
+                    advisor_target=target,
+                    advisor_siblings=siblings,
                 )
                 return
             if isinstance(highlighted, PluginListItem):
@@ -8419,23 +8816,72 @@ class CyberdeckApp(App):
                 # README is the LLM-facing interface doc; netrunner
                 # reads it for invocation details. When no README,
                 # falls back to manifest-only synthesis.
+                #
+                # sub-feature 3 (2026-05-05): the README content
+                # ALSO threads into the AdvisorTarget's
+                # extended_text so the Advisor's system prompt has
+                # full interface depth (flag tables, examples).
+                # We read the file once here regardless of which
+                # display path the modal uses — the cost is small
+                # and the symmetry's worth it.
                 pl = highlighted.plugin
                 readme_path = (
                     pl.source_dir / "README.md"
                     if pl.source_dir is not None else None
                 )
+                readme_text = ""
+                if readme_path is not None and readme_path.is_file():
+                    try:
+                        # 200KB cap matches what _load_file_lines
+                        # would tolerate on its own; over that, we
+                        # fall back to manifest-only Advisor
+                        # context. Best-effort.
+                        if readme_path.stat().st_size <= 200_000:
+                            readme_text = readme_path.read_text(
+                                encoding="utf-8", errors="replace",
+                            )
+                    except Exception:
+                        readme_text = ""
+                target = target_from_plugin(pl, readme_text=readme_text)
+                siblings = self._build_advisor_siblings(target.name)
                 if readme_path and readme_path.is_file():
                     self._open_file_view(
                         str(readme_path),
                         title=f"Plugin: {pl.category}/{pl.name}",
+                        advisor_target=target,
+                        advisor_siblings=siblings,
                     )
                 else:
                     self._open_text_view(
                         title=f"Plugin: {pl.category}/{pl.name}",
                         text=self._render_plugin_info(pl),
+                        advisor_target=target,
+                        advisor_siblings=siblings,
                     )
                 return
             return  # ListView with non-viewable item → no-op
+
+    def _build_advisor_siblings(self, target_name: str) -> tuple[str, ...]:
+        """Build the sibling-tools name list for an Advisor session.
+
+        Names only — the Advisor is allowed to mention other tools
+        in cross-references but must not pretend to know their
+        internals. We also filter out the target's own name so the
+        prompt doesn't read "you can also reference ripgrep" inside
+        the ripgrep Advisor's prompt.
+
+        Used by action_expand's tool + plugin branches; centralised
+        here so the filter rule + ordering live in one place. Tools
+        before plugins reflects the visual ordering of the unified
+        Tools panel; helps the Advisor prefer mentioning siblings
+        the netrunner has been recently looking at.
+        """
+        names = tuple(
+            t.name for t in self.tool_registry.all()
+        ) + tuple(
+            p.name for p in self.plugin_registry.all()
+        )
+        return tuple(n for n in names if n != target_name)
 
     def action_copy_focused(self) -> None:
         """y: yank focused widget's content to the OS clipboard.
@@ -8496,12 +8942,22 @@ class CyberdeckApp(App):
         *,
         title: Optional[str] = None,
         display_path: Optional[str] = None,
+        advisor_target: Optional[AdvisorTarget] = None,
+        advisor_siblings: tuple[str, ...] = (),
     ) -> None:
         """Open ExpandModal with the contents of `path`. Title defaults
         to a "File: <shortened path>" header. Errors (missing file,
         permission denied, binary content) surface as a single-line
         error in the modal rather than crashing — viewing should be
-        forgiving."""
+        forgiving.
+
+        advisor_target/advisor_siblings: optional Advisor handle for
+        the modal's `h` keybind (Tools-UI Thought of Dave 0c). Set
+        only when the file being viewed represents a tool or plugin
+        — the plugin README path passes the loaded Plugin in. All
+        other file-view callers leave it None; their modals don't
+        render the "press H" hint.
+        """
         if title is None:
             short = display_path or self._shorten_path(path)
             title = f"File: {short}"
@@ -8513,17 +8969,31 @@ class CyberdeckApp(App):
             snapshot_lines=snapshot,
             source_widget_id=None,
             provider=provider,  # `r` re-reads from disk
+            advisor_target=advisor_target,
+            advisor_siblings=advisor_siblings,
         ))
 
-    def _open_text_view(self, *, title: str, text: str) -> None:
+    def _open_text_view(
+        self,
+        *,
+        title: str,
+        text: str,
+        advisor_target: Optional[AdvisorTarget] = None,
+        advisor_siblings: tuple[str, ...] = (),
+    ) -> None:
         """Open ExpandModal with arbitrary text content. Used as the
         fallback for list-items that don't map cleanly to a file
-        (e.g. registry-internal profiles)."""
+        (e.g. registry-internal profiles, synthesized tool info,
+        synthesized plugin info when no README).
+
+        advisor_target/advisor_siblings: see _open_file_view."""
         lines = text.splitlines() or [text]
         self.push_screen(ExpandModal(
             title=title,
             snapshot_lines=lines,
             source_widget_id=None,
+            advisor_target=advisor_target,
+            advisor_siblings=advisor_siblings,
         ))
 
     def _render_tool_info(self, tool) -> str:

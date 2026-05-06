@@ -720,20 +720,51 @@ shipped (Phase 4 still blocked on quota signal).
   - Watchdog Q&A system prompt grew CALIBER AWARENESS section
   ~80 LOC across tui.py + watchdog.py.
 
-**✅ TOOLS-UI THOUGHT OF DAVE SHIPPED 2026-05-04** (sub-features
-1+2; sub-feature 3 deferred). Build-plan item 0c.
-  1. **space-launch**: space on tool/plugin row → LaunchScreen
-     with TOOL: / PLUGIN: envelope. Plugin path passes
-     spawn_plugins=[name] so per-spawn addendum scopes to ONLY
-     the picked plugin.
-  2. **z-info**: z on tool row → synthesized info modal
-     (manifest + availability); z on plugin row → README.md
-     view (or synthesized fallback).
-  3. **H haiku research sidebar (DEFERRED)**: needs subprocess
-     management + streaming inline render; bigger lift, filed
-     as follow-up.
+**✅ TOOLS-UI THOUGHT OF DAVE SLICE COMPLETE — 3/3 SUB-FEATURES
+SHIPPED 2026-05-04 → 2026-05-05.** Build-plan item 0c.
+  1. **space-launch** (2026-05-04): space on tool/plugin row →
+     LaunchScreen with TOOL: / PLUGIN: envelope. Plugin path
+     passes spawn_plugins=[name] so per-spawn addendum scopes
+     to ONLY the picked plugin.
+  2. **z-info** (2026-05-04): z on tool row → synthesized info
+     modal (manifest + availability); z on plugin row →
+     README.md view (or synthesized fallback).
+  3. **h-Advisor** (2026-05-05) — reframed mid-build from "haiku
+     research sidebar" to **Advisor** per netrunner spec. A
+     narrowly-scoped per-tool Q&A bot. **Contextual to the
+     expanded view** (modal-scoped, not App-scoped): press z on
+     a tool/plugin row to open the info modal, then lowercase h
+     inside the modal opens AdvisorScreen scoped to that target.
+     The modal renders a cyan "press H for interactive help"
+     hint above the manifest text when an Advisor target is
+     attached. System prompt enforces strict scope: "you ONLY
+     answer questions about <name>"; off-topic questions get a
+     polite refusal + redirect. Sees the names of sibling tools
+     for cross-references without pretending to know their
+     internals.
+     - Substrate: per-question `claude -p` one-shot (Watchdog
+       pattern), forced caliber haiku + low. Multi-turn context
+       within one modal session via prior-Q&A in the user
+       prompt; no `--resume` machinery.
+     - Modal: cyan accent, RichLog scrollback + Input pinned
+       below, greeting on mount echoes the scope rule. y yanks
+       the visible Q&A as plain text; Esc/h closes.
+     - new `advisor.py` (~460 LOC), AdvisorScreen + ExpandModal
+       h binding + action_advise + advisor_target threading
+       through _open_text_view/_open_file_view (~280 LOC tui.py).
+       Plugin path reads README.md (capped 200KB) into the
+       system prompt at modal-open time so plugin Advisors have
+       full interface depth. New `_build_advisor_siblings`
+       helper on the App centralises sibling-name composition.
+     - **Modal-scoped course correction**: first pass had H at
+       App level firing on focused list-item; netrunner asked
+       for contextual-to-expanded-view shape. Modal scope is
+       the right answer — the affordance is visible alongside
+       the manifest text the netrunner is reading.
+     - Real-deck verification pending — wiring smoke-tested.
   Plus new `ToolListItem` class (mirrors PluginListItem) for
-  isinstance() dispatch. ~260 LOC.
+  isinstance() dispatch (shipped with sub-features 1+2). Total
+  trio ~860 LOC across both sessions.
 
 **✅ README RESTRUCTURE SHIPPED 2026-05-04** (build-plan item 0).
 Public-repo cold-reader rewrite. Pitch + status callout above
@@ -789,19 +820,59 @@ delta.
 
 ---
 
+## 🚨 Auto-context discovery (2026-05-05) — must-read before any subprocess work
+
+While shipping the Advisor, we discovered that **every `claude`
+subprocess the deck spawns has been silently auto-loading
+CLAUDE.md content from disk** — verified verbatim against
+https://code.claude.com/docs/en/memory and
+https://code.claude.com/docs/en/env-vars. Specifically:
+
+  - Project-root `<cwd>/CLAUDE.md` is loaded
+  - Walks UP the parent dir tree concatenating EVERY CLAUDE.md
+    it finds (`"All discovered files are concatenated into
+    context rather than overriding each other"`)
+  - `~/.claude/CLAUDE.md`, `~/.claude/projects/<git-repo-key>/
+    memory/MEMORY.md` (first 200 lines / 25KB), and rules dirs
+    also auto-load
+  - Managed-policy CLAUDE.md cannot be excluded (docs explicit)
+
+This explains the "mysterious knowledge" the daemon and
+constructs have always seemed to have of the deck's
+architecture — they've been reading our project memory on every
+turn without us realizing. Likely also the residual ~19k
+cache_creation per spawn we filed as "Anthropic's court" on
+2026-05-02. Probably also a major information leak vector.
+
+**Tactical Advisor fix** shipped 2026-05-05: `--bare`,
+`--system-prompt` (full replace), `--tools ""`,
+`--no-session-persistence`, plus env-var suspenders
+(`CLAUDE_CODE_DISABLE_CLAUDE_MDS`, `_DISABLE_AUTO_MEMORY`,
+`_DISABLE_GIT_INSTRUCTIONS`). See `advisor.py:_run_one`.
+
+**Systemic fix** is now build-plan item **000** (highest-priority
+deferred slice — ranks above the architecture review). Touches
+every subprocess; estimated 600-1000 LOC; needs A/B verification
+because the daemon and constructs may be free-riding on
+CLAUDE.md content. Read `cyberdeck-build-plan.md` item 000
+before doing ANY subprocess-spawn work. Don't add any more
+auto-context-leaking spawn sites.
+
+---
+
 ## Next session battle plan
 
 The deck is at a clean phase point. Caliber slice is 4/5 shipped;
-all build-plan items 0/0a/0b/0c-partial/0d closed. Recommended
-order for the next push, ranked by tractability:
+all build-plan items 0/0a/0b/0c/0d closed (0c slice complete with
+the Advisor landing 2026-05-05). Recommended order for the next
+push, ranked by tractability:
 
-1. **Tools-UI sub-feature 3 (H haiku research sidebar)** — the
-   one piece of build-plan 0c that's still open. ~150 LOC, but
-   real complexity: subprocess management within a modal, streaming
-   inline render, cancel mechanism, brake-hook integration for
-   the Haiku spawn (it's `claude -p ... --model haiku`). Design-
-   first work. The reusable EffortPickerScreen could pair
-   naturally if you decide the sidebar needs an effort picker.
+1. **🚨 Auto-context audit + per-role subprocess isolation**
+   (build-plan 000). The big one. Filed during Advisor
+   verification 2026-05-05. Touches every subprocess. Read the
+   build-plan entry; this needs a design doc before
+   implementation. The longer we wait, the more spawn sites we
+   accumulate that'll need refactoring.
 
 2. **Mechanic v1 LLM-session half** (build-plan 0e). The bridge
    slice now provides the trigger signal; v1 is "what to do." Spawn
@@ -809,6 +880,9 @@ order for the next push, ranked by tractability:
    emit triage report. ~300 LOC. Design needs more thought —
    subprocess primitives differ on the supervisor side (no Construct
    available; mechanic.py is sibling-process, not part of deck).
+   **Coordinate with item 000** — mechanic's LLM session is one
+   more spawn site; if 000 lands first, mechanic v1 inherits the
+   isolation pattern from the start.
 
 3. **Caliber Phase 4** — STILL BLOCKED on build-plan item 13
    (quota signal). Don't pick this up until item 13 lands.
@@ -823,7 +897,8 @@ order for the next push, ranked by tractability:
    EDT (taskId `cyberdeck-architecture-review`). The agent
    phase-checks first; expect findings on the heavy churn from
    this session (tools/plugins/profiles retool + caliber slice +
-   doctor + preferences + mechanic bridge).
+   doctor + preferences + mechanic bridge + Advisor + the
+   auto-context discovery itself).
 
 **Real-deck verification opportunities** for the netrunner's next
 session:
@@ -833,8 +908,13 @@ session:
 - **Caliber Phase 5 surfaces** — sidebar should show
   `daemon: opus·high`, construct panes should render `· caliber`
   suffix in headers when constructs spawn
-- **Tools-UI** — open Tools tab, press space on a tool/plugin
-  row (LaunchScreen with envelope), press z (info modal)
+- **Tools-UI** — open Tools tab, highlight a tool/plugin row.
+  Press space (LaunchScreen with envelope). Press z (info
+  modal — synthesized for tools, README for plugins). From
+  inside the info modal, press h (Advisor opens — narrowly-
+  scoped per-tool Q&A bot, haiku·low; ask "how do I X with
+  this tool"). Modal shows "press H for interactive help"
+  hint when h is wired up.
 - **Doctor** — `python tui.py --doctor` should print 5 PASS
   rows; first run after deleting `<home>/.cyberdeck/first_run_complete`
   should show diagnostics then proceed
@@ -842,11 +922,10 @@ session:
   stderr for "heartbeat file: ..." line; under normal operation,
   no STALE warnings should appear
 
-**Branch state**: `claude/trusting-meitner-f701eb` ahead of
-`origin/main` by ~30 commits. Most recent slice + summary
-docs in CLAUDE.md / cyberdeck-state.md / cyberdeck-build-plan.md.
-The single context window for this session got expensive — picking
-up in a fresh chat is cheaper.
+**Branch state**: `claude/objective-sammet-25e0b4` ahead of
+`origin/main` by ~28 commits + the Advisor slice (uncommitted
+as of this CLAUDE.md update). Most recent slice + summary docs
+in CLAUDE.md / cyberdeck-state.md / cyberdeck-build-plan.md.
 
 **Architecture review** scheduled to fire 2026-06-01 09:00
 EDT (taskId `cyberdeck-architecture-review`); the agent

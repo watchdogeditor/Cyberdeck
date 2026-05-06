@@ -142,6 +142,202 @@ watchdog blindfold. Personal use doesn't need it.
 
 Roughly ordered by likely appeal:
 
+000. **🚨 AUTO-CONTEXT AUDIT + PER-ROLE SUBPROCESS ISOLATION**
+    (filed 2026-05-05 by netrunner; **highest-priority deferred
+    slice — ranks above the architecture review**).
+
+    **The problem.** Every `claude` subprocess the deck spawns
+    inherits the deck's cwd, which is the deck source directory.
+    Claude Code automatically loads context at session start from
+    multiple disk locations — verified against the official docs
+    at https://code.claude.com/docs/en/memory and
+    https://code.claude.com/docs/en/env-vars on 2026-05-05:
+
+      1. Project-root `<cwd>/CLAUDE.md` (and `.claude/CLAUDE.md`)
+      2. **Walks UP the parent directory tree**, picking up every
+         `CLAUDE.md` and `CLAUDE.local.md` along the way to
+         filesystem root, concatenating ALL of them into context.
+         Quote: *"All discovered files are concatenated into
+         context rather than overriding each other."*
+      3. `~/.claude/CLAUDE.md` (user-level memory)
+      4. `~/.claude/projects/<git-repo-key>/memory/MEMORY.md` —
+         auto memory, first 200 lines / 25KB. Keyed by GIT REPO
+         (all worktrees share one).
+      5. `~/.claude/rules/*.md` and `<cwd>/.claude/rules/*.md`
+      6. Managed-policy CLAUDE.md (org-installed; CANNOT be
+         excluded — docs explicitly say so)
+      7. `@path/to/file` imports inside any of the above
+         (recursive, max 5 hops)
+      8. SessionStart hooks (fire even on `claude -p`)
+
+    **The discovery.** The first real-deck Advisor pass on
+    2026-05-05 caught the model answering with content from the
+    deck's project-root CLAUDE.md ("From the CLAUDE.md, I know
+    the deck has a plugin system…"). The Advisor uses
+    `claude -p --append-system-prompt … --permission-mode
+    bypassPermissions` — no tool calls. It was getting CLAUDE.md
+    auto-injected. Walking the docs confirmed: this happens
+    silently for every subprocess we spawn — daemon, watchdog,
+    constructs, pool warmers, tripwire-authoring spawns,
+    advisors. They've all been receiving the deck's project
+    memory (build plans, design notes, gotchas, in-flight
+    slices, security architecture details) as free user-message
+    context on every turn.
+
+    **Why this matters.**
+
+      - **It explains the "mysterious knowledge" the daemon and
+        constructs have always seemed to have of the deck's
+        architecture.** Some of what we thought was "the system
+        prompt is working great" was actually CLAUDE.md leaking
+        through.
+      - **Cache cost.** The 2026-05-02 cache fix dropped
+        `system_changed` misses but left ~19k of ephemeral_1h
+        cache writes per spawn that we filed as "Anthropic's
+        court." That's likely auto-loaded CLAUDE.md drifting
+        across sessions (we update it constantly) and
+        invalidating cache.
+      - **Information leak.** CLAUDE.md has notes about the
+        netrunner's habits, the safety architecture's exact
+        mechanisms, blacklist proposals, in-flight work.
+        Constructs the daemon spawned to do unrelated tasks have
+        been seeing all of it.
+      - **Behavioral risk.** When we eventually fix this, some
+        prompts that were free-riding on CLAUDE.md content will
+        suddenly perform worse. Need careful A/B testing per
+        subprocess type before removing the auto-load.
+
+    **The escape valves (verified verbatim from docs +
+    real-deck testing 2026-05-05).**
+
+      | Mechanism | What it kills | Reliable? |
+      |-----------|---------------|-----------|
+      | `--bare` flag | hooks, skills, plugins, MCP, auto memory, ALL CLAUDE.md | ⚠️ **BREAKS OAUTH** — see gotcha below |
+      | `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` | all CLAUDE.md (user, project, ancestors) | ✅ |
+      | `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` | only auto memory | ✅ |
+      | `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` | git workflow + git status from system prompt | ✅ |
+      | `--system-prompt "..."` | replaces (not appends) the default system prompt | ✅ |
+      | `--tools ""` | disables all built-in tools | ✅ |
+      | `--disable-slash-commands` | skips skills + slash commands | ✅ |
+      | `claudeMdExcludes` setting | specific CLAUDE.md by glob path | ✅ except managed policy |
+      | `--no-session-persistence` | skip transcript writes (-p mode) | ✅ |
+      | cwd outside the git repo | suppresses walk-up + assigns different auto-memory key | ✅ for those layers |
+      | Managed-policy CLAUDE.md | CANNOT be excluded — docs explicit | ❌ |
+
+    **🚨 GOTCHA — `--bare` breaks Claude Max OAuth auth.**
+    Quoting `claude --help` directly (NOT obvious from the
+    memory docs page): *"Anthropic auth is strictly
+    ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and
+    keychain are never read)."* The netrunner's deck uses Claude
+    Max via OAuth/keychain. Round-2 of the Advisor fix tried
+    `--bare` and the spawn exited 1 silently every time because
+    auth never resolved. Diagnosis took two real-deck pass-
+    throughs. **Don't use `--bare` for any subprocess that
+    expects OAuth auth.** Use the env vars + `--disable-slash-
+    commands` instead — they're independently documented to do
+    the CLAUDE.md/auto-memory/skills suppression without
+    breaking auth. File this as the most expensive gotcha to
+    re-introduce: the failure mode is "looks fine in tests,
+    silently broken in production."
+
+    **Tactical fix already shipped (Advisor only, 2026-05-05).**
+    The Advisor now spawns with `--bare --system-prompt …
+    --tools "" --no-session-persistence` plus env vars
+    `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` /
+    `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` /
+    `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`. Belt-and-
+    suspenders. Real-deck verification pending.
+
+    **The systemic slice (this to-do).** Different subprocess
+    types want different shapes:
+
+      | Subprocess | Wants | Mechanism |
+      |------------|-------|-----------|
+      | Advisor | ZERO context | `--bare` + env-var belt (DONE) |
+      | Pool warmer | ZERO context | same as Advisor |
+      | Tripwire authoring | ZERO context | same as Advisor |
+      | Daemon | CURATED context (its role + protocol) | per-role spawn cwd + per-role CLAUDE.md |
+      | Constructs | CURATED context (workspace + protocol) | per-role spawn cwd + per-role CLAUDE.md |
+      | Watchdog | CURATED context (observation rules) | per-role spawn cwd + per-role CLAUDE.md |
+
+    For the curated-context roles, the design is:
+
+      1. Bootstrap on deck launch: write `~/.cyberdeck/spawn-cwds/
+         <role>/CLAUDE.md` with role-specific content (plus
+         emptier siblings for sibling-isolation).
+      2. Subprocess spawns set `cwd=~/.cyberdeck/spawn-cwds/
+         <role>/`. Walk-up still hits `~/.claude/CLAUDE.md` (user
+         memory — netrunner-controlled, fine) but skips the deck
+         source's CLAUDE.md.
+      3. Auto memory becomes `~/.claude/projects/<spawn-cwd-key>/
+         memory/MEMORY.md` — different per role. Possibly disable
+         per role via env var.
+      4. Where appropriate, also pass `--exclude-dynamic-system-
+         prompt-sections` to keep cwd / env / git status out of
+         the system prompt for cache stability across spawns.
+      5. The daemon's CLAUDE.md is where we'd write its
+         operational protocol (decompose intent → spawn actions
+         → integrate outcomes), the construct one its workspace
+         conventions, etc. — content that's TODAY ostensibly in
+         `--append-system-prompt` but might be cleaner in the
+         CLAUDE.md slot per Anthropic's intended division.
+
+    **Risks and gotchas.**
+
+      - **Behavioral regression.** The daemon and constructs
+        have likely been free-riding on CLAUDE.md content;
+        removing the auto-load will reveal under-specified
+        system prompts. Land behind a flag, A/B against the
+        same goal, tune system prompts where regressions
+        surface.
+      - **Worktrees share auto-memory.** All cyberdeck worktrees
+        share one auto-memory directory keyed by git repo. Per-
+        role spawn cwds (outside the repo) get fresh per-role
+        memory keys.
+      - **Managed-policy CLAUDE.md** (if installed) is
+        unavoidable. Not a netrunner concern (no IT pushing
+        policies on the solo dev machine), but documenting for
+        completeness.
+      - **`--resume` re-loads context fresh.** Resuming a
+        session from a different cwd injects different CLAUDE.md
+        content into the resumed conversation. Has to be the
+        same per-role cwd on resume.
+      - **`@path` imports** inside any CLAUDE.md are followed
+        recursively (max 5 hops). Per-role CLAUDE.mds should
+        avoid imports from outside their role dir.
+      - **Cache effects.** Once stable, this should DROP per-
+        spawn cache misses substantially (the ~19k ephemeral_1h
+        writes filed as "Anthropic's court" on 2026-05-02 are
+        almost certainly auto-loaded CLAUDE.md drift).
+
+    **Phasing proposal** when this slice is picked up:
+
+      Phase 0: pre-flight measurement — instrument `claude -p
+      --debug api` to capture exact bytes sent for each
+      subprocess type today. Establish baseline.
+      Phase 1: bootstrap per-role spawn-cwd dirs (mirror
+      `_bootstrap_deck_dispatcher` / `_bootstrap_plugin_bridge`
+      pattern). Empty CLAUDE.mds initially.
+      Phase 2: thread cwd through each subprocess spawn site.
+      Daemon, watchdog, constructs, pool warmers. Behind a
+      `prefs.spawn_cwd_isolation` flag default-off so we can
+      A/B.
+      Phase 3: add env-var belt to all spawn sites (DISABLE_
+      AUTO_MEMORY, DISABLE_GIT_INSTRUCTIONS — DISABLE_CLAUDE_MDS
+      is too aggressive for daemon/constructs that NEED their
+      role CLAUDE.md).
+      Phase 4: write role-specific content into each CLAUDE.md.
+      Iterate via real-deck testing.
+      Phase 5: flip the flag default-on, retire the flag once
+      stable.
+
+    **Estimated size:** 600-1000 LOC across spawn sites + new
+    bootstrap module + canon doc updates. Plus several days of
+    real-deck A/B verification per subprocess type. **Bigger
+    than any previous slice; deserves its own design doc before
+    we start.** File new `Design Files/cyberdeck-spawn-context-
+    isolation.md` covering the full design, then phase as above.
+
 00. **Comprehensive architecture + design review** (filed
    2026-05-04 by netrunner). Once major mechanisms feel done,
    walk the canon docs (orientation / state / spec / philosophy
@@ -165,8 +361,9 @@ Roughly ordered by likely appeal:
      Pre-public-repo-launch and pre-1.0 are both natural
      review windows; this fits before either.
 
-0c. **Tools UI: space-launch + z-info + H-haiku-research**
-   (Thought of Dave, filed 2026-05-04).
+0c. **Tools UI: space-launch + z-info + H-Advisor**
+   (Thought of Dave, filed 2026-05-04). All three sub-features
+   shipped — slice complete.
    - **space-launch** ✅ SHIPPED 2026-05-04 (commit 5b30ddd).
      New ToolListItem class for isinstance dispatch. Tool path
      uses TOOL: envelope; plugin path uses PLUGIN: envelope +
@@ -177,14 +374,53 @@ Roughly ordered by likely appeal:
      individually); plugin rows open their README.md when
      present, falling back to synthesized info otherwise.
      `_render_tool_info` / `_render_plugin_info` helpers.
-   - **H-haiku-research** STILL DEFERRED. Needs subprocess
-     management + streaming inline render in the z-info modal
-     + cancel mechanism. Bigger lift than the other two
-     sub-features. When picking up: open the z-info modal for
-     a tool/plugin, the H key (within modal scope) spawns
-     `claude -p '<research-prompt>' --model haiku --effort low`,
-     streams output into a sidebar Static widget on the modal,
-     y-yanks the result. ~150 LOC.
+   - **h-Advisor** ✅ SHIPPED 2026-05-05 (uncommitted). Reframed
+     mid-build from the "haiku research sidebar" to the
+     **Advisor** — a narrowly-scoped per-tool Q&A bot. The
+     Advisor is **contextual to the expanded view**: press z on
+     a tool/plugin row to open the info modal as before, then
+     press lowercase h within that modal to open AdvisorScreen
+     scoped to that one target. The modal renders a prominent
+     "press H for interactive help" hint above the manifest text
+     when an Advisor handle is attached. System prompt enforces
+     strict scope: "you ONLY answer questions about <name>";
+     off-topic questions get a polite refusal + redirect. Sees
+     the names of sibling tools so it can cross-reference ("for
+     that, try the jq Advisor") without pretending to know their
+     internals.
+     - Substrate: per-question `claude -p` one-shot (Watchdog
+       pattern), forced caliber haiku + low. Multi-turn context
+       within one modal session via prior-Q&A in the user
+       prompt; no `--resume` machinery.
+     - Modal: cyan accent, RichLog scrollback + Input pinned
+       below, greeting on mount echoes the scope rule. y yanks
+       the visible Q&A as plain text; Esc/h closes.
+     - new `advisor.py` (~460 LOC): `AdvisorTarget` view-model,
+       `Advisor` async oracle, `target_from_tool` /
+       `target_from_plugin` adapters, `build_system_prompt` /
+       `build_user_prompt` helpers.
+     - tui.py: `AdvisorScreen` modal (~200 LOC),
+       `ExpandModal.action_advise` + lowercase h binding +
+       advisor_target/advisor_siblings constructor params + the
+       cyan "press H for interactive help" hint label. Reads
+       plugin README.md (capped 200KB) into the system prompt
+       at modal-open time so plugin Advisors have full interface
+       depth. New `_build_advisor_siblings(target_name)` helper
+       on the App centralises the sibling-name list construction
+       (filters out the target's own name; orders tools before
+       plugins to match the unified Tools panel).
+     - **Modal-scoped, not App-scoped.** First pass had H bound
+       at App level firing on focused list-item; netrunner
+       course-corrected to modal-only ("contextual for when the
+       tool was in expanded view"). Modal scope is the right
+       shape — affordance is visible alongside the manifest text
+       the netrunner is reading, and the deck-wide keymap stays
+       lighter (lowercase h is reserved for future hjkl
+       navigation work).
+     - Real-deck verification pending — wiring smoke-tested
+       (advisor module unit checks pass; ExpandModal h binding
+       registration + action_advise + advisor_target threading
+       confirmed; App-level h cleanly absent).
 
 0. **README restructure for public GitHub repo** ✅ SHIPPED
    2026-05-04 (commit 1aa7564). Public-repo cold-reader rewrite:
