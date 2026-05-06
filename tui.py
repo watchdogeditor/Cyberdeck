@@ -69,8 +69,12 @@ from connection_monitor import (
 )
 from brake_state import (
     BrakeState, BrakeStateStore, BrakeChangeEvent,
-    load_limits, save_limits,
 )
+# Preferences is the canonical accessor for state.json contents
+# (build-plan item 0b, 2026-05-04). brake_state.load_limits /
+# save_limits stay exported for any non-tui caller (none today),
+# but tui.py uses Preferences exclusively.
+from preferences import Preferences
 from brake_delay import (
     DelayEntry, DelayResolution, DelayMonitor,
     write_delay_override,
@@ -3989,62 +3993,50 @@ class CyberdeckApp(App):
         # CyberdeckApp.__init__ defaults of 0.0 and 30.0
         # respectively) in place. No-op on a fresh install — the
         # file doesn't exist yet, so we use the defaults.
+        # Build-plan item 0b: persisted preferences flow through the
+        # Preferences accessor (single import surface, typed
+        # properties, future-proofed schema). Internally still
+        # delegates to brake_state.load_limits / save_limits so the
+        # state.json shape is unchanged.
+        self.prefs = Preferences(self.home_dir)
         try:
-            persisted = load_limits(
-                self.home_dir / ".cyberdeck" / "state.json"
-            )
-            dw = persisted.get("delay_window_seconds")
-            if isinstance(dw, (int, float)) and dw >= 0:
-                self.delay_window_seconds = float(dw)
-            wt = persisted.get("wedge_timeout_seconds")
-            if isinstance(wt, (int, float)) and wt >= 0:
-                self.wedge_timeout_seconds = float(wt)
+            # Tunables that aren't CLI-overridden load from prefs.
+            # Each falls back to the default from preferences.py if
+            # the key is missing or malformed in state.json.
+            self.delay_window_seconds = self.prefs.delay_window_seconds
+            self.wedge_timeout_seconds = self.prefs.wedge_timeout_seconds
             # Caliber Phase 2 (2026-05-04): fast_mode is a deck-wide
-            # cost governor — netrunner-controlled, defaults OFF. The
-            # daemon does NOT pick fast_mode autonomously; it's a
-            # budget switch, not a routing decision. When on, eligible
-            # spawns (Opus 4.6) get the speed boost; everything else
-            # silently spawns at standard. Explicit CLI flag wins over
-            # persisted value so the netrunner can override per-launch
-            # without affecting the persisted default.
-            fm = persisted.get("fast_mode")
-            if isinstance(fm, bool) and not self._fast_mode_explicit:
-                self.fast_mode = fm
+            # cost governor. Explicit CLI flag wins over persisted;
+            # otherwise load from prefs.
+            if not self._fast_mode_explicit:
+                self.fast_mode = self.prefs.fast_mode
             # If the netrunner DID pass --fast-mode / --no-fast-mode
             # explicitly, persist their choice now so the next launch
             # without the flag picks it up.
             if self._fast_mode_explicit:
-                save_limits(
-                    self.home_dir / ".cyberdeck" / "state.json",
-                    fast_mode=self.fast_mode,
-                )
+                self.prefs.save(fast_mode=self.fast_mode)
             # Caliber Phase 3 (scoped down, 2026-05-04): persisted
-            # daemon_effort from prior CLI flag or Limits-modal
-            # change. Model is always opus — not configurable. CLI-
-            # explicit wins over persisted; persisted-only loads
-            # otherwise.
-            de = persisted.get("daemon_effort")
+            # daemon_effort. CLI-explicit wins over persisted.
             if (
                 self.daemon_caliber is not None
                 and not self._daemon_effort_explicit
-                and isinstance(de, str)
             ):
-                try:
-                    from caliber import Caliber as _C
-                    self.daemon_effort = de
-                    self.daemon_caliber = _C(
-                        model="opus", effort=de,
-                    )
-                except Exception:
-                    pass
+                de = self.prefs.daemon_effort
+                if de != self.daemon_effort:
+                    try:
+                        from caliber import Caliber as _C
+                        self.daemon_effort = de
+                        self.daemon_caliber = _C(
+                            model="opus", effort=de,
+                        )
+                    except Exception:
+                        pass
             if self._daemon_effort_explicit and self.daemon_caliber:
-                save_limits(
-                    self.home_dir / ".cyberdeck" / "state.json",
-                    daemon_effort=self.daemon_caliber.effort,
-                )
+                self.prefs.save(daemon_effort=self.daemon_caliber.effort)
         except Exception:
-            # load_limits is already best-effort, but wrap one more
-            # layer here so a malformed entry can't break startup.
+            # Preferences is already best-effort (load_limits returns
+            # {} on read failure, save_limits swallows OSError); wrap
+            # once more so a malformed entry can't break startup.
             pass
         # Phase 8 of the unified-event-stream slice: subscribe via the
         # bus instead of the legacy `on_change=` callback. The handler
@@ -10381,8 +10373,10 @@ class CyberdeckApp(App):
         # the next session might want different caps). save_limits
         # is best-effort; failures don't block the in-session apply.
         try:
-            save_limits(
-                self.home_dir / ".cyberdeck" / "state.json",
+            # Build-plan item 0b: route through Preferences. Same
+            # underlying state.json file; same read-merge-write
+            # semantics; cleaner import surface.
+            self.prefs.save(
                 delay_window_seconds=self.delay_window_seconds,
                 wedge_timeout_seconds=self.wedge_timeout_seconds,
                 daemon_effort=self.daemon_effort,
