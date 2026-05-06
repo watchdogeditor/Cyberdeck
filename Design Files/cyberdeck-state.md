@@ -690,20 +690,72 @@ tui.py. Heavy add in tui.py (EffortPickerScreen ~120 LOC +
 LimitsScreen restructure ~100 LOC); heavy remove in caliber.py
 (directive parser ~108 LOC).
 
+**✅ MULTI-SLICE PUSH SHIPPED 2026-05-04** (uncommitted as of this
+state.md update). Seven distinct slices landed in one session
+following the netrunner's "in that order" recommendation:
+
+  1. **Caliber Phase 5** — sidebar daemon line (`daemon: opus·high
+     · fast`), construct pane caliber suffix (dim cyan after
+     [STATE]/[profile] badges, threaded from spawned event
+     payload), watchdog Q&A CALIBER AWARENESS section. Caliber
+     slice now 4/5 (Phase 4 still blocked on quota signal).
+  2. **Tools-UI Thought of Dave sub-features 1+2** (build-plan
+     0c). space on tool/plugin row → LaunchScreen with TOOL: /
+     PLUGIN: envelope; z on tool → manifest info modal; z on
+     plugin → README.md or synthesized info. New `ToolListItem`
+     class for isinstance dispatch. Sub-feature 3 (H haiku
+     research sidebar) deferred — needs subprocess + streaming
+     render in modal.
+  3. **README restructure for public repo** (build-plan 0).
+     Pitch + status callout above the fold, expanded
+     prerequisites, broader architecture section (4 entities +
+     spine + brake + mechanic), Design canon with "what to read
+     first" hints, new Status section, License + contributing.
+  4. **doctor.py first-run check** (build-plan 0a). New module +
+     wire-up in tui.py __main__. Five prereq checks (python
+     ≥3.11, textual, mss, claude binary, claude --version) with
+     PASS/WARN/FAIL + remediation hints. DETECT + SUGGEST, not
+     AUTO-INSTALL. Sentinel at `<home>/.cyberdeck/first_run_
+     complete`; `--doctor` / `--no-doctor` CLI flags. ASCII-only
+     output (Windows cp1252 stdout). Mock-aware (script paths
+     pass via Path.is_file fallback).
+  5. **preferences.py module** (build-plan 0b). Thin wrapper —
+     typed properties (prefs.fast_mode, prefs.daemon_effort,
+     prefs.brake, etc.) + save(**kwargs). Schema docstring with
+     future placeholders (theme, default_profile,
+     keybind_overrides, agent_defaults, last_session_id).
+  6. **Mechanic v0→v1 bridge** — liveness heartbeat. Deck
+     writes `<home>/.cyberdeck/heartbeat` every 5s with timestamp
+     + monotonic. Mechanic reads mtime each tick; logs
+     "STALE HEARTBEAT" warn after 20s (4 missed ticks); logs
+     "heartbeat recovered" on return. v0+1 LOGS ONLY — no
+     automatic action; v1 LLM session triage is deferred.
+  7. **Preferences migration** — tui.py callers of
+     `brake_state.load_limits / save_limits` migrated to
+     `self.prefs.*` accessors. Persistence semantics unchanged
+     (Preferences delegates internally); new code path is the
+     single import surface.
+
+Total ~1300 LOC across 8 commits. Real-deck verification pending
+on most surfaces — netrunner will validate during normal use.
+
 **Next session picks up at: open netrunner choice.**
   - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
     build-plan item 13.
-  - Caliber Phase 5 (UI surfaces — sidebar daemon-caliber line,
-    pane caliber suffix, Limits-modal fields, watchdog Q&A
-    awareness) — ~150 LOC, no blockers.
-  - First-run onboarding + preferences module (build-plan
-    items 0a + 0b)
-  - README restructure for public repo (build-plan item 0)
-  - Tools-UI Thought of Dave (build-plan item 0c) — space-launch
-    + z-info + H-haiku-research
-  - Mechanic v0→v1 bridge (liveness heartbeat)
+  - Tools-UI sub-feature 3 (H haiku research sidebar) — needs
+    subprocess management + streaming inline render in the
+    z-info modal. Bigger lift; design-first.
+  - Mechanic v1 LLM-session half — bigger lift; needs the LLM
+    triage flow design + claude subprocess management for the
+    supervisor side. The bridge slice (heartbeat) gives v1 its
+    detection signal.
   - Remaining discrete bugs (kill doesn't interrupt in-flight;
-    silent wedge cx-796e0468)
+    silent wedge cx-796e0468) — both deferred pending design /
+    more data points.
+  - Architecture review fires 2026-06-01 09:00 EDT (taskId
+    `cyberdeck-architecture-review`). Will phase-check current
+    state and produce structured findings if at a clean
+    boundary.
 
 Architecture review scheduled 2026-06-01 09:00 EDT.
 
