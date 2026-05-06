@@ -25,14 +25,23 @@ Then the four other canon docs, in this order:
   - `cyberdeck-spec.md` — canonical architecture (the *what*)
   - `cyberdeck-philosophy.md` — convictions that resolve ambiguity (the *why*)
 
-Three architecture docs for the major in-flight initiatives:
+Four architecture docs for the major in-flight initiatives:
+  - `cyberdeck-spawn-context-isolation.md` — **🚨 highest-priority
+    deferred slice (build-plan item 000)**. The role-injection
+    design that addresses claude code's silent CLAUDE.md / auto-
+    memory leak into every subprocess. Per-role prompt files in
+    `<deck-source>/roles/` injected via `--append-system-prompt` /
+    `--system-prompt` instead of trusted to claude code's auto-
+    discovery. Filed 2026-05-05. Read this BEFORE adding any new
+    spawn site or modifying existing ones.
   - `cyberdeck-event-stream-design.md` — the spine (one canonical
     event bus, role-derived filters). Phases 1-7 shipped 2026-04-30;
     Phase 8 cleanup is the last remaining slice.
   - `cyberdeck-maintbot-design.md` — the Mechanic (separate-process
     supervisor + on-demand LLM session). Two-tier architecture
     landed 2026-04-30; v0 (supervisor only — subprocess janitor) is
-    the next implementation slice.
+    the next implementation slice. **Item 000 should land first**;
+    mechanic v1 then inherits the role pattern.
   - `cyberdeck-model-effort-design.md` — caliber (per-spawn model +
     effort + fast-mode). Daemon picks per construct based on task
     + remaining quota; netrunner overrides via Limits modal or
@@ -844,19 +853,24 @@ turn without us realizing. Likely also the residual ~19k
 cache_creation per spawn we filed as "Anthropic's court" on
 2026-05-02. Probably also a major information leak vector.
 
-**Tactical Advisor fix** shipped 2026-05-05: `--bare`,
+**Tactical Advisor fix** shipped 2026-05-05 (round 3 — round 2's
+`--bare` broke OAuth; see Filed gotcha). Final recipe:
 `--system-prompt` (full replace), `--tools ""`,
-`--no-session-persistence`, plus env-var suspenders
-(`CLAUDE_CODE_DISABLE_CLAUDE_MDS`, `_DISABLE_AUTO_MEMORY`,
-`_DISABLE_GIT_INSTRUCTIONS`). See `advisor.py:_run_one`.
+`--disable-slash-commands`, `--no-session-persistence`, plus
+env-var belt (`CLAUDE_CODE_DISABLE_CLAUDE_MDS`,
+`_DISABLE_AUTO_MEMORY`, `_DISABLE_GIT_INSTRUCTIONS` — scoped
+per-subprocess via `env=` kwarg, no global splash). See
+`advisor.py:_run_one`.
 
 **Systemic fix** is now build-plan item **000** (highest-priority
-deferred slice — ranks above the architecture review). Touches
-every subprocess; estimated 600-1000 LOC; needs A/B verification
-because the daemon and constructs may be free-riding on
-CLAUDE.md content. Read `cyberdeck-build-plan.md` item 000
-before doing ANY subprocess-spawn work. Don't add any more
-auto-context-leaking spawn sites.
+deferred slice — ranks above the architecture review).
+**Programmatic role-prompt injection** from disk-backed role
+files at `<deck-source>/roles/<role>.md` plus a `general.toml`
+for netrunner identity. Composition order at every spawn:
+general → role → profile → per-spawn → plugin. Read
+`Design Files/cyberdeck-spawn-context-isolation.md` for the full
+design before doing ANY subprocess-spawn work. Don't add any
+more spawn sites that auto-load context.
 
 ---
 

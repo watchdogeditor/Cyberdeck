@@ -248,95 +248,86 @@ Roughly ordered by likely appeal:
     `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`. Belt-and-
     suspenders. Real-deck verification pending.
 
-    **The systemic slice (this to-do).** Different subprocess
-    types want different shapes:
+    **The systemic slice (this to-do).** Full design lives in
+    `Design Files/cyberdeck-spawn-context-isolation.md` (filed
+    2026-05-05; refactored same day around the netrunner's
+    role-injection proposal). Read that for the implementation
+    detail. Summary:
 
-      | Subprocess | Wants | Mechanism |
-      |------------|-------|-----------|
-      | Advisor | ZERO context | `--bare` + env-var belt (DONE) |
-      | Pool warmer | ZERO context | same as Advisor |
-      | Tripwire authoring | ZERO context | same as Advisor |
-      | Daemon | CURATED context (its role + protocol) | per-role spawn cwd + per-role CLAUDE.md |
-      | Constructs | CURATED context (workspace + protocol) | per-role spawn cwd + per-role CLAUDE.md |
-      | Watchdog | CURATED context (observation rules) | per-role spawn cwd + per-role CLAUDE.md |
+    Replace claude code's silent disk-loaded memory with
+    **programmatic per-role prompt injection from disk-backed
+    role-config files**. The deck owns the prompt-context
+    pipeline end-to-end: no walk-up, no auto-memory project-
+    key juggling, no `--bare` / OAuth conflict.
 
-    For the curated-context roles, the design is:
+    Layout:
 
-      1. Bootstrap on deck launch: write `~/.cyberdeck/spawn-cwds/
-         <role>/CLAUDE.md` with role-specific content (plus
-         emptier siblings for sibling-isolation).
-      2. Subprocess spawns set `cwd=~/.cyberdeck/spawn-cwds/
-         <role>/`. Walk-up still hits `~/.claude/CLAUDE.md` (user
-         memory — netrunner-controlled, fine) but skips the deck
-         source's CLAUDE.md.
-      3. Auto memory becomes `~/.claude/projects/<spawn-cwd-key>/
-         memory/MEMORY.md` — different per role. Possibly disable
-         per role via env var.
-      4. Where appropriate, also pass `--exclude-dynamic-system-
-         prompt-sections` to keep cwd / env / git status out of
-         the system prompt for cache stability across spawns.
-      5. The daemon's CLAUDE.md is where we'd write its
-         operational protocol (decompose intent → spawn actions
-         → integrate outcomes), the construct one its workspace
-         conventions, etc. — content that's TODAY ostensibly in
-         `--append-system-prompt` but might be cleaner in the
-         CLAUDE.md slot per Anthropic's intended division.
+      <deck-source>/
+        roles/
+          daemon.md            # the daemon coordinator
+          construct.md         # task-scoped workers
+                               #   (also used by pool warmers)
+          watchdog-qa.md       # the Q&A oracle
+          watchdog-authoring.md # tripwire authoring
+          advisor.md           # per-tool Q&A bot
+        general.toml           # netrunner identity + global prefs
 
-    **Risks and gotchas.**
+    Each role file ships a bundled default; netrunner edits the
+    on-disk file to calibrate; saving blank restores default on
+    next deck launch. Role files live in deck source (NOT
+    `<home>/`) for two reasons:
+      (1) Brake hook's existing protection denies construct
+          writes to deck-source paths — constructs cannot edit
+          their own startup behavior, full stop.
+      (2) `git pull` ships updates to defaults; netrunner
+          edits are temporary calibration, bundled defaults
+          are authoritative.
 
-      - **Behavioral regression.** The daemon and constructs
-        have likely been free-riding on CLAUDE.md content;
-        removing the auto-load will reveal under-specified
-        system prompts. Land behind a flag, A/B against the
-        same goal, tune system prompts where regressions
-        surface.
-      - **Worktrees share auto-memory.** All cyberdeck worktrees
-        share one auto-memory directory keyed by git repo. Per-
-        role spawn cwds (outside the repo) get fresh per-role
-        memory keys.
-      - **Managed-policy CLAUDE.md** (if installed) is
-        unavoidable. Not a netrunner concern (no IT pushing
-        policies on the solo dev machine), but documenting for
-        completeness.
-      - **`--resume` re-loads context fresh.** Resuming a
-        session from a different cwd injects different CLAUDE.md
-        content into the resumed conversation. Has to be the
-        same per-role cwd on resume.
-      - **`@path` imports** inside any CLAUDE.md are followed
-        recursively (max 5 hops). Per-role CLAUDE.mds should
-        avoid imports from outside their role dir.
-      - **Cache effects.** Once stable, this should DROP per-
-        spawn cache misses substantially (the ~19k ephemeral_1h
-        writes filed as "Anthropic's court" on 2026-05-02 are
-        almost certainly auto-loaded CLAUDE.md drift).
+    Composition order at every spawn:
 
-    **Phasing proposal** when this slice is picked up:
+      [claude code default (replaced or appended)]
+      + general identity block       (from general.toml)
+      + role addendum                (from roles/<role>.md)
+      + profile addendum             (constructs only)
+      + per-spawn addendum
+      + plugin block                 (constructs only)
 
-      Phase 0: pre-flight measurement — instrument `claude -p
-      --debug api` to capture exact bytes sent for each
-      subprocess type today. Establish baseline.
-      Phase 1: bootstrap per-role spawn-cwd dirs (mirror
-      `_bootstrap_deck_dispatcher` / `_bootstrap_plugin_bridge`
-      pattern). Empty CLAUDE.mds initially.
-      Phase 2: thread cwd through each subprocess spawn site.
-      Daemon, watchdog, constructs, pool warmers. Behind a
-      `prefs.spawn_cwd_isolation` flag default-off so we can
-      A/B.
-      Phase 3: add env-var belt to all spawn sites (DISABLE_
-      AUTO_MEMORY, DISABLE_GIT_INSTRUCTIONS — DISABLE_CLAUDE_MDS
-      is too aggressive for daemon/constructs that NEED their
-      role CLAUDE.md).
-      Phase 4: write role-specific content into each CLAUDE.md.
-      Iterate via real-deck testing.
-      Phase 5: flip the flag default-on, retire the flag once
-      stable.
+    Two families:
 
-    **Estimated size:** 600-1000 LOC across spawn sites + new
-    bootstrap module + canon doc updates. Plus several days of
-    real-deck A/B verification per subprocess type. **Bigger
-    than any previous slice; deserves its own design doc before
-    we start.** File new `Design Files/cyberdeck-spawn-context-
-    isolation.md` covering the full design, then phase as above.
+      - **Family A (replace)**: Advisor, Watchdog Q&A, Watchdog
+        tripwire authoring, future Mechanic v1. Use
+        `--system-prompt` (full replace) + `--tools ""` +
+        `--disable-slash-commands` + env var belt. Already
+        shipped for Advisor 2026-05-05.
+      - **Family B (append)**: Daemon, Constructs, Pool
+        warmers. Use `--append-system-prompt` to preserve
+        claude code's tool-use scaffolding + same env var
+        belt.
+
+    **Phasing** (full version in design doc):
+
+      Phase 0: pre-flight measurement (`claude -p --debug api`
+        baseline per role)
+      Phase 1: build infrastructure (`roles_registry.py`,
+        `general_config.py`, `spawn_context.py`)
+      Phase 2: bootstrap role files from existing code prompts
+        (`DAEMON_SYSTEM_PROMPT` → `roles/daemon.md`, etc.) — no
+        functional change yet
+      Phase 3: migrate spawn sites behind `prefs.role_injection`
+        flag (default-off)
+      Phase 4: add `general.toml` support
+      Phase 5: real-deck A/B verify per role
+      Phase 6: tune role files where regressions surface
+      Phase 7: flip flag default-on, retire flag
+
+    **Estimated size:** 600-1000 LOC across new modules +
+    spawn-site migrations + role-file content + canon updates.
+    Plus several days of real-deck A/B verification per
+    subprocess type. **Bigger than any previous slice — read
+    the design doc end-to-end before starting.**
+
+    See full design at
+    `Design Files/cyberdeck-spawn-context-isolation.md`.
 
 00. **Comprehensive architecture + design review** (filed
    2026-05-04 by netrunner). Once major mechanisms feel done,
