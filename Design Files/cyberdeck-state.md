@@ -1093,6 +1093,100 @@ markers). Real-deck verification pending: force-kill the deck
 process, observe mechanic stderr for "firing v1 triage" → check
 that `<log-basename>-triage.md` lands with a structured report.
 
+**Real-deck verified 2026-05-06**: force-kill produced a
+beautiful triage report (~2 minutes, sonnet/medium reading the
+30k log + walking design files for gotcha matches). Report at
+`cyberdeck-2026-05-06-204828-triage.md` correctly identified
+`STATUS_CONTROL_C_EXIT`, matched the filed gotcha verbatim,
+captured state at death (running constructs + tripwires +
+daemon state), proposed three causes ranked by confidence,
+gave concrete next steps. Plus a follow-up Ctrl+Q test caught
+the bug where `_drive_fleet`'s async finally-block teardown
+wasn't reliably writing the shutdown footer — fixed via
+explicit `deck_logger.close(reason="shutdown")` in
+`action_quit`'s idle path (filed as gotcha + fix shipped same
+day).
+
+---
+
+**✅ MECHANIC v1.5 STALE-HEARTBEAT TRIAGE SHIPPED 2026-05-06.**
+Closes the "deck PID alive but TUI wedged" gap that v0+1
+detected but only logged. Mechanic story now 5/5 phases shipped
+(v0 supervisor, v0+1 heartbeat bridge, v1 unclean-exit triage,
+v1.5 stale-heartbeat triage; v2 deliberate summon and v3
+autonomous correction remain deferred per design).
+
+**Why it needed a different shape than v1.** Real-deck
+observation from the netrunner: heartbeat goes stale when the
+machine is SUSPENDED, not just when the TUI wedges. Auto-firing
+on every stale event = ~$0.10 + 2 minutes per machine suspend.
+Bad cost story.
+
+**Design.** On stale heartbeat, prompt the netrunner
+interactively (y/N to stderr) instead of auto-firing. While
+waiting for the answer, keep polling heartbeat:
+  - If heartbeat recovers → print recovery notice. The prompt
+    thread is still blocked on input(); when the netrunner
+    eventually answers, supervisor checks current heartbeat
+    state and skips triage if recovered (regardless of what
+    they typed).
+  - If netrunner answers 'y' AND heartbeat still stale →
+    force-kill the deck (graceful SIGTERM via existing
+    `kill_pid()` helper) so the log gets finalized, then run
+    the same finalize+triage flow v1 uses with a
+    `wedge_kill_context` flag set on the TriageRequest.
+  - If netrunner answers 'n' / Enter → dismiss; supervisor
+    re-arms the prompt only after heartbeat recovers
+    (DISMISSED → IDLE transition). Prevents repeated
+    re-prompts within one stale window.
+
+For headless / wall-mount deployments, new
+`--auto-triage-on-stale` CLI flag bypasses the prompt and goes
+straight to kill+triage on stale detection.
+
+**Implementation.** ~250 LOC across two modules.
+  - `mechanic.py`: state machine
+    (`_HeartbeatState.IDLE / PROMPTING / DISMISSED`),
+    `_ask_triage(response, age)` daemon-thread prompt helper,
+    kill-then-break path that drops into the existing v1
+    finalize+triage flow with `wedge_kill_context` set.
+  - `mechanic_triage.py`: `TriageRequest.wedge_kill_context`
+    field; `build_user_prompt` branches on it to add a
+    STALE-HEARTBEAT CONTEXT block; `MECHANIC_SYSTEM_PROMPT`
+    extended with "two paths" frame (Path A natural death vs.
+    Path B supervisor force-killed). Path-B-specific guidance
+    ("no Python traceback expected; focus on what the TUI
+    was doing right before the heartbeat stopped") + suspend
+    false-positive detection guidance for `--auto-triage-on-
+    stale` users.
+
+**Threading model.** The prompt is `input()` running on a
+daemon thread; supervisor's main loop polls a shared
+`response` dict each tick. We don't try to interrupt
+`input()` mid-call (Python doesn't expose a clean way on
+Windows); instead, when heartbeat recovers we just log a
+recovery notice and let the netrunner know they can dismiss.
+The eventual answer gets cross-checked against current
+heartbeat state — recovered → no-op regardless of yes/no.
+
+**Verified.** Both modules import clean. `--auto-triage-on-
+stale` flag registers in `--help`. Surface tests confirm:
+  - `_HeartbeatState` constants exist
+  - `_ask_triage` helper present
+  - `TriageRequest.wedge_kill_context` accepts string + None
+  - `build_user_prompt` includes STALE-HEARTBEAT CONTEXT block
+    when context set; omits cleanly when None
+  - `MECHANIC_SYSTEM_PROMPT` has Path A + Path B sections
+
+**Real-deck verification opportunity:** suspend the machine
+and observe heartbeat staleness → prompt fires → resume
+machine → heartbeat recovers → supervisor announces
+"recovered, dismiss the prompt above" → press Enter to
+clear. Or force-wedge the TUI (livelock between async tasks
+would do it) → confirm prompt → 'y' → confirm deck killed +
+triage report lands with the STALE-HEARTBEAT CONTEXT block
+in the report.
+
 ---
 
 **Next session picks up at: open netrunner choice.**

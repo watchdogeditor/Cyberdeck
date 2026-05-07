@@ -132,6 +132,17 @@ class TriageRequest:
     `report_dir` is where to write the triage report. Defaults to
     the log's parent directory (next to `latest.log`). The naming
     scheme is `<log-basename>-triage.md`.
+
+    `wedge_kill_context` is set by the supervisor when v1.5
+    stale-heartbeat triage fires — the deck PID was alive at
+    detection time, the heartbeat had gone stale, and the
+    supervisor force-killed the deck (either because
+    --auto-triage-on-stale was set, or because the netrunner
+    confirmed via the interactive prompt). The triage prompt
+    surfaces this context so the report can reason about
+    "deck wedged then killed" vs. "deck crashed naturally" —
+    same final state on disk (no log_footer) but different
+    causes worth distinguishing in the diagnostic.
     """
     log_path: Path
     clean_close_reason: Optional[str] = None
@@ -142,6 +153,7 @@ class TriageRequest:
     report_dir: Optional[Path] = None
     claude_bin: str = "claude"
     timeout: float = DEFAULT_TIMEOUT
+    wedge_kill_context: Optional[str] = None
 
 
 @dataclass
@@ -223,13 +235,60 @@ indicating what happened. Common kinds:
   - `pool.*`            — session pool lifecycle
 
 ================================================================
+TWO TRIAGE PATHS — read the user message to know which fired
+================================================================
+
+**Path A — natural deck death (v1).** The deck process exited on
+its own (clean shutdown, EJECT, crash, OOM, kill -9, blue
+screen). Supervisor's job was reaping orphan claude
+subprocesses; the log captures whatever the deck wrote before
+death. Look for tracebacks, error records, or the last events
+before EOF. This is the common case.
+
+**Path B — supervisor force-killed (v1.5 stale-heartbeat).** The
+deck PID was alive but the heartbeat file (`<home>/.cyberdeck/
+heartbeat`) hadn't been touched in N seconds. The supervisor
+force-killed the deck for diagnosis. The user message contains
+a STALE-HEARTBEAT CONTEXT block when this path fires; if you
+see that block, the diagnostic question shifts: it's no longer
+"why did the deck crash" but "why did the TUI go unresponsive
+while the process stayed alive." Common causes:
+
+  - **TUI event loop wedge** — Textual's main loop blocked on
+    something (sync I/O, infinite loop, livelock between async
+    tasks). Look for the LAST work the deck was doing in the
+    log: which goal was active, which constructs were running,
+    which daemon turn was in flight. The wedge usually happens
+    right after a specific trigger.
+  - **Render-pipeline crash** (filed gotcha — Textual `_render`
+    shadowing). Symptom is "deck stops drawing, heartbeat
+    stops" without a Python traceback in the log because the
+    crash is inside Textual's render loop and gets swallowed
+    by Textual's own error handling.
+  - **Async deadlock between deck-side coroutines** (e.g. fleet
+    consume task awaiting an event that never fires).
+  - **False positive: machine suspend.** The supervisor's prompt
+    is supposed to filter most of these out (heartbeat recovers
+    when the machine wakes), but if --auto-triage-on-stale was
+    set, we may be triaging a suspend. The STALE-HEARTBEAT
+    CONTEXT block notes whether the netrunner confirmed via
+    prompt or whether auto-fire skipped the prompt — this
+    distinguishes "real wedge" from "supervisor was over-eager."
+    If suspend looks plausible (long stretch with NO log
+    activity right before kill, no interesting trigger), say
+    so; the netrunner can adjust the threshold.
+
+================================================================
 TRIAGE METHOD
 ================================================================
 
 1. **Find the death point.** The log usually contains a Python
    traceback or a final event before the stream goes silent. Look
    for: stderr tracebacks, `severity: error` or `severity:
-   critical` records, the last few records before EOF.
+   critical` records, the last few records before EOF. **Path B
+   note:** there will be NO traceback (supervisor killed the
+   process); look instead for what the deck was DOING right
+   before it stopped writing.
 
 2. **Identify what was running.** Walk back from the death point
    and note the active goal, in-flight constructs, the daemon's
@@ -335,6 +394,18 @@ def build_user_prompt(req: TriageRequest, log_tail: str) -> str:
         f"Tracked subprocesses at death: {req.tracked_subprocesses}",
         f"Subprocesses killed by supervisor: {req.subprocesses_killed}",
     ]
+    if req.wedge_kill_context:
+        # v1.5 stale-heartbeat path. The deck wasn't dying on its
+        # own — its PID was alive but the heartbeat had gone stale
+        # (TUI wedged, or machine suspend, or other liveness gap).
+        # The supervisor force-killed it. Surface this so the
+        # triage knows to diagnose "why did the TUI go unresponsive"
+        # rather than "why did the process crash."
+        parts.append("")
+        parts.append("=" * 64)
+        parts.append("STALE-HEARTBEAT (v1.5) CONTEXT — supervisor force-killed:")
+        parts.append("=" * 64)
+        parts.append(req.wedge_kill_context)
     if req.deck_source_dir:
         parts.append(f"Deck source directory: {req.deck_source_dir}")
         parts.append(

@@ -540,6 +540,78 @@ Roughly ordered by likely appeal:
    action; v1 LLM session triage is the deferred follow-up.
    ~80 LOC across tui.py + mechanic.py.
 
+0e2. **Mechanic v1.5 — stale-heartbeat triage** ✅ SHIPPED
+   2026-05-06. Closes the "deck PID alive but TUI wedged" gap
+   that v0+1 detected but only logged. Real-deck observation
+   from the netrunner shaped the design: heartbeat goes stale
+   when the machine is SUSPENDED, not just when the TUI wedges.
+   Auto-firing triage on every stale event would burn ~$0.10 +
+   2 minutes of triage time per machine suspend.
+
+   Design (per netrunner direction): on stale heartbeat, prompt
+   the netrunner interactively (y/N to stderr) instead of auto-
+   firing. While waiting for the answer, keep polling heartbeat:
+     - If heartbeat recovers → print recovery notice, mark
+       prompt as moot. The netrunner can dismiss the now-stale
+       prompt; if they answer 'y' anyway, supervisor checks
+       current heartbeat state and skips triage if recovered.
+     - If netrunner answers 'y' AND heartbeat still stale →
+       force-kill the deck (graceful SIGTERM via existing
+       `kill_pid()` helper) so the log gets finalized before
+       triage reads it. Then run the same finalize+triage flow
+       that v1 uses for natural deck deaths.
+     - If netrunner answers 'n' / Enter → dismiss; supervisor
+       re-arms the prompt only after heartbeat recovers (so
+       repeated false-positive suspends don't keep prompting
+       within one stale window).
+
+   For headless / wall-mount deployments where no netrunner is
+   at the terminal, new `--auto-triage-on-stale` CLI flag
+   bypasses the prompt entirely and goes straight to
+   kill+triage on stale detection.
+
+   Triage's user prompt + system prompt extended with a "two
+   paths" frame: Path A (natural death — v1) and Path B
+   (supervisor force-killed — v1.5). The triage knows which
+   path fired and adjusts the diagnostic question accordingly:
+   for Path B there will be no Python traceback (supervisor
+   killed the process), so the report focuses on "what was
+   the TUI doing right before the heartbeat stopped" rather
+   than "what blew up." Includes guidance on detecting the
+   suspend-false-positive case so the netrunner can adjust
+   the threshold if --auto-triage-on-stale produces noise.
+
+   Implementation: ~250 LOC across mechanic.py (state machine,
+   threading-based prompt, kill-then-break path) +
+   mechanic_triage.py (TriageRequest.wedge_kill_context field,
+   user-prompt branch, system prompt update).
+
+   State machine:
+     IDLE → on stale: detect + spawn prompt thread → PROMPTING
+       (or auto-fire under --auto-triage-on-stale → kill + break)
+     PROMPTING → on heartbeat recovery: print one-shot recovery
+       notice; prompt thread eventually completes, answer is
+       checked against current heartbeat state.
+     PROMPTING → on prompt 'y' AND still stale: kill deck +
+       break (drops to finalize+triage with wedge context).
+     PROMPTING → on prompt 'y' AND recovered: log "not
+       triaging," reset to IDLE.
+     PROMPTING → on prompt 'n'/Enter: → DISMISSED.
+     DISMISSED → on heartbeat fresh: → IDLE (re-arms for
+       future stale events).
+
+   Mechanic story now 5/5 phases shipped: v0 (supervisor),
+   v0+1 (heartbeat bridge), v1 (unclean-exit triage), v1.5
+   (stale-heartbeat triage). v2 (deliberate summon from deck UI)
+   + v3 (autonomous correction / relaunch) remain deferred per
+   the maintbot design doc.
+
+   Real-deck verification: suspend the machine (heartbeat goes
+   stale, prompt fires) → resume the machine (heartbeat
+   recovers, supervisor announces "ignore the prompt"). Or
+   force-wedge the deck somehow → confirm prompt appears →
+   answer 'y' → confirm deck killed + triage report lands.
+
 0e. **Mechanic v1 LLM-session half** ✅ SHIPPED 2026-05-06.
    Diagnose-only LLM session that fires on unclean deck exit.
    New module `mechanic_triage.py` (~480 LOC) — TriageRequest /

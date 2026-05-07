@@ -925,10 +925,11 @@ push, ranked by tractability:
    2026-05-06: tripwire authoring "seems to be working" post
    item 000 phase 1 (less overzealous), so urgency is low.
 
-3. **Mechanic v1.5 — stale-heartbeat triage.** Now that v1
-   (unclean-exit triage) shipped 2026-05-06, the natural
-   follow-up is firing triage when the deck PID is alive but the
-   TUI is wedged. Needs design around log-write-vs-read race.
+3. ~~**Mechanic v1.5 — stale-heartbeat triage.**~~ ✅ SHIPPED
+   2026-05-06. Interactive prompt on stale heartbeat (or
+   `--auto-triage-on-stale` for headless), listens for
+   heartbeat recovery during prompt, kills deck + triages on
+   confirmation. Mechanic story now 5/5 phases.
 
 4. **Adversarial dyad** (build-plan 0f, filed 2026-05-06).
    Daemon-orchestrated generator/discriminator pattern for

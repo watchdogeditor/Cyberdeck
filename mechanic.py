@@ -50,6 +50,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -261,6 +262,74 @@ def _apply_record(record: dict, tracked: dict[str, int]) -> Optional[str]:
     return None
 
 
+# ---- v1.5 stale-heartbeat triage state machine ------------------------
+#
+# When the heartbeat goes stale, the supervisor doesn't immediately fire
+# triage — the most common cause of stale heartbeat is the netrunner
+# suspending their machine, NOT a wedged TUI. Auto-firing on every
+# stale event would burn ~$0.10 + 2 minutes of triage time per suspend.
+#
+# Instead: prompt the netrunner interactively (via stderr) asking
+# whether to triage. While the prompt is open, keep polling heartbeat.
+# Three resolutions:
+#
+#   1. Heartbeat recovers WHILE prompt is open → print recovery notice,
+#      ask the netrunner to dismiss the now-stale prompt. The deck is
+#      back; no triage needed.
+#   2. Netrunner answers "y" AND heartbeat is still stale → kill the
+#      deck (graceful SIGTERM with grace, escalating to SIGKILL on
+#      POSIX) so the log gets finalized cleanly, then run the same
+#      finalize+triage flow that fires on natural deck death. The
+#      triage gets a `wedge_kill_context` flag so the report knows
+#      the supervisor force-killed (vs. natural crash).
+#   3. Netrunner answers "n" / Enter → triage dismissed for this stale
+#      event. State machine flips to DISMISSED; re-arms only when
+#      heartbeat goes fresh again (so a future stale event re-prompts).
+#
+# `--auto-triage-on-stale` flag bypasses the prompt entirely, going
+# straight to the kill-and-triage path. Useful for headless / wall-
+# mount deployments where there's no netrunner to answer the prompt.
+
+
+class _HeartbeatState:
+    IDLE = "idle"            # heartbeat fresh, no prompt active
+    PROMPTING = "prompting"  # prompt thread alive, waiting for response
+    DISMISSED = "dismissed"  # netrunner said no; awaiting recovery before re-arming
+
+
+def _ask_triage(response: dict, age_seconds: float) -> None:
+    """Run from a daemon thread. Block on input(), record the answer.
+
+    `response` is a dict shared with the main thread:
+        {"value": Optional[str], "done": bool}
+    The main thread polls `done` each tick and reads `value` when set.
+
+    On EOFError (no stdin attached, e.g. headless launch with stdin
+    closed) records empty string — the main thread treats that as
+    "no answer / dismissed."
+    """
+    try:
+        ans = input(
+            f"\n[mechanic] Heartbeat stale ({age_seconds:.0f}s). "
+            f"Trigger v1 triage? Will kill deck first. (y/N): "
+        )
+        response["value"] = ans
+    except EOFError:
+        response["value"] = ""
+    except Exception as e:
+        response["value"] = ""
+        # Best-effort log; don't propagate (we're a daemon thread).
+        try:
+            print(
+                f"[mechanic] triage prompt thread error: {e}",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+    finally:
+        response["done"] = True
+
+
 # ---- main loop --------------------------------------------------------
 
 
@@ -344,7 +413,21 @@ def parse_args() -> argparse.Namespace:
             "lands at <log-basename>-triage.md next to the log. "
             "Disable this if you don't want claude burning tokens "
             "on every crash (e.g. while iterating on a known-flaky "
-            "branch)."
+            "branch). Also suppresses v1.5 stale-heartbeat triage."
+        ),
+    )
+    parser.add_argument(
+        "--auto-triage-on-stale",
+        action="store_true",
+        help=(
+            "v1.5 (2026-05-06): when the heartbeat goes stale, fire "
+            "triage automatically without prompting. Default is "
+            "interactive — supervisor prints a y/N prompt to stderr "
+            "and waits for the netrunner to confirm before "
+            "killing the deck and triaging (which avoids burning "
+            "tokens on every machine-suspend false positive). Set "
+            "this flag in headless / wall-mount deployments where "
+            "no netrunner is sitting at the terminal to answer."
         ),
     )
     parser.add_argument(
@@ -474,17 +557,29 @@ def main() -> int:
     # deck writes <home>/.cyberdeck/heartbeat every 5s; we read its
     # mtime each tick. PID alive + heartbeat stale = wedged TUI
     # (event loop stuck, redraw cycle frozen). v0 catches deck-died;
-    # this catches deck-frozen. Logs a one-time diagnostic when
-    # detected; v1 LLM session (deferred) will decide what to do
-    # about it. Variables track the "have we already warned?" state
-    # so we don't spam stderr every tick on a long wedge.
+    # this catches deck-frozen.
+    #
+    # v1.5 (2026-05-06): on stale heartbeat, prompt the netrunner
+    # interactively (or auto-fire under --auto-triage-on-stale).
+    # Most-common stale cause is machine suspend, NOT a wedged TUI;
+    # auto-firing would burn ~$0.10 + ~2 minutes per suspend. The
+    # state machine + prompt-thread pattern lets us listen for
+    # heartbeat recovery while waiting for the netrunner's answer.
+    # See _ask_triage and _HeartbeatState above for the full design.
     heartbeat_path = resolve_heartbeat_path(args.heartbeat_path)
     print(
         f"[mechanic] heartbeat file: {heartbeat_path}",
         file=sys.stderr,
     )
-    heartbeat_warned = False  # one-shot warn-then-quiet
-    heartbeat_recovered_at: Optional[float] = None
+    hb_state = _HeartbeatState.IDLE
+    prompt_response: dict = {"value": None, "done": False}
+    prompt_thread: Optional[threading.Thread] = None
+    recovery_announced_during_prompt = False
+    # Set when a kill-and-triage flow should fire after the loop
+    # breaks. Carries the wedge context (last seen heartbeat age)
+    # so the triage prompt can mention "deck PID was alive but
+    # heartbeat stale Xs; supervisor force-killed for diagnosis."
+    wedge_kill_context: Optional[str] = None
 
     # Heartbeat loop. Catch up the log on every tick, check deck
     # liveness, check heartbeat freshness, sleep. Ctrl+C on the
@@ -500,35 +595,180 @@ def main() -> int:
             if not pid_alive(deck_pid):
                 break
 
-            # Heartbeat-staleness check. Only meaningful AFTER
-            # we've seen at least one fresh heartbeat — a missing
-            # file early in the deck's startup is normal (the
-            # writer hasn't ticked yet). Fresh-once-seen tracks
-            # this implicitly via heartbeat_recovered_at.
             age = heartbeat_age_seconds(heartbeat_path)
-            if age is not None and age > args.heartbeat_stale_seconds:
-                if not heartbeat_warned:
-                    print(
-                        f"[mechanic] STALE HEARTBEAT detected: "
-                        f"file is {age:.1f}s old "
-                        f"(threshold={args.heartbeat_stale_seconds}s); "
-                        f"deck pid={deck_pid} is alive but TUI may "
-                        f"be wedged. v1 LLM session would triage "
-                        f"here; v0+1 logs only.",
-                        file=sys.stderr,
-                    )
-                    heartbeat_warned = True
-            elif age is not None and heartbeat_warned:
-                # Heartbeat came back. Reset the warn flag so a
-                # future stale event prints again. Also note the
-                # recovery so the netrunner sees the deck unfroze.
+            is_stale = (
+                age is not None
+                and age > args.heartbeat_stale_seconds
+            )
+
+            # State machine:
+            #
+            #   IDLE       → on stale: detect, then either
+            #                  (a) auto-fire if --auto-triage-on-stale
+            #                  (b) spawn prompt thread, → PROMPTING
+            #   PROMPTING  → on heartbeat recovery: print recovery
+            #                  notice (one-shot); the prompt thread
+            #                  may still be blocked on input(), but
+            #                  the answer will be ignored when it
+            #                  arrives if heartbeat is fresh.
+            #              → on prompt completion ('y'): if still
+            #                  stale → kill deck + break (drops to
+            #                  finalize); if recovered → notify, reset
+            #                  to IDLE.
+            #              → on prompt completion ('n'/empty): notify,
+            #                  → DISMISSED.
+            #   DISMISSED  → on heartbeat fresh: → IDLE (re-arms
+            #                  prompt for any future stale event).
+
+            if hb_state == _HeartbeatState.IDLE and is_stale:
+                # First detection of a fresh stale event.
                 print(
-                    f"[mechanic] heartbeat recovered ({age:.1f}s "
-                    f"old); deck appears responsive again",
+                    f"[mechanic] STALE HEARTBEAT detected: "
+                    f"file is {age:.1f}s old "
+                    f"(threshold={args.heartbeat_stale_seconds}s); "
+                    f"deck pid={deck_pid} is alive but TUI may be "
+                    f"wedged. Common false-positive: machine "
+                    f"suspended (heartbeat resumes when netrunner "
+                    f"unsuspends).",
                     file=sys.stderr,
                 )
-                heartbeat_warned = False
-                heartbeat_recovered_at = time.time()
+                if args.no_triage:
+                    print(
+                        f"[mechanic] --no-triage set; not "
+                        f"prompting for triage. Will log only.",
+                        file=sys.stderr,
+                    )
+                    hb_state = _HeartbeatState.DISMISSED
+                elif args.auto_triage_on_stale:
+                    print(
+                        f"[mechanic] --auto-triage-on-stale set; "
+                        f"killing deck for triage without prompt",
+                        file=sys.stderr,
+                    )
+                    wedge_kill_context = (
+                        f"Heartbeat went stale ({age:.1f}s old at "
+                        f"detection). --auto-triage-on-stale set, "
+                        f"so the supervisor force-killed the deck "
+                        f"for diagnosis without prompting."
+                    )
+                    if kill_pid(deck_pid):
+                        print(
+                            f"[mechanic] deck pid={deck_pid} killed; "
+                            f"proceeding to triage",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"[mechanic] kill_pid({deck_pid}) "
+                            f"reported failure; proceeding anyway",
+                            file=sys.stderr,
+                        )
+                    break
+                else:
+                    # Spawn prompt thread; loop continues.
+                    prompt_response = {"value": None, "done": False}
+                    recovery_announced_during_prompt = False
+                    prompt_thread = threading.Thread(
+                        target=_ask_triage,
+                        args=(prompt_response, age),
+                        daemon=True,
+                    )
+                    prompt_thread.start()
+                    hb_state = _HeartbeatState.PROMPTING
+
+            elif hb_state == _HeartbeatState.PROMPTING:
+                # While prompt thread is blocked on input(), watch
+                # for heartbeat recovery. If it comes back, print
+                # a one-shot recovery notice — the netrunner can
+                # see the prompt is moot. We don't try to kill the
+                # input thread; once the netrunner hits Enter or
+                # types something, the answer will be ignored
+                # because is_stale will be False at decision time.
+                if not is_stale and not recovery_announced_during_prompt:
+                    age_str = f"{age:.1f}s" if age is not None else "?"
+                    print(
+                        f"[mechanic] heartbeat RECOVERED ({age_str}) "
+                        f"while triage prompt is open. Press Enter "
+                        f"or type N to dismiss the prompt above; "
+                        f"the deck appears responsive again, no "
+                        f"triage needed.",
+                        file=sys.stderr,
+                    )
+                    recovery_announced_during_prompt = True
+
+                # Did the prompt thread complete? If yes, route
+                # based on answer + current heartbeat state.
+                if prompt_response.get("done"):
+                    raw = prompt_response.get("value") or ""
+                    ans = raw.strip().lower()
+                    accept = ans in ("y", "yes")
+
+                    if accept and is_stale:
+                        # Netrunner confirmed AND heartbeat still
+                        # stale — kill the deck and drop to
+                        # finalize+triage path with wedge context.
+                        wedge_kill_context = (
+                            f"Heartbeat went stale ({age:.1f}s old "
+                            f"at confirmation). Netrunner approved "
+                            f"force-kill via the supervisor's "
+                            f"interactive prompt; the supervisor "
+                            f"killed the deck so the triage runs "
+                            f"against a finalized log."
+                        )
+                        print(
+                            f"[mechanic] netrunner confirmed; "
+                            f"killing deck pid={deck_pid}",
+                            file=sys.stderr,
+                        )
+                        if kill_pid(deck_pid):
+                            print(
+                                f"[mechanic] deck killed; "
+                                f"proceeding to triage",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print(
+                                f"[mechanic] kill_pid({deck_pid}) "
+                                f"reported failure; proceeding anyway",
+                                file=sys.stderr,
+                            )
+                        break
+                    elif accept and not is_stale:
+                        # Netrunner confirmed but heartbeat
+                        # recovered first. Don't triage — the deck
+                        # is back. Reset to IDLE so a future stale
+                        # event re-prompts.
+                        print(
+                            f"[mechanic] netrunner confirmed "
+                            f"triage but heartbeat recovered "
+                            f"before kill; not triaging. Returning "
+                            f"to BAU.",
+                            file=sys.stderr,
+                        )
+                        hb_state = _HeartbeatState.IDLE
+                        prompt_thread = None
+                    else:
+                        # Dismiss. Will re-arm when heartbeat
+                        # recovers (DISMISSED → IDLE transition).
+                        print(
+                            f"[mechanic] triage dismissed. Will "
+                            f"re-prompt if heartbeat goes stale "
+                            f"again after recovery.",
+                            file=sys.stderr,
+                        )
+                        hb_state = _HeartbeatState.DISMISSED
+                        prompt_thread = None
+
+            elif hb_state == _HeartbeatState.DISMISSED and not is_stale:
+                # Recovery after a dismissed prompt — re-arm.
+                age_str = f"{age:.1f}s" if age is not None else "?"
+                print(
+                    f"[mechanic] heartbeat recovered ({age_str}); "
+                    f"re-arming v1.5 stale-heartbeat prompt for "
+                    f"future stale events",
+                    file=sys.stderr,
+                )
+                hb_state = _HeartbeatState.IDLE
 
             time.sleep(args.poll_interval)
     except KeyboardInterrupt:
@@ -647,6 +887,12 @@ def main() -> int:
         deck_source_dir=deck_source_dir,
         claude_bin=args.claude_bin,
         timeout=args.triage_timeout,
+        # v1.5: when set, the supervisor force-killed the deck on a
+        # stale-heartbeat detection (interactive prompt approved or
+        # --auto-triage-on-stale flag). Triage's user prompt
+        # mentions this so the report can distinguish "deck wedged
+        # then we killed it" from "deck crashed naturally."
+        wedge_kill_context=wedge_kill_context,
     )
     triage_result = run_triage(triage_req)
     if triage_result.success:
