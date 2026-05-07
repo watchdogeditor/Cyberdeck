@@ -197,6 +197,13 @@ Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Deck at clean ph
 - **Daemon narrative fix** — daemon mislabels brake-hook denials as tripwire fires; tighten daemon system prompt to distinguish `permission_denials` from `tripwire.fire`
 - **Verify Claude Code's fast-mode settings.json key** — current `{"fastMode": true}` may need to be `{"speed": "fast"}`; real-deck verify via `system_init` event's `fast_mode_state` field
 
+### UI polish pass
+Filed 2026-05-07 from real-deck observation. Netrunner flagged that several render surfaces need substantial improvement; no concrete design yet, but the intent is captured so the pass doesn't slip.
+- **Sidebar (left bar)** — fleet log + status indicators (brake / connection / caliber / pool / cost / spawns). Functional but cramped. Layout, hierarchy, density all on the table.
+- **Chatlog (center activity stream)** — renders fleet events, daemon thinking, watchdog Q&A, tripwire fires, brake denials, attention items. Each event type has its own format and the cumulative result is dense. Concerns to surface during the design pass: visual hierarchy, event-type discoverability, scrollback navigation, search, density tuning.
+- **Advisor modal scroll truncation** — concrete sub-bug, real-deck observed 2026-05-07: asking the Advisor "what do you know?" produced output that got truncated by the scrollbar. The modal's content area should scroll cleanly through long Q&A responses. Investigate whether the scrollbar is consuming visible area or the content's height isn't being computed properly. Could ship as a discrete fix ahead of the broader pass. Touches `advisor.py` render path + the AdvisorScreen modal layout in `tui.py`.
+- *Design:* none yet — file an in-flight design doc when the pass picks up. Likely composes with universal list-names (MID FUTURE) since both touch the same render surfaces.
+
 ### Tripwires slice 3 — severity-aware rendering
 - Critical pulls focus, warning badges, low logs only
 - Severity tiers already in DSL; just visual routing
