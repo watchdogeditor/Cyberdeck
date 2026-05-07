@@ -16,32 +16,45 @@ a fresh machine and runs `python tui.py` gets either:
 `doctor.py` runs cheap detection at startup with PASS / WARN / FAIL
 classification + remediation hints.
 
-Policy (post-2026-05-07 split):
-  - HARD PREREQS (Python, textual, claude binary, claude --version)
-    are DETECT + SUGGEST, NOT AUTO-INSTALL. npm install for the
-    claude CLI and a working Python with textual are environment-
-    level concerns where auto-install is fragile across corp
-    firewalls, alternate Python distributions, and locked-down
-    environments. FAIL → print hint + exit 1; netrunner fixes
-    manually.
-  - PLUGIN DEPS (each plugin.toml's `requires.python_imports`) are
-    DETECT + OPTIONAL-PROMPT-TO-INSTALL. Missing deps NEVER block
-    deck launch — affected plugins simply appear in the Tools panel
-    as `unavailable: missing python imports: <pkg>`, the same way
-    binary tools that aren't on PATH show up. If stdin is a TTY and
-    deps are missing, the doctor offers a one-shot prompt: "install
-    via pip? [y/N]". On yes → run `<python> -m pip install <pkgs>`
-    + re-check (any still-missing plugins remain unavailable;
-    install failures don't block launch either). On no / non-TTY /
-    Ctrl+D → skip cleanly, deck launches with affected plugins
-    marked unavailable. NO download is ever attempted without
-    explicit y/yes from the prompt.
+Policy (post-2026-05-07, three tiers):
+  - PYTHON >= 3.11 — hard FAIL, no prompt. Can't auto-install
+    Python from inside Python. Most failures here mean the
+    interpreter wouldn't even import this module (3.11+ syntax
+    or stdlib features); a soft FAIL is a belt-and-suspenders
+    catch for 3.10 environments where parsing succeeded but
+    runtime behavior would diverge.
+  - TEXTUAL + CLAUDE BINARY — DETECT + PROMPT-TO-INSTALL-OR-ABORT.
+    Both are objectively required to launch the deck (textual
+    renders the TUI; claude is the AI agent backend for daemon /
+    watchdog / advisor / constructs). On detection failure, the
+    doctor offers a one-shot prompt: "install via {pip,npm}? [y/N]".
+    Yes → run installer + re-check. No / non-TTY / install failure
+    / still-missing → print hint + exit 1 cleanly. NO download is
+    attempted without explicit y/yes.
+  - CLAUDE --VERSION HEALTHY — hard FAIL, no prompt. If the binary
+    is present but `claude --version` exits non-zero, the install
+    is corrupt or the OAuth login is broken. Re-installing usually
+    won't help; the netrunner needs to investigate manually.
+  - PLUGIN DEPS (each plugin.toml's `requires.python_imports`) —
+    DETECT + OPTIONAL-PROMPT-TO-INSTALL-OR-SKIP. Missing deps NEVER
+    block launch; affected plugins surface in the Tools panel as
+    `unavailable: missing python imports: <pkg>`, same way binary
+    tools that aren't on PATH show up. TTY stdin → optional prompt;
+    yes installs, no skips. Non-TTY / Ctrl+D / install failure →
+    skip cleanly. Plugins are graceful-degradation citizens.
 
-    Policy history: pre-2026-05-07 was WARN-and-continue (no
-    prompt). 2026-05-07 morning was PROMPT-TO-INSTALL-OR-ABORT.
-    2026-05-07 afternoon (current) is PROMPT-TO-INSTALL-OR-SKIP —
-    netrunner direction: plugins should degrade gracefully like
-    tools, not gate launch.
+Three-tier rationale (netrunner direction 2026-05-07):
+  1. Things the script literally can't run without (Python) → just
+     let them fail noisily; if the netrunner is launching for the
+     first time during an engagement, that's on them.
+  2. Things the deck objectively needs at launch (textual, claude)
+     → offer to install, exit cleanly if declined. The deck can't
+     do anything useful without these, so launching halfway and
+     erroring out per-spawn is worse than aborting up front.
+  3. Things the deck can degrade gracefully without (plugin deps)
+     → optional prompt, never block launch. The Tools panel
+     already has a vocabulary for "this thing isn't loadable" — let
+     plugins use it.
 
 Sentinel: `<home>/.cyberdeck/first_run_complete`. After a run where
 no FAIL is encountered, write the sentinel; subsequent runs skip
@@ -561,6 +574,118 @@ def prompt_install_plugin_deps(
     return response in ("y", "yes")
 
 
+def prompt_install_textual() -> bool:
+    """Prompt the netrunner to install textual via pip when the
+    check_textual() check FAILed. Returns True on yes, False on
+    no / non-TTY / Ctrl+D / Ctrl+C.
+
+    The caller exits 1 cleanly on False — textual is required to
+    render the TUI; the deck can't run without it. Pre-2026-05-07
+    afternoon, this was a hard FAIL with manual-install hint and
+    no prompt; the netrunner's policy update offers an in-band
+    install opportunity since textual is a single pip-install away.
+    """
+    if not sys.stdin.isatty():
+        print(
+            "cyberdeck: stdin is not a TTY; cannot prompt for "
+            "textual install.",
+            file=sys.stderr,
+        )
+        return False
+    print("cyberdeck: textual library not found.")
+    print()
+    print(
+        "textual is required to render the deck's TUI. Install via "
+        "pip?  (textual)  Declining exits the deck."
+    )
+    try:
+        response = input("[y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return response in ("y", "yes")
+
+
+def prompt_install_claude_bin() -> bool:
+    """Prompt the netrunner to install Claude Code via npm when the
+    check_claude_bin() check FAILed. Returns True on yes, False on
+    no / non-TTY / Ctrl+D / Ctrl+C.
+
+    The caller exits 1 cleanly on False — claude is required for
+    every AI-agent subprocess (daemon, watchdog, advisor,
+    constructs); the deck can launch its TUI without it but every
+    spawn would error out, which is worse than aborting up front.
+
+    Same policy update as prompt_install_textual: pre-2026-05-07
+    afternoon was hint-and-fail; now we offer the install in-band.
+    """
+    if not sys.stdin.isatty():
+        print(
+            "cyberdeck: stdin is not a TTY; cannot prompt for "
+            "claude install.",
+            file=sys.stderr,
+        )
+        return False
+    print("cyberdeck: claude binary not found on PATH.")
+    print()
+    print(
+        "claude is required to spawn the daemon / watchdog / "
+        "constructs. Install via npm?"
+    )
+    print("  npm install -g @anthropic-ai/claude-code")
+    print(
+        "After install, run `claude` once in a terminal to log "
+        "in to your Anthropic account. Declining exits the deck."
+    )
+    try:
+        response = input("[y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return response in ("y", "yes")
+
+
+def install_claude_bin() -> tuple[bool, str]:
+    """Run `npm install -g @anthropic-ai/claude-code`. Returns
+    (success, output). Same shape as install_packages but for
+    the npm side of the world.
+
+    Failure modes worth distinguishing in output:
+      - npm not on PATH (FileNotFoundError) → user needs to install
+        Node.js first
+      - permission denied on global prefix (corp Windows without
+        admin, or Linux without sudo) → npm error message in stderr
+        suggests --prefix or sudo
+      - network failure / registry timeout
+      - registry corruption
+
+    5min timeout — same as install_packages. npm is occasionally
+    slow on first global install (downloads + dependencies).
+    """
+    cmd = ["npm", "install", "-g", "@anthropic-ai/claude-code"]
+    print(f"cyberdeck: running: {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300.0,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "npm install timed out (5min)"
+    except FileNotFoundError:
+        return False, (
+            "npm not found on PATH. Install Node.js first "
+            "(https://nodejs.org/) and re-run the deck."
+        )
+    except OSError as exc:
+        return False, f"npm invocation failed: {exc}"
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        return False, output.strip() or "npm exited non-zero (no output)"
+    return True, output.strip()
+
+
 def install_packages(packages: list[str]) -> tuple[bool, str]:
     """Run `<python> -m pip install <packages>`. Returns (success,
     output) — output is captured stdout+stderr suitable for the
@@ -606,28 +731,27 @@ def run_doctor_or_exit(
     """Top-level orchestration. Either returns cleanly (deck can
     launch) or calls sys.exit(N).
 
-    Flow:
+    Flow (three-tier policy, post-2026-05-07 afternoon):
       1. Run checks.
       2. If first run / `--doctor` / any FAIL: print the report.
       3. If `--doctor` flag: exit (0 on PASS-only, 1 on any FAIL).
-         Observational mode — no install prompt.
-      4. If any FAIL on hard prereqs (Python, textual, claude): exit 1.
-         These are environment-level issues; the deck cannot launch
-         without them.
-      5. If any plugin dep WARN: optional prompt to install (TTY
-         only). Yes → pip install + re-check (still-missing plugins
-         remain unavailable). No / non-TTY / Ctrl+D / install
-         failure → continue. Affected plugins surface in the Tools
-         panel as `unavailable: missing python imports: <pkg>`,
-         same way binary tools that aren't on PATH show up.
-      6. Mark first-run done, return.
-
-    Plugin-dep handling never blocks launch (post-2026-05-07
-    netrunner direction). Pre-policy this exited 1 on decline /
-    install failure; current policy treats those as graceful
-    degradation — the plugin registry already marks unavailable
-    plugins with a reason, so the netrunner sees the consequence
-    in the Tools panel without the doctor needing to gate launch.
+         Observational mode — no install prompts.
+      4. Tier 1 (Python <3.11): hard FAIL, no prompt. Can't auto-
+         install Python from inside Python. Exit 1.
+      5. Tier 2 (textual missing OR claude binary missing): prompt
+         to install. Yes → run installer + re-check; if still
+         missing, exit 1. No / non-TTY / install failure → exit 1
+         cleanly with manual-install hint.
+      6. Tier 2.5 (claude --version unhealthy): hard FAIL, no
+         prompt. Binary present but broken; install-again unlikely
+         to help. Exit 1.
+      7. Tier 3 (plugin deps missing): optional prompt to install
+         (TTY only). Yes → pip install + re-check (still-missing
+         plugins remain unavailable). No / non-TTY / Ctrl+D /
+         install failure → continue. Affected plugins surface in
+         the Tools panel as `unavailable: missing python imports:
+         <pkg>`, same way binary tools that aren't on PATH show up.
+      8. Mark first-run done, return.
 
     Caller is expected to skip this entirely when the netrunner
     passes `--no-doctor` (escape hatch for development with mock
@@ -649,17 +773,106 @@ def run_doctor_or_exit(
         # picked up by a non-doctor launch's prompt flow.
         sys.exit(1 if failed else 0)
 
-    if failed:
+    # Tier 1: Python version (no prompt — can't auto-install).
+    fail_by_label = {
+        r.label: r for r in results if r.severity == Severity.FAIL
+    }
+    if "python" in fail_by_label:
         print(
-            "cyberdeck: hard prerequisites failed. Fix the FAIL "
-            "items above and re-run.",
+            "cyberdeck: Python 3.11+ required. Install a newer "
+            "Python and re-run.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # Plugin-dep optional prompt-to-install (post-2026-05-07 policy).
-    # Never blocks launch — decline and install failure both fall
-    # through to the deck launching with affected plugins marked
+    # Tier 2a: textual (prompt-install-or-abort).
+    if "textual" in fail_by_label:
+        if not prompt_install_textual():
+            print(
+                "cyberdeck: textual is required to render the TUI. "
+                "Aborting.\n"
+                "To install manually: pip install textual",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        ok, output = install_packages(["textual"])
+        if not ok:
+            print(
+                f"cyberdeck: pip install failed:\n{output}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Re-check: pip can exit 0 but leave the import unfindable
+        # (wrong site-packages, namespace package, etc.).
+        if importlib.util.find_spec("textual") is None:
+            print(
+                "cyberdeck: install completed but textual still "
+                "not findable. Check pip output above and your "
+                "Python environment.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("cyberdeck: textual installed.")
+        # Re-run checks since the world has changed.
+        results = run_checks(claude_bin)
+        fail_by_label = {
+            r.label: r for r in results if r.severity == Severity.FAIL
+        }
+
+    # Tier 2b: claude binary (prompt-install-or-abort).
+    if "claude_bin" in fail_by_label:
+        if not prompt_install_claude_bin():
+            print(
+                "cyberdeck: claude is required to spawn the daemon "
+                "/ watchdog / constructs. Aborting.\n"
+                "To install manually: npm install -g "
+                "@anthropic-ai/claude-code",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        ok, output = install_claude_bin()
+        if not ok:
+            print(
+                f"cyberdeck: npm install failed:\n{output}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Re-check: npm install -g sometimes succeeds but the new
+        # binary isn't on the current shell's PATH yet (PATH gets
+        # cached at shell start). Tell the netrunner to restart
+        # the terminal in that case.
+        if shutil.which(claude_bin) is None:
+            print(
+                f"cyberdeck: install completed but {claude_bin!r} "
+                f"still not on PATH. Restart your terminal so PATH "
+                f"picks up the newly-installed binary, then re-run.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("cyberdeck: claude installed.")
+        # Re-run checks since claude_version probe now applies.
+        results = run_checks(claude_bin)
+        fail_by_label = {
+            r.label: r for r in results if r.severity == Severity.FAIL
+        }
+
+    # Tier 2.5: claude --version healthy (no prompt — can't auto-fix
+    # a corrupt install or broken OAuth login).
+    if "claude_version" in fail_by_label:
+        print(
+            "cyberdeck: claude binary present but `claude --version` "
+            "failed. The install may be corrupt or the OAuth login "
+            "may be broken. Run `claude --version` manually to "
+            "diagnose; reinstall with `npm install -g "
+            "@anthropic-ai/claude-code` if needed; run `claude` once "
+            "in a terminal to refresh the login.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Tier 3: plugin-dep optional prompt-to-install. Never blocks
+    # launch — decline and install failure both fall through to
+    # mark_first_run_complete with affected plugins marked
     # unavailable in the Tools panel.
     missing = get_missing_plugin_packages(results)
     if missing:
