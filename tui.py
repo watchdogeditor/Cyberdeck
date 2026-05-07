@@ -2315,11 +2315,6 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
     .power_line {
         margin-bottom: 1;
     }
-    #effort_button {
-        width: auto;
-        margin-top: 1;
-        margin-bottom: 1;
-    }
     """
 
     BINDINGS = [
@@ -2390,9 +2385,9 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             )
             yield Label(
                 "[dim]Adjust caps + power levels. Tab between fields, "
-                "Enter or Ctrl+S to save, Esc to cancel. Press "
-                "[b]E[/b] to set daemon effort, [b]F[/b] to toggle "
-                "fast-mode.[/dim]"
+                "Enter or Ctrl+S to save, Esc to cancel. "
+                "[reverse b] E [/reverse b] daemon effort  ·  "
+                "[reverse b] F [/reverse b] fast-mode toggle[/dim]"
             )
             with Horizontal(id="limits_columns"):
                 # ---- Left column: numeric caps -----------------------
@@ -2444,25 +2439,21 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                             type="integer",
                         )
                 # ---- Right column: power levels ----------------------
+                # Standardized 2026-05-07 (UI-polish micro-pass): both
+                # daemon-effort and fast-mode render as parallel rows
+                # with a small keycap-styled letter prefix. Pre-fix,
+                # daemon-effort had a primary-variant Button while
+                # fast-mode was just a Label — visually asymmetric.
+                # Now both are Labels with `[reverse b] X [/reverse b]`
+                # keycap markers and the same shape.
                 with Vertical(classes="limits_col"):
                     yield Label(
                         "POWER LEVELS", classes="limits_col_title",
                     )
                     yield Label(
-                        f"Daemon: [b]opus[/b] · "
-                        f"[cyan b]{self.daemon_effort}[/cyan b]\n"
-                        f"[dim]model pinned (manager role)[/dim]",
+                        self._daemon_caliber_label_text(),
                         id="daemon_caliber_label",
                         classes="power_line",
-                    )
-                    # Tab-reachable button as a fallback for the
-                    # priority-binding `E` shortcut. The hotkey is
-                    # the fast path; the button is the discoverable
-                    # path. Either invokes the same effort picker.
-                    yield Button(
-                        "Set daemon effort  (E)",
-                        id="effort_button",
-                        variant="primary",
                     )
                     yield Label(
                         self._fast_mode_label_text(),
@@ -2569,8 +2560,21 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             "fast_mode": self.fast_mode,
         })
 
+    def _daemon_caliber_label_text(self) -> str:
+        """Compose the daemon-effort row. Keycap-prefix styling
+        matches the fast-mode row below (UI-polish standardization
+        2026-05-07). Extracted so the EffortPickerScreen callback
+        can re-render in place after a pick without duplicating
+        the markup string."""
+        return (
+            f"[reverse b] E [/reverse b]  Daemon: [b]opus[/b] · "
+            f"[cyan b]{self.daemon_effort}[/cyan b]\n"
+            f"[dim]model pinned (manager role)[/dim]"
+        )
+
     def _fast_mode_label_text(self) -> str:
-        """Compose the fast-mode label content. Extracted so
+        """Compose the fast-mode row. Keycap-prefix styling matches
+        the daemon-effort row above. Extracted so
         action_toggle_fast_mode can re-render in place after a flip
         without duplicating the markup string."""
         fm_text = (
@@ -2578,9 +2582,8 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             else "[dim]off[/dim]"
         )
         return (
-            f"Fast-mode governor: {fm_text}\n"
-            f"[dim]Opus 4.6 only · 6x cost / 2.5x speed · "
-            f"press [b]F[/b] to toggle[/dim]"
+            f"[reverse b] F [/reverse b]  Fast-mode: {fm_text}\n"
+            f"[dim]Opus 4.6 only · 6x cost / 2.5x speed[/dim]"
         )
 
     def action_toggle_fast_mode(self) -> None:
@@ -2607,11 +2610,7 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             self.daemon_effort = result
             try:
                 lbl = self.query_one("#daemon_caliber_label", Label)
-                lbl.update(
-                    f"Daemon: [b]opus[/b] · "
-                    f"[cyan b]{self.daemon_effort}[/cyan b]\n"
-                    f"[dim]model pinned (manager role)[/dim]"
-                )
+                lbl.update(self._daemon_caliber_label_text())
             except Exception:
                 pass
 
@@ -2622,13 +2621,6 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             ),
             _picked,
         )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Tab-reachable Button fallback for the E hotkey. Same
-        action; this just gives mouse / Tab-navigation netrunners
-        a discoverable path into the effort picker."""
-        if event.button.id == "effort_button":
-            self.action_open_effort_picker()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
