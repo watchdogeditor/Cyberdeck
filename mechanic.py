@@ -78,22 +78,57 @@ def _pid_alive_win(pid: int) -> bool:
     """Windows: open a query handle and read the exit code. STILL_ACTIVE
     (259) means the process is running; any other code means it exited
     with that value. OpenProcess returning NULL means the pid is gone
-    (or we don't have rights, which we usually do for our own children)."""
+    (or we don't have rights, which we usually do for our own children).
+
+    **Critical: explicit ctypes argtypes/restype.** Without them,
+    ctypes defaults to `c_int` (32-bit signed) for the HANDLE return
+    of OpenProcess. On 64-bit Windows, HANDLE is pointer-sized
+    (8 bytes); the default truncates to 32 bits. The truncated value
+    may "look" non-NULL to `if not h:` but is corrupt — passing it
+    to GetExitCodeProcess fails (returns 0), and `_pid_alive_win`
+    returns False even though the process is fully alive. Symptom:
+    mechanic immediately reports the deck dead right after launch.
+    Real-deck-confirmed 2026-05-06 on Python 3.14.3 + Windows 11.
+    Fix: declare argtypes + restype with `ctypes.wintypes` so HANDLE
+    is `c_void_p`-shaped on 64-bit and DWORD/BOOL stay correctly
+    sized regardless of architecture.
+
+    Filed in cyberdeck-state.md Async/subprocess gotchas — the
+    "ctypes Windows-handle truncation" landmine. Generalizes
+    beyond mechanic: any future ctypes call into kernel32 / user32
+    / etc. needs explicit types."""
     import ctypes
+    from ctypes import wintypes
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     STILL_ACTIVE = 259
     kernel32 = ctypes.windll.kernel32
-    h = kernel32.OpenProcess(
-        PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
-    )
+
+    # OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId) -> HANDLE
+    OpenProcess = kernel32.OpenProcess
+    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    OpenProcess.restype = wintypes.HANDLE
+
+    # GetExitCodeProcess(HANDLE hProcess, LPDWORD lpExitCode) -> BOOL
+    GetExitCodeProcess = kernel32.GetExitCodeProcess
+    GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+    ]
+    GetExitCodeProcess.restype = wintypes.BOOL
+
+    # CloseHandle(HANDLE hObject) -> BOOL
+    CloseHandle = kernel32.CloseHandle
+    CloseHandle.argtypes = [wintypes.HANDLE]
+    CloseHandle.restype = wintypes.BOOL
+
+    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not h:
         return False
     try:
-        exit_code = ctypes.c_ulong()
-        ok = kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code))
+        exit_code = wintypes.DWORD()
+        ok = GetExitCodeProcess(h, ctypes.byref(exit_code))
         return bool(ok) and exit_code.value == STILL_ACTIVE
     finally:
-        kernel32.CloseHandle(h)
+        CloseHandle(h)
 
 
 def pid_alive(pid: int) -> bool:

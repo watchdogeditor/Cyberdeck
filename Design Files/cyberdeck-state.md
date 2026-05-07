@@ -2242,6 +2242,45 @@ and 11.
   splits it into Strips, so scrolling stays line-by-line.
 
 ### Async / subprocess
+- **🚨 ctypes Windows-handle truncation: ALWAYS set argtypes /
+  restype on kernel32 / user32 / advapi32 calls.** Filed
+  2026-05-06 during Mechanic v1.5 real-deck testing. Symptom:
+  mechanic.py reported the deck dead immediately after launch
+  ("[mechanic] deck pid=XXXXX died ... cleaning up 0 tracked
+  subprocess(es); firing v1 triage") even though the deck was
+  fully alive and writing log records. Triage fired
+  unnecessarily, burning ~2 minutes + tokens per false-positive
+  launch.
+  
+  Mechanism: ctypes `kernel32.OpenProcess(...)` without explicit
+  argtypes/restype defaults to `c_int` (32-bit signed) for the
+  HANDLE return value. On 64-bit Windows, HANDLE is pointer-sized
+  (8 bytes); the default truncates to 32 bits. Sometimes the
+  truncated handle is still non-zero (looks valid to `if not h`)
+  but is corrupt — `GetExitCodeProcess(h, ...)` fails (returns 0)
+  → `_pid_alive_win` returns False → mechanic concludes the
+  deck is dead.
+  
+  Intermittent in practice: depends on whether the OS happened to
+  return a HANDLE with non-zero high bits (which is non-
+  deterministic between launches and varies by Windows version /
+  Python ctypes version). Bug latent for the entire mechanic v0
+  history; surfaced reliably enough on Python 3.14.3 + Windows 11
+  to be diagnosed.
+  
+  Fix: declare full argtypes + restype using `ctypes.wintypes`:
+    OpenProcess.argtypes = [DWORD, BOOL, DWORD]; restype = HANDLE
+    GetExitCodeProcess.argtypes = [HANDLE, POINTER(DWORD)]; restype = BOOL
+    CloseHandle.argtypes = [HANDLE]; restype = BOOL
+  
+  Generalizes beyond mechanic: any future ctypes call into
+  kernel32 / user32 / advapi32 / etc. MUST set argtypes + restype
+  before calling. Skipping is a Windows-64-bit landmine. Test
+  shape: spawn a known-alive subprocess, call your function on
+  its pid, assert True; kill it, call again, assert False.
+  Skipping the test = waiting for the next intermittent
+  reproduction in production.
+
 - **Async-task teardown isn't guaranteed to run before process
   exit.** Filed 2026-05-06 during Mechanic v1 real-deck testing.
   `action_quit` (Ctrl+Q idle path) called `self.exit()` after
