@@ -3248,9 +3248,7 @@ class KeybindsScreen(ModalScreen[None]):
         with Vertical(id="keybinds_dialog"):
             yield Label(
                 "[b]CYBERDECK KEYBINDS[/b]  "
-                "[dim]([reverse b] q [/reverse b]/"
-                "[reverse b] e [/reverse b] page · "
-                "[reverse b] Esc [/reverse b] / "
+                "[dim]([reverse b] Esc [/reverse b] / "
                 "[reverse b] ? [/reverse b] / "
                 "[reverse b] Space [/reverse b] close)[/dim]"
             )
@@ -3259,20 +3257,25 @@ class KeybindsScreen(ModalScreen[None]):
                 yield Static(self._build_page_text(), id="keybinds_body")
 
     def _page_indicator_text(self) -> str:
-        """Top-of-modal pager: shows all section names with the
-        current page highlighted via [reverse b] chrome (matches
-        the keycap convention used elsewhere). Lets the netrunner
-        see at a glance which page they're on AND what's on the
-        other pages without flipping through them all."""
-        bits: list[str] = []
+        """Top-of-modal pager: Q keycap on the far left, section
+        titles in the middle (current highlighted via reverse-block
+        chrome like the keycaps), E keycap on the far right. The
+        keycap-flanked layout makes the page-nav controls
+        self-explanatory — [Q] on the left reads as "previous,"
+        [E] on the right as "next" — without a separate hint line
+        in the header. Netrunner direction 2026-05-07 evening."""
+        bits: list[str] = ["[reverse b] Q [/reverse b]"]
         for idx, (title, _) in enumerate(self.PAGES):
             if idx == self._page:
                 bits.append(f"[reverse b] {title} [/reverse b]")
             else:
                 bits.append(f"[dim]{title}[/dim]")
-        n = len(self.PAGES)
-        i = self._page + 1
-        return f"[dim]Page {i}/{n}[/dim]   " + "  ".join(bits)
+        bits.append("[reverse b] E [/reverse b]")
+        # Q ... titles ... E with comfortable spacing. Single-space
+        # between titles keeps things compact; double-space between
+        # Q/E and the title list creates a clear visual gap so the
+        # nav keycaps don't look like a sixth section.
+        return f"{bits[0]}   " + "  ".join(bits[1:-1]) + f"   {bits[-1]}"
 
     def _build_page_text(self) -> str:
         """Render the current page's bindings as a Rich-markup

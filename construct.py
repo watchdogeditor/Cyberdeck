@@ -17,6 +17,9 @@ import json
 import os
 import re
 import shutil
+import signal
+import subprocess as _subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -35,6 +38,123 @@ if TYPE_CHECKING:
     # — the construct just calls `.to_claude_args()` on whatever
     # caliber-shaped object Fleet hands it.
     from caliber import Caliber
+
+
+# ---- tree-kill helpers (post-2026-05-07 evening — netrunner direction:
+# kill must propagate to every descendant; "I don't care what breaks,
+# kill needs to be the 'stop instantly' button") -----------------------
+#
+# Pre-fix the construct's kill() called proc.terminate() / proc.kill()
+# which on Windows is TerminateProcess (parent only) and on POSIX is
+# SIGTERM/SIGKILL to a single PID. claude-code routinely spawns child
+# subprocesses for tool calls (Bash workers, python interpreters, ssh
+# sessions, etc.); killing the parent leaves those orphaned, and the
+# construct's pane stuck in "killed" state while real work continues
+# in the background.
+#
+# Fix: when a kill is requested OR escalation fires, walk the process
+# tree and SIGKILL everything. Cross-platform pure-stdlib approach:
+#   - Windows: spawn `taskkill /T /F /PID <pid>`. /T = whole tree,
+#     /F = force. Synchronous; ignored output. Always available on
+#     Windows since XP.
+#   - POSIX: try the process-group route (works if the subprocess was
+#     started with start_new_session — most aren't, but the call is
+#     cheap and silent on failure). Belt-and-suspenders: walk
+#     /proc/<pid>/task/<tid>/children to enumerate descendants and
+#     SIGKILL each. Finally SIGKILL the root in case earlier passes
+#     missed it.
+#
+# Best-effort throughout. Failures (already gone, permission denied,
+# missing binary, /proc unmounted) are silent — the caller's clean-
+# state-flip happens regardless. Worst case we leave a stray
+# subprocess; not-the-end-of-the-world but rarer than today's
+# default-orphan behavior.
+
+
+def _hard_kill_tree(pid: int) -> None:
+    """Aggressively terminate `pid` and all its descendants.
+
+    Best-effort, silent on failure. The netrunner explicitly opted
+    into 'kill stops things instantly, breakage is acceptable' over
+    'kill is graceful but leaves orphans.'
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    if sys.platform == "win32":
+        # taskkill /T = entire process tree; /F = force-terminate.
+        # Capture output so it doesn't pollute the deck's stderr.
+        try:
+            _subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10.0,
+            )
+        except Exception:
+            pass
+        return
+
+    # POSIX path: process group first (most subprocesses share their
+    # parent's pgid; killpg one-shot drops the whole tree if so).
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+    # Belt-and-suspenders: walk /proc to enumerate descendants we
+    # might have missed (different pgids, daemonized children, etc.).
+    try:
+        for descendant_pid in _enumerate_descendants_posix(pid):
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+    # Finally, SIGKILL the root in case killpg missed it.
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _enumerate_descendants_posix(pid: int) -> list[int]:
+    """Walk /proc/<pid>/task/<tid>/children to find every descendant
+    PID under `pid`. Returns flat list (root not included). Linux-
+    specific (/proc layout); on macOS / *BSD this returns empty and
+    the caller falls through to the killpg + root-kill path."""
+    descendants: list[int] = []
+    visited: set[int] = set()
+    stack: list[int] = [pid]
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        tasks_dir = f"/proc/{cur}/task"
+        if not os.path.isdir(tasks_dir):
+            continue
+        try:
+            tids = os.listdir(tasks_dir)
+        except OSError:
+            continue
+        for tid in tids:
+            children_path = f"{tasks_dir}/{tid}/children"
+            try:
+                with open(children_path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            for token in raw.split():
+                try:
+                    child_pid = int(token)
+                except ValueError:
+                    continue
+                if child_pid not in visited:
+                    stack.append(child_pid)
+                    descendants.append(child_pid)
+    return descendants
 
 
 class ConstructState(Enum):
@@ -813,17 +933,57 @@ class Construct:
         self._kill_requested = True
         if not self._kill_reason:
             self._kill_reason = reason or "unspecified"
+
+        # Snapshot the pid before we start tearing down — proc.pid
+        # can become None after the process exits, and we need it
+        # for the tree-kill pass below regardless of which branch
+        # fires.
+        root_pid = self._proc.pid
+
         try:
             self._proc.terminate()
             await asyncio.wait_for(self._proc.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            self._proc.kill()
+            # Escalation: claude didn't respond to terminate within
+            # the grace window. Hard tree-kill — taskkill /T /F on
+            # Windows, killpg + descendant walk + SIGKILL on POSIX.
+            # Pre-2026-05-07 evening this was just proc.kill() which
+            # only takes down the parent claude PID; child
+            # subprocesses (bash workers, python interpreters,
+            # whatever the model invoked) survived as orphans.
+            # Real-deck observation: kill would "succeed" while a
+            # background curl / nmap / ssh ran on indefinitely.
+            if root_pid is not None:
+                _hard_kill_tree(root_pid)
+            else:
+                # Defensive fallback: pid was already None somehow
+                # (proc never started cleanly?). Best we can do.
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
             try:
-                await self._proc.wait()
-            except ProcessLookupError:
+                await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+            except (ProcessLookupError, asyncio.TimeoutError):
                 pass
         except ProcessLookupError:
             pass  # already gone
+
+        # Belt-and-suspenders tree-kill on EVERY kill path (clean
+        # terminate succeeded, escalation fired, or process was
+        # already gone). claude can shutdown gracefully without
+        # propagating SIGTERM to its children — even on the clean
+        # path we've seen background work continue. Netrunner
+        # direction: kill must be "stop instantly" — re-walking the
+        # tree is cheap (taskkill on a dead pid no-ops; descendant
+        # walks find nothing if already cleaned) and prevents the
+        # orphan-subprocess class of bugs entirely.
+        if root_pid is not None:
+            try:
+                _hard_kill_tree(root_pid)
+            except Exception:
+                pass
+
         self.state = ConstructState.KILLED
 
     # ---- introspection --------------------------------------------------
