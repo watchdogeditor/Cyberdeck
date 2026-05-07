@@ -54,6 +54,14 @@ Two more for specific moments: `cyberdeck-project-instructions.md`
 future tools-research conversation). `cyberdeck_arbiter_design.md` is
 a deferred wearable-form-factor variant — not current scope.
 
+**Living inventory:** `cyberdeck-platform-portability.md` (filed
+2026-05-06). Tracks every line of Windows-specific code in the
+deck with notes on Linux/Pi porting plans. Update whenever new
+platform-specific code lands. The deck targets hardware-agnostic
+deployment (RPi-Linux is the eventual home), so explicit
+fence-posts beat hidden assumptions — this doc makes the porting
+cost knowable.
+
 ## Where the deck is right now (2026-04-30, late)
 
 Spine 7/8 phases shipped (event_bus + every producer migrated +
