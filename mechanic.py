@@ -486,6 +486,35 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-iterative",
+        action="store_true",
+        help=(
+            "Disable iterative-triage prompting (item 0g, 2026-05-07). "
+            "Default behavior: after pass 1's report writes, prompt "
+            "the netrunner via stderr 'Keep delving? [y/N]'; on yes, "
+            "fire a deepening pass via --resume <session_id> that "
+            "appends a 'Deeper analysis (pass N)' section to the same "
+            "report file. Disable this to keep the v1 single-pass "
+            "behavior (e.g. for headless / wall-mount where there's "
+            "no netrunner at the terminal). Non-TTY stdin auto-skips "
+            "the prompt regardless of this flag."
+        ),
+    )
+    parser.add_argument(
+        "--max-triage-passes",
+        type=int,
+        default=4,
+        help=(
+            "Maximum number of deepening passes to allow during "
+            "iterative triage (default 4 — i.e. pass 1 + up to 4 "
+            "additional). Soft cap to keep token spend bounded; the "
+            "netrunner can still end the loop early at any prompt by "
+            "answering N. Set to 0 to suppress all deepening passes "
+            "(equivalent to --no-iterative for the deepening-loop "
+            "behavior, but still uses run_iterative_triage's wrapper)."
+        ),
+    )
+    parser.add_argument(
         "--claude-bin",
         type=str,
         default="claude",
@@ -953,7 +982,9 @@ def main() -> int:
         # on the common clean-shutdown path. The LLM session module
         # has its own dependencies (tempfile, subprocess.run for the
         # synchronous claude call); cleaner to lazy-load.
-        from mechanic_triage import TriageRequest, run_triage
+        from mechanic_triage import (
+            TriageRequest, run_iterative_triage,
+        )
     except Exception as e:
         print(
             f"[mechanic] triage module import failed: {e}; "
@@ -991,54 +1022,81 @@ def main() -> int:
         # then we killed it" from "deck crashed naturally."
         wedge_kill_context=wedge_kill_context,
     )
-    triage_result = run_triage(triage_req)
-    if triage_result.success:
-        print(
-            f"[mechanic] triage written ({triage_result.elapsed_s:.1f}s) "
-            f"-> {triage_result.report_path}",
-            file=sys.stderr,
-        )
-        print(
-            f"[mechanic] summary: {triage_result.summary_line}",
-            file=sys.stderr,
-        )
-    elif triage_result.is_partial:
-        # Timeout fired but partial-recovery wrote a useful report
-        # from collected stream events. Different framing from a
-        # literal stub: the netrunner has real diagnostic content
-        # to read; "FAILED" + "stub" would understate that.
-        print(
-            f"[mechanic] triage timed out at "
-            f"{triage_result.elapsed_s:.1f}s — partial report saved",
-            file=sys.stderr,
-        )
-        print(
-            f"[mechanic] partial -> {triage_result.report_path}",
-            file=sys.stderr,
-        )
-        print(
-            f"[mechanic] summary: {triage_result.summary_line}",
-            file=sys.stderr,
-        )
-        print(
-            f"[mechanic] re-run with --triage-timeout "
-            f"{triage_result.elapsed_s * 2:.0f} for more headroom",
-            file=sys.stderr,
-        )
-    else:
-        # Real failure (claude not found, non-zero exit, missing
-        # result event, file-system error). Stub written carries
-        # the failure reason; no useful diagnostic content.
-        print(
-            f"[mechanic] triage FAILED ({triage_result.elapsed_s:.1f}s): "
-            f"{triage_result.error}",
-            file=sys.stderr,
-        )
-        if triage_result.report_path:
+
+    # Iterative-triage cap (item 0g). --no-iterative collapses to
+    # single-pass behavior; otherwise the orchestrator prompts the
+    # netrunner between passes and resumes the same claude session
+    # via --resume <session_id> for deepening.
+    max_passes = 0 if args.no_iterative else max(0, args.max_triage_passes)
+    triage_results = run_iterative_triage(
+        triage_req, max_deepening_passes=max_passes,
+    )
+
+    # Surface each pass's outcome to stderr. Pass 1 gets the existing
+    # success/partial/fail framing; subsequent passes get a brief
+    # "deepening pass N: ..." line. The full reports are appended to
+    # the same file alongside the log; netrunner reads the file for
+    # the complete story.
+    for idx, triage_result in enumerate(triage_results):
+        is_pass_1 = idx == 0
+        pass_label = "v1 triage" if is_pass_1 else f"deepening pass {idx + 1}"
+        if triage_result.success:
+            if is_pass_1:
+                print(
+                    f"[mechanic] {pass_label} written "
+                    f"({triage_result.elapsed_s:.1f}s) "
+                    f"-> {triage_result.report_path}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[mechanic] {pass_label} appended "
+                    f"({triage_result.elapsed_s:.1f}s)",
+                    file=sys.stderr,
+                )
             print(
-                f"[mechanic]   stub written -> {triage_result.report_path}",
+                f"[mechanic] summary: {triage_result.summary_line}",
                 file=sys.stderr,
             )
+        elif triage_result.is_partial:
+            # Timeout fired but partial-recovery wrote a useful report
+            # from collected stream events. Different framing from a
+            # literal stub: the netrunner has real diagnostic content
+            # to read; "FAILED" + "stub" would understate that.
+            print(
+                f"[mechanic] {pass_label} timed out at "
+                f"{triage_result.elapsed_s:.1f}s — partial report saved",
+                file=sys.stderr,
+            )
+            if is_pass_1:
+                print(
+                    f"[mechanic] partial -> {triage_result.report_path}",
+                    file=sys.stderr,
+                )
+            print(
+                f"[mechanic] summary: {triage_result.summary_line}",
+                file=sys.stderr,
+            )
+            print(
+                f"[mechanic] re-run with --triage-timeout "
+                f"{triage_result.elapsed_s * 2:.0f} for more headroom",
+                file=sys.stderr,
+            )
+        else:
+            # Real failure (claude not found, non-zero exit, missing
+            # result event, file-system error). Stub written carries
+            # the failure reason; no useful diagnostic content.
+            print(
+                f"[mechanic] {pass_label} FAILED "
+                f"({triage_result.elapsed_s:.1f}s): "
+                f"{triage_result.error}",
+                file=sys.stderr,
+            )
+            if is_pass_1 and triage_result.report_path:
+                print(
+                    f"[mechanic]   stub written -> {triage_result.report_path}",
+                    file=sys.stderr,
+                )
     return 0
 
 

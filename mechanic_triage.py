@@ -69,7 +69,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 # Caliber: sonnet + medium. Triage is reasoning-heavy (correlate
@@ -175,6 +175,13 @@ class TriageResult:
     netrunner — the difference matters because partial reports
     contain real diagnostic content the netrunner can act on.
 
+    `session_id` is the claude-side session uuid captured from the
+    first system/init stream event. Set when the spawn produced one;
+    None on early failures. `run_iterative_triage` reads this to
+    drive `--resume <session_id>` for subsequent deepening passes,
+    so the model keeps its working context across passes instead
+    of re-reading the log from scratch.
+
     The supervisor uses summary_line for its stderr output; the
     netrunner reads report_path for the full story.
     """
@@ -185,6 +192,7 @@ class TriageResult:
     error: Optional[str] = None
     elapsed_s: float = 0.0
     is_partial: bool = False
+    session_id: Optional[str] = None
 
 
 # System prompt for the mechanic v1 LLM session. Family A — full
@@ -636,7 +644,12 @@ def _print_triage_event(event: dict) -> None:
     # to keep stderr signal-to-noise high.
 
 
-def run_triage(req: TriageRequest) -> TriageResult:
+def run_triage(
+    req: TriageRequest,
+    *,
+    resume_session_id: Optional[str] = None,
+    user_prompt_override: Optional[str] = None,
+) -> TriageResult:
     """Spawn one `claude -p` subprocess for the triage and return
     the result.
 
@@ -653,61 +666,87 @@ def run_triage(req: TriageRequest) -> TriageResult:
     belt for CLAUDE.md / auto-memory / git-instructions
     suppression. Mechanic's curated system prompt has its own
     architecture vocabulary; no need to free-ride on auto-load.
+
+    Iterative-triage support (item 0g, 2026-05-07):
+      - `resume_session_id`: when set, the spawn adds
+        `--resume <session_id>` and SKIPS the system-prompt-file
+        flag (claude --resume preserves the prior session's system
+        prompt + conversation context). The deepening pass inherits
+        the model's working knowledge from pass 1 instead of
+        re-reading the log + the gotchas list from scratch.
+      - `user_prompt_override`: when set, used as the user-message
+        body instead of the default `build_user_prompt(req,
+        log_tail)`. Pass-2+ uses this for the deepening directive
+        ("go deeper, look at X"); the conversation context already
+        has the log content from pass 1.
     """
     started_at = time.time()
 
     # Resolve binary upfront for a clear error if it's missing.
     bin_path = shutil.which(req.claude_bin) or req.claude_bin
 
-    # Read the tail of the log. If this fails, the triage isn't
-    # going to be useful — bail with a clear error so the
-    # supervisor can log it.
-    log_tail = _load_log_tail(req.log_path)
-    if not log_tail:
-        return TriageResult(
-            success=False,
-            report_text=(
-                f"# Triage report — {req.log_path.name}\n\n"
-                f"## Summary\n\n"
-                f"Triage failed: could not read log tail from "
-                f"`{req.log_path}`. The file may be missing, "
-                f"unreadable, or empty.\n"
-            ),
-            error="log_tail_read_failed",
-            elapsed_s=time.time() - started_at,
-            summary_line="triage failed: log unreadable",
-        )
-
-    user_prompt = build_user_prompt(req, log_tail)
+    # Determine the user prompt + whether we need to read the log.
+    # Resume passes don't re-read the log (the prior session already
+    # has it in context); fresh passes do.
+    if user_prompt_override is not None:
+        user_prompt = user_prompt_override
+    else:
+        # Read the tail of the log. If this fails, the triage isn't
+        # going to be useful — bail with a clear error so the
+        # supervisor can log it.
+        log_tail = _load_log_tail(req.log_path)
+        if not log_tail:
+            return TriageResult(
+                success=False,
+                report_text=(
+                    f"# Triage report — {req.log_path.name}\n\n"
+                    f"## Summary\n\n"
+                    f"Triage failed: could not read log tail from "
+                    f"`{req.log_path}`. The file may be missing, "
+                    f"unreadable, or empty.\n"
+                ),
+                error="log_tail_read_failed",
+                elapsed_s=time.time() - started_at,
+                summary_line="triage failed: log unreadable",
+            )
+        user_prompt = build_user_prompt(req, log_tail)
 
     # System prompt → temp file. argv-newline-truncation gotcha
     # applies to every spawn site that uses --system-prompt /
     # --append-system-prompt with multi-line content on Windows.
+    # Skipped when resuming — claude --resume preserves the prior
+    # session's system prompt automatically.
     sysprompt_path: Optional[str] = None
-    try:
-        fd, sysprompt_path = tempfile.mkstemp(
-            suffix=".txt", prefix=f"mechanic-triage-",
-        )
-        os.close(fd)
-        Path(sysprompt_path).write_text(
-            MECHANIC_SYSTEM_PROMPT, encoding="utf-8",
-        )
-    except Exception as e:
-        return TriageResult(
-            success=False,
-            report_text="",
-            error=f"failed to write system-prompt file: {e}",
-            elapsed_s=time.time() - started_at,
-            summary_line=f"triage failed: prompt write {e!r}",
-        )
+    if resume_session_id is None:
+        try:
+            fd, sysprompt_path = tempfile.mkstemp(
+                suffix=".txt", prefix=f"mechanic-triage-",
+            )
+            os.close(fd)
+            Path(sysprompt_path).write_text(
+                MECHANIC_SYSTEM_PROMPT, encoding="utf-8",
+            )
+        except Exception as e:
+            return TriageResult(
+                success=False,
+                report_text="",
+                error=f"failed to write system-prompt file: {e}",
+                elapsed_s=time.time() - started_at,
+                summary_line=f"triage failed: prompt write {e!r}",
+            )
 
-    cmd = [
-        bin_path,
-        "-p",
-        "--system-prompt-file", sysprompt_path,
+    cmd = [bin_path, "-p"]
+    if resume_session_id is not None:
+        cmd += ["--resume", resume_session_id]
+    if sysprompt_path is not None:
+        cmd += ["--system-prompt-file", sysprompt_path]
+    cmd += [
         "--tools", TRIAGE_ALLOWED_TOOLS,
         "--disable-slash-commands",
-        "--no-session-persistence",
+        # --no-session-persistence is omitted on resume passes
+        # because the resume itself reads the persisted session.
+        # Fresh passes still set it to keep the cache stable.
+        *(["--no-session-persistence"] if resume_session_id is None else []),
         "--model", TRIAGE_MODEL,
         "--effort", TRIAGE_EFFORT,
         # Permission mode bypassPermissions because v1's tools are
@@ -794,6 +833,7 @@ def run_triage(req: TriageRequest) -> TriageResult:
         "assistant_text": [],     # text blocks: the in-progress report
         "thinking_blocks": [],    # all thinking strings (debug appendix)
         "tool_calls": [],         # (tool, input_dict) tuples
+        "session_id": None,       # claude-side uuid from system/init
     }
 
     def _reader_thread() -> None:
@@ -810,6 +850,13 @@ def run_triage(req: TriageRequest) -> TriageResult:
                 _print_triage_event(event)
 
                 et = event.get("type")
+                if et == "system" and event.get("subtype") == "init":
+                    # First event in the stream — carries the
+                    # claude-side session uuid we'll need for
+                    # --resume on a subsequent deepening pass.
+                    sid = event.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        reader_state["session_id"] = sid
                 if et == "result":
                     reader_state["final_text"] = (
                         event.get("result", "") or ""
@@ -897,6 +944,7 @@ def run_triage(req: TriageRequest) -> TriageResult:
                 f"tool calls"
             ),
             elapsed_s=time.time() - started_at,
+            session_id=reader_state.get("session_id"),
         )
 
     if proc.returncode != 0:
@@ -934,6 +982,7 @@ def run_triage(req: TriageRequest) -> TriageResult:
             error=f"report-write failed (text in result): {e}",
             summary_line=_summary_line(report_text),
             elapsed_s=time.time() - started_at,
+            session_id=reader_state.get("session_id"),
         )
 
     return TriageResult(
@@ -942,6 +991,7 @@ def run_triage(req: TriageRequest) -> TriageResult:
         report_path=report_path,
         summary_line=_summary_line(report_text),
         elapsed_s=time.time() - started_at,
+        session_id=reader_state.get("session_id"),
     )
 
 
@@ -1112,3 +1162,225 @@ def _finalize_failure(
         summary_line=summary_line,
         elapsed_s=time.time() - started_at,
     )
+
+
+# ---- iterative triage (item 0g, 2026-05-07) -------------------------------
+#
+# Multi-pass deepening triage. After v1's initial report, optionally prompt
+# the netrunner: "Keep delving?". On y, fire another pass via `--resume
+# <session_id>` so the model continues with full prior-pass context (no
+# re-reading the log + gotchas; just goes deeper). Each pass appends a new
+# section to the same report file. Stops on N, max-passes, fail, or
+# non-TTY stdin.
+#
+# Why iterative: real-deck observation 2026-05-06 — pass-1 reports were
+# usually correct on the surface but sometimes left the netrunner with
+# unanswered "but WHY did X cascade into Y" questions. Forcing the
+# netrunner to manually re-spawn a triage with a longer prompt was
+# friction. Iterative gives them an interactive deepening surface that
+# costs token-by-token instead of upfront.
+
+
+# Maximum number of deepening passes (v1 = 1 pass; v1+iter = pass 1 + up
+# to MAX_DEEPENING_PASSES additional). Soft cap to keep token spend
+# bounded — netrunner can override per-launch via `--max-triage-passes`.
+DEFAULT_MAX_DEEPENING_PASSES = 4
+
+
+def _build_deepen_directive(pass_num: int) -> str:
+    """User-message body for a deepening pass. Sent verbatim as the
+    user's next turn; claude --resume preserves the prior session's
+    system prompt and conversation history, so this is just the
+    "go further" instruction.
+
+    `pass_num` is the deepening pass number (2 = first deepening pass
+    after pass 1; 3 = second deepening; etc.). Used in the heading
+    so the appended section is glanceable in the report file.
+    """
+    return (
+        f"DEEPEN. The netrunner read your last triage and wants more "
+        f"depth. Go further than your previous pass — pick the most "
+        f"speculative cause from your prior 'Plausible causes' list "
+        f"and dig until you can promote or eliminate it. Cross-check "
+        f"more filed gotchas in cyberdeck-state.md. If your prior "
+        f"'Suggested next steps' said 'investigate Z', go investigate "
+        f"Z now and report what you found. If your prior report said "
+        f"'unknown' anywhere, try to narrow it.\n"
+        f"\n"
+        f"Append a NEW section to the report under the heading "
+        f"`## Deeper analysis (pass {pass_num})`. Don't repeat your "
+        f"earlier content; build on it. Same hard constraints apply: "
+        f"read-only, no autonomous fixes, honest about unknowns, "
+        f"brief."
+    )
+
+
+def prompt_keep_delving(pass_num: int) -> bool:
+    """Stderr prompt: "Keep delving? [y/N]". Returns True on y/yes.
+
+    Non-TTY stdin → returns False without prompting. Same policy as
+    the doctor's plugin-dep prompt: when there's no human at the
+    terminal, don't spin (keeps headless / wall-mount / CI deployments
+    sane — they get the v1 single-pass triage and exit, no hang).
+
+    EOFError / KeyboardInterrupt during input() → False (treat as
+    decline). Ctrl+C on the supervisor terminal during a triage prompt
+    is the netrunner saying "I'm done with this triage flow"; respect
+    that.
+    """
+    if not sys.stdin.isatty():
+        return False
+    try:
+        sys.stderr.write(
+            f"\n[mechanic] Pass {pass_num - 1} report written. "
+            f"Keep delving? (next pass resumes the same claude "
+            f"session and writes a new 'Deeper analysis (pass "
+            f"{pass_num})' section). [y/N]: "
+        )
+        sys.stderr.flush()
+        ans = input("").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("\n")
+        return False
+    except Exception:
+        # Any unexpected I/O issue — bail on the iterative path
+        # rather than risk a hang. Pass-1 report is preserved.
+        return False
+    return ans in ("y", "yes")
+
+
+def _append_pass_to_report(
+    report_path: Optional[Path],
+    new_text: str,
+) -> bool:
+    """Append a deepening pass's text to the existing report file.
+
+    Returns True on success, False on any I/O failure. Failure is
+    tolerable — the new text is also in the returned TriageResult,
+    so the netrunner can recover it from stderr if needed.
+
+    Insertion strategy: append a horizontal-rule separator + the
+    new text. The pass's own opening heading (`## Deeper analysis
+    (pass N)`) provides the section anchor; we don't add another
+    heading layer here. Plain append vs. a more structured rewrite
+    keeps this resilient to the model formatting the new pass
+    however it wants.
+    """
+    if report_path is None:
+        return False
+    try:
+        with report_path.open("a", encoding="utf-8") as f:
+            f.write("\n\n---\n\n")
+            f.write(new_text.rstrip())
+            f.write("\n")
+        return True
+    except OSError:
+        return False
+
+
+def run_iterative_triage(
+    req: TriageRequest,
+    *,
+    max_deepening_passes: int = DEFAULT_MAX_DEEPENING_PASSES,
+    prompt_fn: Optional[Callable[[int], bool]] = None,
+) -> list[TriageResult]:
+    """Run pass 1 + up to `max_deepening_passes` additional passes,
+    prompting the netrunner between each via `prompt_fn` (defaults
+    to `prompt_keep_delving`). Returns the list of TriageResults
+    in order — `[0]` is pass 1, `[1]` is the first deepening pass,
+    etc. The list is always non-empty (pass 1 always fires).
+
+    Each deepening pass:
+      - Uses `--resume <session_id>` from the prior result to inherit
+        the model's full working context (log content, gotchas
+        cross-references, prior cause-ranking) instead of re-reading
+        from scratch.
+      - Sends a short "go deeper" directive (`_build_deepen_directive`)
+        instructing the model to write a new `## Deeper analysis
+        (pass N)` section.
+      - Appends the new text to the existing report file via
+        `_append_pass_to_report`.
+
+    Stops early on:
+      - `prompt_fn` returns False (netrunner declined / non-TTY).
+      - `max_deepening_passes` reached.
+      - Pass returned `success=False AND not is_partial` — a real
+        failure, no point continuing without a valid session.
+      - No `session_id` captured from the prior pass (can't resume).
+    """
+    if prompt_fn is None:
+        prompt_fn = prompt_keep_delving
+
+    # Pass 1 — fresh, standard triage.
+    results: list[TriageResult] = []
+    pass1 = run_triage(req)
+    results.append(pass1)
+
+    # Real failure on pass 1 → no session to resume from. Return
+    # the single-result list; supervisor surfaces it the same way
+    # as a non-iterative triage.
+    if not pass1.success and not pass1.is_partial:
+        return results
+    if not pass1.session_id:
+        # Pass 1 produced output but somehow no session_id (shouldn't
+        # happen in practice — system/init fires on every fresh
+        # claude -p, including --no-session-persistence ones). Without
+        # the id we can't resume; surface pass 1 as final.
+        sys.stderr.write(
+            "[mechanic] iterative triage: pass 1 didn't surface a "
+            "session_id; can't deepen. Returning single-pass result.\n"
+        )
+        sys.stderr.flush()
+        return results
+
+    # Deepening loop.
+    current_session_id: Optional[str] = pass1.session_id
+    for i in range(max_deepening_passes):
+        pass_num = i + 2  # pass 2, 3, 4, ...
+        if not prompt_fn(pass_num):
+            break
+
+        sys.stderr.write(
+            f"[mechanic] iterative: firing deepening pass "
+            f"{pass_num} (resume {current_session_id[:8]}…)\n"
+        )
+        sys.stderr.flush()
+
+        directive = _build_deepen_directive(pass_num)
+        next_pass = run_triage(
+            req,
+            resume_session_id=current_session_id,
+            user_prompt_override=directive,
+        )
+        results.append(next_pass)
+
+        # Append this pass's text to the original report file. Use
+        # report_path from pass 1 (or the latest successful pass if
+        # available) — the deepening pass's own report_path may
+        # have been overwritten by the per-pass write logic.
+        original_report_path = pass1.report_path
+        if next_pass.report_text:
+            _append_pass_to_report(
+                original_report_path, next_pass.report_text,
+            )
+
+        # Real failure → stop. Partial-recovery on a deepening pass
+        # is treated as continuable (the appended text is still
+        # diagnostic value), but a hard failure means we've lost
+        # the session and should surface what we have.
+        if not next_pass.success and not next_pass.is_partial:
+            sys.stderr.write(
+                f"[mechanic] iterative: pass {pass_num} failed "
+                f"({next_pass.error}); stopping deepening loop\n"
+            )
+            sys.stderr.flush()
+            break
+
+        # Update session_id for the next iteration. Claude usually
+        # returns the same session_id across resumes within a chain,
+        # but some implementations issue a new id when context
+        # rotates; track whatever the last pass actually used.
+        if next_pass.session_id:
+            current_session_id = next_pass.session_id
+
+    return results

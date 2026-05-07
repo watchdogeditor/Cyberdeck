@@ -105,6 +105,12 @@ see `cyberdeck-state.md`. This is a one-line index.
 - *Design:* `in-flight/cyberdeck-maintbot-design.md` (v0–v1.5 sections)
 - Living inventory `cyberdeck-platform-portability.md` filed
 
+### Mechanic v1.6 — iterative triage (item 0g, 2026-05-07)
+- Multi-pass deepening on top of v1's single-pass shape. Pass 1 fires the standard triage; mechanic then prompts on stderr "Keep delving? [y/N]"; on yes, fires a deepening pass via `claude -p --resume <session_id>` and appends a `## Deeper analysis (pass N)` section to the same report file
+- Reuses v1.5's streaming + prompt-thread infrastructure. New helpers: `prompt_keep_delving()`, `run_iterative_triage()`, `_build_deepen_directive()`, `_append_pass_to_report()`. New `TriageResult.session_id` field captured from the first `system/init` stream event
+- Mechanic CLI gains `--no-iterative` (collapse to single-pass behavior) and `--max-triage-passes` (default 4). Non-TTY stdin auto-skips the prompt so headless / wall-mount deployments get single-pass without hanging on `input()`
+- *Design:* `in-flight/cyberdeck-maintbot-design.md` (now noted in STATUS banner)
+
 ### Tripwires redesign — brake/tripwire unification (2026-05-07)
 
 Major reshape of tripwire enforcement in response to a real-deck operational pain point ("most tasks failed because tripwires fired on benign content"). Lands as one slice; touches `brake_state.py`, `brake_hook.py`, `brake_delay.py`, `tripwires.py`, `tui.py`.
@@ -138,18 +144,13 @@ Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Deck at clean ph
 - Companion to caliber Phase 4 (provides quality signal alongside item 13's quota signal)
 - *Design:* doc to be filed; concept summary in this build plan + user auto-memory `project_prompt_shaping_design.md`
 
-### 3. Item 0g — Mechanic iterative triage
-- Multi-pass deepening with stderr prompts between passes ("Keep delving?"). Each pass thickens the report
-- ~200-300 LOC. Reuses streaming + v1.5 prompt-thread infrastructure
-- *Design:* `in-flight/cyberdeck-maintbot-design.md` (v2 / iterative section)
-
-### 4. Item 0h — Mechanic repair authority for non-source issues
+### 3. Item 0h — Mechanic repair authority for non-source issues
 - Promotes maintbot v2. Diff-preview + per-fix approval for config files (state.json, profile TOML, tools.toml — NOT deck source)
 - ~300-400 LOC; new `mechanic_repair.py`
-- Composes with 0g as a "third pass" trigger when iterative triage detects config issues
+- Composes with 0g (now SHIPPED) as a "third pass" trigger when iterative triage detects config issues
 - *Design:* `in-flight/cyberdeck-maintbot-design.md` (v2 section)
 
-### 5. Architecture review
+### 4. Architecture review
 - Scheduled to fire 2026-06-01 09:00 EDT (taskId `cyberdeck-architecture-review`)
 - Read-only; outputs `Design Files/cyberdeck-review-<date>.md`
 - Findings under (A) architecture coherence, (B) hard-rules compliance, (C) filed-gotcha re-introduction risk, (D) tech debt + TODOs

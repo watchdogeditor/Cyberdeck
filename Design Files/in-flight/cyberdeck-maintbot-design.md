@@ -1,9 +1,9 @@
 # Cyberdeck — Maintbot / Mechanic Design
 
-> **STATUS: v0 + v0.5 + v1 + v1.5 SHIPPED; v2 ACTIVE; v3 DEFERRED INDEFINITELY.**
+> **STATUS: v0 + v0.5 + v1 + v1.5 + v1.6 SHIPPED; v2 ACTIVE; v3 DEFERRED INDEFINITELY.**
 > Updated 2026-05-07.
 >
-> **Shipped slices** (mostly 2026-04-30 → 2026-05-06):
+> **Shipped slices** (mostly 2026-04-30 → 2026-05-07):
 > - **v0** — sibling Python process supervisor, tails NDJSON for live
 >   claude pids, kills on detected deck death. Cross-platform
 >   (`mechanic.py`).
@@ -15,6 +15,14 @@
 > - **v1.5** — stale-heartbeat triage with interactive prompt +
 >   listens-for-recovery; `--auto-triage-on-stale` for headless. Live
 >   narration via `stream-json --verbose`. Partial-recovery on timeout.
+> - **v1.6** (item 0g, 2026-05-07) — iterative triage. Multi-pass
+>   deepening on top of v1's single-pass shape. After pass 1 writes,
+>   mechanic prompts "Keep delving? [y/N]"; on yes, fires a deepening
+>   pass via `claude -p --resume <session_id>` and appends a
+>   `## Deeper analysis (pass N)` section to the same report file.
+>   Stops on N / max-passes / fail / non-TTY. New CLI flags:
+>   `--no-iterative`, `--max-triage-passes`. Default cap: 4 deepening
+>   passes.
 >
 > See `cyberdeck-state.md` → Mechanic section for the full shipped
 > reference, and Filed gotchas → Async/subprocess for the bugs caught
@@ -23,8 +31,9 @@
 >
 > **v2 (repair authority for non-source config files)** is the active
 > next slice — line item in `cyberdeck-build-plan.md` → CURRENT FRONTIER
-> item 5 (item 0h). Iterative-triage (item 0g) is the companion piece —
-> CURRENT FRONTIER item 4.
+> item 3 (item 0h). Iterative-triage (item 0g) shipped 2026-05-07; v2
+> can compose with it as a "third pass" trigger when iterative triage
+> detects config issues that fall under v2's repair authority.
 >
 > **v3 (autonomous correction)** stays deferred indefinitely — defer
 > until v1 + v2 give enough trust data.
