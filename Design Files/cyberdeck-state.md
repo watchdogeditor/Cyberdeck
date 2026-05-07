@@ -2148,6 +2148,33 @@ and 11.
   splits it into Strips, so scrolling stays line-by-line.
 
 ### Async / subprocess
+- **Async-task teardown isn't guaranteed to run before process
+  exit.** Filed 2026-05-06 during Mechanic v1 real-deck testing.
+  `action_quit` (Ctrl+Q idle path) called `self.exit()` after
+  `fleet.shutdown()`, with the assumption that `_drive_fleet`'s
+  finally-block teardown would write the log_footer with
+  `reason="shutdown"`. Two failure modes broke that:
+    1. **`_drive_fleet` may never have started.** Idle deck with
+       no goal set yet → no fleet-driving coroutine → no
+       teardown → no footer.
+    2. **Textual's `exit()` cancels async tasks; finally-block
+       timing isn't deterministic.** The fleet-driving coroutine
+       might get cancelled before its finally block runs OR the
+       process might exit before the cancellation propagates
+       fully.
+  Symptom: Mechanic v1 supervisor sees no `log_footer` record at
+  EOF, classifies the exit as unclean, fires expensive triage on
+  every clean Ctrl+Q (sonnet/medium triage = ~2 minutes of
+  `claude -p` per shutdown). Cost: real money + delayed exit
+  experience. Fix: close the logger EXPLICITLY in `action_quit`
+  before `self.exit()`, mirroring what `_do_eject` already does
+  for the eject path. `DeckLogger.close()` is idempotent so
+  belt-and-suspenders close calls in `_drive_fleet` teardown
+  remain harmless. **Lesson:** any cleanup that needs to be
+  durable across process exit must run synchronously BEFORE
+  `exit()`. Don't rely on async finally-blocks to fire reliably
+  under cancellation. The eject path was already doing this
+  correctly; the quit path drifted.
 - **🔓 USER EMAIL AUTO-INJECTED BY CLAUDE CODE — UPSTREAM BUG #55743.**
   Filed 2026-05-06 during item-000 verification. Anthropic's
   Claude Code reads the OAuth-account email from `~/.claude.json`

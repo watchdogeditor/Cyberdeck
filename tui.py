@@ -7598,10 +7598,26 @@ class CyberdeckApp(App):
             )
             return
 
-        # Idle path — clean exit. Tell fleet to tear down (cheap if
-        # it's already idle), then let Textual unwind. The DeckLogger's
-        # close-with-shutdown-reason fires from _drive_fleet's bottom-
-        # of-loop teardown.
+        # Idle path — clean exit. Two-step teardown:
+        #
+        # 1. Close the deck logger FIRST with reason="shutdown" so
+        #    the log_footer gets flushed before any further async
+        #    cleanup races with process exit. The Mechanic's
+        #    supervisor reads this footer to distinguish clean
+        #    Ctrl+Q from unclean crash; without it, Mechanic v1
+        #    fires expensive triage on every clean shutdown.
+        #    Bug shipped 2026-05-06 ("close fires from _drive_fleet
+        #    teardown") — wrong because _drive_fleet may never have
+        #    started (idle deck) AND because Textual's exit() can
+        #    cancel _drive_fleet before its finally block runs.
+        #    Mirrors what _do_eject already does explicitly.
+        #    DeckLogger.close is idempotent — _drive_fleet's
+        #    belt-and-suspenders close call below stays as a no-op
+        #    in this path.
+        # 2. Tell fleet to tear down (cheap if already idle), then
+        #    let Textual unwind.
+        if self.deck_logger is not None:
+            self.deck_logger.close(reason="shutdown")
         if self.fleet is not None:
             self.fleet.shutdown()
         self.exit()
