@@ -525,14 +525,67 @@ def resolve_log_dir(arg_dir: Optional[str]) -> Path:
     return Path(__file__).resolve().parent / "logs"
 
 
+def _peek_log_header_pid(log_path: Path) -> Optional[int]:
+    """Read just the first line of a log file. If it's a valid
+    `log_header` record with a `pid` int, return that pid; else None.
+
+    Cheap (one line read), no file lock, tolerant of partial /
+    in-progress writes (returns None silently). Used by
+    `wait_for_log_file` to validate liveness before committing to a
+    log file as the supervision target."""
+    try:
+        with open(log_path, "r", encoding="utf-8") as fp:
+            line = fp.readline()
+        if not line:
+            return None
+        rec = json.loads(line)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    if rec.get("type") != "log_header":
+        return None
+    pid = rec.get("pid")
+    if isinstance(pid, int):
+        return pid
+    return None
+
+
 def wait_for_log_file(log_dir: Path, timeout: float) -> Optional[Path]:
-    """Poll `log_dir` for any fresh `cyberdeck-*.log`. Returns the
-    newest one, or None if the timeout elapses with nothing found."""
+    """Poll `log_dir` for a fresh `cyberdeck-*.log` whose deck pid
+    is currently alive. Returns that log path, or None if no
+    alive-deck log appears within `timeout`.
+
+    **Liveness check is what differentiates this from a naive
+    "newest fresh file" pick.** Filed 2026-05-06: when the
+    netrunner kills the deck and relaunches quickly, the previous
+    launch's log file is still within the 5-minute freshness
+    window (`_LOG_FRESHNESS_SECONDS`) and may have a more recent
+    mtime than the new deck's log file (which hasn't been written
+    yet because Python is still starting up). Without the
+    pid_alive check, mechanic would attach to the stale log,
+    read the dead pid from its header, and immediately fire
+    triage on a deck that's actually fine. The bug surfaced
+    intermittently as "mechanic reports deck dead immediately
+    after launch when I restart quickly" — symptom matches
+    exactly. Fix: validate the header's pid is currently alive
+    before committing.
+
+    Stale logs (header pid dead) are silently skipped each poll;
+    the loop continues waiting for either the new deck's log to
+    be written OR the timeout to elapse. If timeout elapses with
+    nothing alive, returns None — the supervisor exits cleanly
+    rather than misattaching to a dead deck."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         log = find_log_file(log_dir)
         if log is not None:
-            return log
+            pid = _peek_log_header_pid(log)
+            if pid is not None and pid_alive(pid):
+                return log
+            # else: stale log (no header yet, or header pid dead).
+            # Keep polling — the new deck may still be starting up
+            # and writing its log file.
         time.sleep(0.5)
     return None
 

@@ -2242,6 +2242,58 @@ and 11.
   splits it into Strips, so scrolling stays line-by-line.
 
 ### Async / subprocess
+- **mechanic.py log-file-selection race on quick deck restart.**
+  Filed 2026-05-06 during Mechanic v1.5 real-deck testing.
+  Symptom: netrunner kills the deck and relaunches within
+  ~5-10 seconds; new mechanic immediately reports "deck
+  pid=XXXXX died" and fires triage on a fresh, alive deck.
+  Doesn't reproduce when waiting longer between restarts.
+
+  Root cause: `mechanic.find_log_file` returns the most-recently-
+  modified `cyberdeck-*.log` within the 5-minute freshness
+  window (`_LOG_FRESHNESS_SECONDS = 300`). On a quick restart:
+
+    - T=0: deck1 dies; its log mtime frozen
+    - T=N: netrunner relaunches; launch.bat fires deck2
+    - T=N+0.1: deck2 starts python (cold start ~1-3s on Win)
+    - T=N+1.1: launch.bat fires mechanic (after 1s sleep)
+    - T=N+1.2: mechanic.find_log_file polls — deck2's log
+      file may NOT EXIST YET (deck still in Python startup).
+      Only deck1's log is in the freshness window.
+      mechanic attaches to deck1's log, reads deck1's pid
+      from header → pid is dead → fires triage on a stale
+      log even though deck2 is healthy and running.
+
+  Why "wait 10s" works: deck2 has time to write its log
+  header before mechanic polls, so deck2's log mtime is
+  newer than deck1's, and the newest-mtime selection picks
+  the right file.
+
+  Fix: validate header pid liveness in `wait_for_log_file`.
+  New `_peek_log_header_pid(log_path)` reads only the first
+  line of the candidate log, parses as NDJSON, returns the
+  `log_header.pid` field (or None on parse error / wrong
+  type / missing field). `wait_for_log_file` calls this and
+  ALSO calls `pid_alive(pid)`; only commits to a log file
+  whose deck pid is currently alive. Stale logs (pid dead)
+  get silently skipped each poll; loop continues until either
+  a live-deck log appears OR `startup_timeout` elapses (in
+  which case mechanic exits cleanly rather than misattaching).
+
+  Verified with three smoke tests:
+    1. Only stale log exists → `wait_for_log_file` skips
+       it and times out (returns None).
+    2. Stale log present + live log written 1s later →
+       `wait_for_log_file` skips stale, picks up live one
+       when it appears (~1s elapsed).
+    3. Live log present from the start → returns immediately.
+
+  **Lesson generalizes:** any "newest by mtime" selection over
+  files that get reused across launches needs a freshness +
+  liveness check. mtime alone isn't enough when files from
+  multiple launches sit in the same directory within the
+  freshness window.
+
 - **🚨 ctypes Windows-handle truncation: ALWAYS set argtypes /
   restype on kernel32 / user32 / advapi32 calls.** Filed
   2026-05-06 during Mechanic v1.5 real-deck testing. Symptom:
