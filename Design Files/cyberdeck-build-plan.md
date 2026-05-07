@@ -654,6 +654,94 @@ Roughly ordered by likely appeal:
    `<log-basename>-triage.md` lands next to the log with a
    structured report.
 
+0g. **Mechanic iterative triage — multi-pass deepening**
+   (filed 2026-05-06 by netrunner). Today the triage is
+   single-pass: spawn → think → report → exit. Sometimes the
+   first-pass report is enough; sometimes the netrunner wants
+   the model to dig deeper. Currently the only knob is
+   `--triage-timeout` and re-running from scratch.
+
+   Proposed shape: triage does a CURSORY SWEEP first (low effort,
+   short timeout, focused on the death point + obvious gotcha
+   matches). Then prompts the netrunner: "Keep delving? or call
+   it?" If "keep going," spawn a follow-up pass (with the prior
+   report as context, higher effort budget, broader investigation
+   scope). Each pass thickens the existing report — appends new
+   findings rather than starting over. Re-prompt after each pass.
+
+   Mechanism: similar to the v1.5 prompt-thread pattern (state
+   machine + threading-based stderr prompt). Reuse the streaming
+   narration so the netrunner sees what the deeper pass is doing.
+   Each pass writes its delta to the same `<log>-triage.md`,
+   appending instead of overwriting. The report becomes
+   structurally chaptered: "Pass 1: cursory sweep", "Pass 2:
+   deeper investigation into <area>", etc.
+
+   **Composes with item 0f (adversarial dyad)?** Maybe — the
+   discriminator could evaluate "is this report's diagnosis
+   likely correct?" as the signal for whether another pass is
+   warranted. Probably overkill for v1 of iterative triage; just
+   ask the netrunner.
+
+   **Estimated size:** ~200-300 LOC. Reuses the existing
+   `mechanic_triage.run_triage` infrastructure; adds a multi-call
+   wrapper + stderr prompt + report-append logic. Defer until
+   architecture review (2026-06-01) reshapes the mechanic story
+   if needed.
+
+0h. **Mechanic repair authority for non-source issues** (filed
+   2026-05-06 by netrunner). Today's mechanic is read-only —
+   per the maintbot design doc, v1 is diagnose-only and v3
+   (autonomous correction) is "deferred indefinitely" because
+   autonomy in source modifications is dangerous. But the
+   netrunner observed a tighter scope worth shipping: when the
+   mechanic detects the crash was caused by something OUTSIDE
+   of source — a broken configuration file, a corrupted
+   state.json, a malformed profile TOML — it should be able to
+   FIX that with netrunner approval.
+
+   The narrowness matters. The deck source is brake-protected
+   from constructs and shouldn't be edited by the mechanic
+   either. But config files in `<home>/.cyberdeck/state.json`,
+   `<home>/profiles/*.toml`, `<home>/tools/tools.toml` — those
+   are netrunner-owned data, mutable by the deck itself. If the
+   mechanic detects "your default profile has a syntax error"
+   it should be able to fix it. If it detects "state.json has
+   a bad limits block" it should be able to revert that block
+   to defaults. With netrunner approval each time.
+
+   This is the maintbot design doc's "v2 — guided correction"
+   shape. Was deferred behind v1; promote to a follow-up to
+   v1.5.
+
+   Proposed mechanism: triage report includes a "Proposed
+   fixes" section when the cause is a config-file issue. Each
+   proposed fix has:
+     - description (one sentence)
+     - target file (must be in <home>, not deck source)
+     - diff preview (current → proposed)
+     - rationale (why this fixes the crash)
+   Mechanic prints the proposed fixes to stderr after the
+   report writes. Asks: "Apply these fixes? (y/N)". On 'y',
+   applies + writes a "fixes applied" footer to the report.
+   On 'n', the report stands as-is.
+
+   Hard constraints (mirror the v1 design's read-only ones):
+     - NO writes to deck source (paths under `<deck-source>/*`
+       except `<deck-source>/cyberdeck-home/`)
+     - NO destructive operations (delete files, rm -rf, etc.)
+     - Each fix is INDIVIDUAL approval — no bulk approvals
+     - Backup the original file before applying (so the
+       netrunner can manually revert if the fix is wrong)
+
+   **Estimated size:** ~300-400 LOC. New `mechanic_repair.py`
+   module for proposed-fix dataclass + apply logic, integration
+   with `mechanic_triage.py` to surface the fixes section, and
+   integration with `mechanic.py` for the approval prompt + apply
+   flow. Composes with item 0g (iterative triage) — repair
+   authority might be a "third pass" the netrunner can trigger
+   when a config issue is detected.
+
 0f. **Adversarial dyad — generator/discriminator validation
    pattern** (filed 2026-05-06 by netrunner). A daemon-orchestrated
    pattern for refining generated work via paired constructs. When

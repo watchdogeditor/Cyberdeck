@@ -937,7 +937,16 @@ push, ranked by tractability:
    2026-05-06. Interactive prompt on stale heartbeat (or
    `--auto-triage-on-stale` for headless), listens for
    heartbeat recovery during prompt, kills deck + triages on
-   confirmation. Mechanic story now 5/5 phases.
+   confirmation. Plus follow-ups (also 2026-05-06):
+   ctypes Windows-handle truncation fix; log-selection race
+   on quick restart; Ctrl+Q clean-shutdown footer fix; live
+   narration of triage events via stream-json + reader thread;
+   partial-recovery on timeout; default timeout bumped 180s →
+   300s; partial-vs-stub stderr distinction.
+   Mechanic story now 5/5 phases shipped + extensive bug-fix
+   pass. Items 0g (iterative triage — multi-pass deepening)
+   and 0h (repair authority for non-source config files) filed
+   as next-tier follow-ups.
 
 4. **Adversarial dyad** (build-plan 0f, filed 2026-05-06).
    Daemon-orchestrated generator/discriminator pattern for
@@ -947,6 +956,23 @@ push, ranked by tractability:
    "is the work good enough" feedback signal alongside the
    "did we hit quota" signal item 13 will provide). Picks up
    post architecture review.
+
+4b. **Mechanic iterative triage** (build-plan 0g, filed
+   2026-05-06). Multi-pass deepening with netrunner prompts
+   between passes. Cursory sweep → "keep delving?" prompt →
+   deeper pass with prior report as context → repeat. Each
+   pass thickens the report (append, not overwrite). ~200-300
+   LOC. Reuses streaming infrastructure + v1.5 prompt-thread
+   pattern.
+
+4c. **Mechanic repair authority for non-source issues**
+   (build-plan 0h, filed 2026-05-06). When triage detects the
+   cause was a broken config file (state.json, profile TOML,
+   tools.toml) — NOT deck source — propose fixes with diff
+   previews + per-fix netrunner approval. v2 of the maintbot
+   design doc (was "deferred behind v1"; promoted now).
+   ~300-400 LOC. Composes with iterative triage as a "third
+   pass" trigger when config issues are detected.
 
 5. **Caliber Phase 4** — STILL BLOCKED on build-plan item 13
    (quota signal). Don't pick this up until item 13 lands.
@@ -990,9 +1016,75 @@ session:
   no STALE warnings should appear
 
 **Branch state**: `claude/objective-sammet-25e0b4` ahead of
-`origin/main` by ~28 commits + the Advisor slice (uncommitted
-as of this CLAUDE.md update). Most recent slice + summary docs
-in CLAUDE.md / cyberdeck-state.md / cyberdeck-build-plan.md.
+`origin/main` by ~42 commits as of session-end 2026-05-06.
+Most recent slice + summary docs in CLAUDE.md /
+cyberdeck-state.md / cyberdeck-build-plan.md /
+cyberdeck-platform-portability.md (new this session).
+
+**This session shipped (2026-05-06)** — 14 commits, mostly
+mechanic v1/v1.5 + auto-context discovery + bug fixes:
+
+1. Advisor (Tools-UI 0c sub-feature 3): per-tool Q&A bot
+   scoped to z-info modal, narrowly-scoped per-tool system
+   prompt, sonnet/medium caliber, h keybind from inside
+   ExpandModal.
+2. Multi-line argv truncation fix (Windows): switched Advisor
+   + Watchdog one-shot to `--system-prompt-file` /
+   `--append-system-prompt-file`. Promoted to top-level Hard
+   Rule in CLAUDE.md.
+3. Spawn-context-isolation design doc (item 000) +
+   role-injection-by-programmatic-injection framing.
+4. Item 000 first phase: per-role CLAUDE.md auto-load
+   suppression. Per-role policy: kill for Advisor /
+   Construct / Daemon / Pool warmer / Tripwire-authoring;
+   keep for Watchdog Q&A. Env-var belt
+   (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` etc.) per-subprocess.
+5. user_email_protection default tripwire (mitigation for
+   upstream bug anthropics/claude-code#55743 — userEmail
+   auto-injection with no opt-out flag). Reads OAuth email
+   from ~/.claude.json at startup, registers as
+   deck-global tripwire.
+6. Watchdog Q&A clarity: PROJECT MEMORY AWARENESS section
+   in WATCHDOG_SYSTEM_PROMPT to prevent the model from
+   denying it has CLAUDE.md context (real-deck observation:
+   it was lying about its capabilities).
+7. Mechanic v1: diagnose-only LLM-session triage on unclean
+   deck exit. New `mechanic_triage.py` module, Family A
+   clean-spawn recipe, system prompt with two-paths frame
+   (natural death vs supervisor force-kill).
+8. Filed adversarial dyad as build-plan 0f.
+9. Ctrl+Q triage skip fix: explicit `deck_logger.close(
+   reason="shutdown")` in action_quit before exit() — the
+   _drive_fleet finally-block teardown wasn't reliable
+   under cancellation.
+10. Mechanic v1.5: stale-heartbeat triage with interactive
+    prompt + listens-for-recovery + kill-deck-then-triage on
+    confirmation. `--auto-triage-on-stale` for headless.
+11. ctypes Windows-handle truncation fix in
+    `_pid_alive_win`: explicit argtypes/restype using
+    ctypes.wintypes. Was causing intermittent
+    "deck dead immediately after launch" false positives.
+12. Platform portability inventory
+    (`cyberdeck-platform-portability.md`): living document
+    tracking every Windows-specific code path with Linux/Pi
+    porting notes. Cross-referenced from canon-doc list.
+13. Log-selection race fix: `wait_for_log_file` now
+    validates header pid liveness before committing. Fixes
+    the "restart deck quickly → mechanic immediately reports
+    dead" bug.
+14. Mechanic triage live narration via `--output-format
+    stream-json --verbose`: reader thread pretty-prints
+    events to stderr in real time. Plus partial-recovery on
+    timeout: assembles a useful PARTIAL Triage report from
+    collected stream events when 300s cap fires.
+15. (Same commit as #14 follow-up): `is_partial` flag on
+    TriageResult + bumped default timeout 180s → 300s +
+    partial-vs-stub stderr wording distinction.
+
+Five new Filed gotchas this session — argv-newline
+truncation, ctypes Windows-handle truncation, async-task
+teardown isn't guaranteed, log-selection race, and the
+upstream userEmail leak (with mitigation).
 
 **Architecture review** scheduled to fire 2026-06-01 09:00
 EDT (taskId `cyberdeck-architecture-review`); the agent
