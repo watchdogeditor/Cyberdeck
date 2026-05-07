@@ -20,10 +20,29 @@ the deck process and triages unclean exits. Constructs talk back via
 the dispatcher protocol. Every focusable surface in the right and
 bottom panels does something.
 
-**Branch state (2026-05-07):** `claude/objective-sammet-25e0b4` ~42
-commits ahead of `origin/main`. Deck at clean phase point — most recent
-slice (mechanic v1+v1.5 cluster) fully real-deck verified. Merge to
-main is the netrunner's call.
+**🆕 Design-files restructure landed 2026-05-07** (branch
+`designdoc-rewrite`, commit `e324428`). The 19-doc accreted layout was
+reorganized into a two-tier shape: lean current-state files at canon
+root, full provenance preserved in `Design Files/archive/`. Active
+slices live in `Design Files/in-flight/` with STATUS banners on each.
+Headline numbers: state.md 3129 → 591 lines (-81%), build-plan.md 1538
+→ 369 lines (-76%), CLAUDE.md fully rewritten as meta/orientation. All
+provenance preserved — pre-restructure journals at
+`archive/journal/cyberdeck-{state,build-plan}-journal-pre-2026-05-07.md`.
+**This is fresh and untested in real workflow.** The next session
+picking up work is the first real validation that the new arrangement
+holds. If something feels missing, check the journal archives before
+assuming it was deleted — the lean rebuild moved content, didn't drop it.
+Working artifact `Design Files/PLAN-TREE-DRAFT.md` is scratch — delete
+once the rebuild is validated.
+
+**Branch state:** the merged work-in-progress branch
+(`claude/objective-sammet-25e0b4`) was retired alongside the restructure
+— its commits had landed in main; local + remote refs cleaned up. The
+restructure itself lives on `designdoc-rewrite` (pushed to origin).
+Deck is otherwise at a clean phase point — most recent feature slice
+(mechanic v1+v1.5 cluster) fully real-deck verified. Merge to main is
+the netrunner's call.
 
 **Major in-flight initiatives:** see `cyberdeck-build-plan.md` →
 CURRENT FRONTIER for ranked next-up candidates. As of last update:
