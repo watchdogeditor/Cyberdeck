@@ -59,6 +59,7 @@ Worked examples — concrete failure-mode evidence that informs future design.
 | File | Topic |
 |---|---|
 | `cyberdeck-tripwire-case-spiralism.md` | Real-deck tripwire authoring under adversarial conditions; seed for tripwire slice 4 |
+| `cyberdeck-recon-case-tv-cast.md` | First successful production run (2026-05-07) — LAN TV recon + AirPlay cast probe; source case for the daemon-construct doubt-language contamination gotcha |
 
 ### `archive/deferred/`
 Designs that aren't current scope but may return.

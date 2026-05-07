@@ -82,7 +82,8 @@ below for the cumulative record.
 - `archive/shipped/cyberdeck-event-stream-design.md` — the spine (8/8 phases shipped)
 - `archive/shipped/cyberdeck-tools-plugins-profiles-retool.md` — three-way split (5/5 phases shipped)
 - `archive/shipped/cyberdeck-tools-research-report.md` + `tools-research-seed.md` — input → consumed into v2 default kit
-- `archive/case-studies/cyberdeck-tripwire-case-spiralism.md` — worked tripwire example
+- `archive/case-studies/cyberdeck-tripwire-case-spiralism.md` — worked tripwire example (defensive research, 2026-04-30)
+- `archive/case-studies/cyberdeck-recon-case-tv-cast.md` — first successful production run: LAN TV recon + AirPlay cast probe at a client venue (2026-05-07). Source case for the daemon doubt-language contamination gotcha.
 - `archive/deferred/cyberdeck_arbiter_design.md` — wearable form-factor variant
 - `archive/journal/` — pre-2026-05-07 journal snapshots of state.md and build-plan.md
 
