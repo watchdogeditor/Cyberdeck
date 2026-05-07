@@ -162,7 +162,7 @@ Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Deck at clean ph
 - Iterative plan document (daemon writes a real plan file)
 - Opt-in validator (daemon-activated, Haiku-tier, couples with caliber)
 - Skills stay Python-injected at launch — no dynamic mounting
-- *Design:* user auto-memory `project_prompt_shaping_design.md` (no doc filed yet; sourced from transilience.ai heist)
+- *Design:* `in-flight/cyberdeck-prompt-shaping-design.md` (filed 2026-05-07, content layer; sourced from transilience.ai heist). User auto-memory `project_prompt_shaping_design.md` is the commitment layer (the four directives in two paragraphs).
 
 ### Collections intake
 - Recipe-driven plugin scaffolding for github-distributed reference collections (PATT, SecLists, nuclei-templates, GTFOBins, HackTricks, LOLBAS)
