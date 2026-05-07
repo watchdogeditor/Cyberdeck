@@ -115,6 +115,38 @@ than the netrunner suggested, prefer the smaller scope. If a goal
 implies destructive scope only by interpretation, ask via `chat`
 before assuming it.
 
+TASK-STRING DISCIPLINE: When you write a `task` for a construct,
+write it as if YOU are the one giving the construct its only
+instructions. The construct does NOT get to see your conversation
+with the netrunner — it sees only the task string you compose.
+Therefore:
+
+  - Do NOT include conversational hedges or doubt-modifiers that
+    came out of your dialogue with the netrunner. Forbidden
+    vocabulary in task strings: "allegedly", "supposedly",
+    "reportedly", "the netrunner says", "you may need to verify",
+    "though I'm not sure", "if this is true", and similar second-
+    hand framings. These import YOUR uncertainty into the
+    construct's working assumptions and trigger objectivity
+    crises that paralyze legitimate work.
+  - The netrunner is authoritative. If they said something is
+    true, state it as true in the task. If they authorized an
+    action, state the authorization plainly ("the netrunner has
+    explicitly authorized X"); do not water it down ("we have
+    permission" with no source).
+  - If YOU are uncertain about something the netrunner asked,
+    ASK them via `chat` BEFORE spawning a construct. Resolve
+    your uncertainty in dialogue with the netrunner, not by
+    passing it downstream as construct hedge-language.
+
+Real-deck filed gotcha 2026-05-07: a construct received a task
+containing the word "allegedly" — a single word lifted from the
+daemon's conversation with the netrunner. That word triggered an
+objectivity crisis in the construct, who deliberated extensively
+about whether to take an action the netrunner had explicitly
+authorized. The netrunner's word is authoritative; daemon
+framing must not pass dialogue-doubt downstream.
+
 CRITICAL: You MUST respond with exactly ONE fenced json block. Do not
 add prose before or after the JSON block. The block must match this
 shape:
@@ -642,6 +674,17 @@ class Daemon:
             # appears with mine." Mirror the watchdog Q&A pattern:
             # kill on timeout, null the proc handle, let the next
             # turn re-spawn cleanly.
+            #
+            # Pane header update (filed 2026-05-07 evening): emit a
+            # synthetic status event so the daemon pane visibly
+            # transitions to "respawn" during the recovery. Without
+            # this, the status sticks at whatever the previous turn
+            # last reported (typically "working" or "waiting") for
+            # the duration of the recovery — netrunner can't tell
+            # the wedge fix is firing. The status event piggybacks
+            # on the existing kind="status" router in
+            # _handle_daemon_event; the deck-side handler looks up
+            # "respawn" in DAEMON_STATUS_STYLES.
             yield DaemonEvent(
                 timestamp=time.time(),
                 kind="error",
@@ -652,6 +695,11 @@ class Daemon:
                         f"subprocess; next turn will spawn fresh."
                     ),
                 },
+            )
+            yield DaemonEvent(
+                timestamp=time.time(),
+                kind="status",
+                payload={"status": "respawn"},
             )
             try:
                 await self._shutdown_streaming()

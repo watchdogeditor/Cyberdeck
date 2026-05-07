@@ -194,6 +194,14 @@ DAEMON_STATUS_STYLES = {
     "done":     "cyan",
     "failed":   "red",
     "stopped":  "orange1",
+    # Wedge-recovery status (post-2026-05-07 evening): emitted by
+    # daemon.py's TimeoutError handler when it kills the wedged
+    # streaming subprocess and waits for the next turn to spawn
+    # fresh. Magenta to match the deck-wide "act-on-it" color
+    # used for delays + attention items — the netrunner should
+    # SEE this transition so they know the kill+respawn is firing
+    # rather than confuse it for another silent stall.
+    "respawn":  "magenta",
 }
 
 
@@ -1287,23 +1295,61 @@ class ConstructPane(Static, can_focus=True):
                 f"[b]{name}[/b] "
                 f"[{sev_color}]\\[{sev_label}][/{sev_color}]"
             )
+            # Soft-wrap helper: split at ~72-char boundaries on word
+            # breaks so the Label renders the text across multiple
+            # rows instead of letting the whole line spill past the
+            # pane width. Pre-fix (filed 2026-05-07 evening from
+            # real-deck observation): the description rendered as a
+            # single long line that got cut off at pane width,
+            # making it impossible to compare what the construct
+            # was doing against what the tripwire was guarding —
+            # critical info for an X-press override decision.
+            #
+            # 72 chars chosen as a conservative pane-width target
+            # that works at typical 3-4-pane horizontal layouts.
+            # Falls through gracefully on shorter content (single
+            # line, no wrap).
+            def _wrap_at(s: str, width: int = 72) -> list[str]:
+                words = s.split()
+                if not words:
+                    return []
+                out: list[str] = []
+                current = words[0]
+                for w in words[1:]:
+                    if len(current) + 1 + len(w) <= width:
+                        current = f"{current} {w}"
+                    else:
+                        out.append(current)
+                        current = w
+                out.append(current)
+                return out
+
             # Body lines: description (always) + suggestion (warning
             # only — that's the field meant for the construct's pivot
             # but the netrunner reading the overlay also benefits
             # from seeing the recommended alternative). Rich markup
             # bracket-escape so a description like "Don't do [X]"
-            # doesn't get parsed as markup.
+            # doesn't get parsed as markup. Each row gets its own
+            # markup tags so per-line styling stays clean.
             description_safe = description.replace("[", r"\[")
             suggestion_safe = suggestion.replace("[", r"\[")
             tripwire_lines = [tripwire_header]
             if description_safe:
-                tripwire_lines.append(
-                    f"[dim]{description_safe}[/dim]"
-                )
+                for wrapped in _wrap_at(description_safe):
+                    tripwire_lines.append(f"[dim]{wrapped}[/dim]")
             if suggestion_safe and severity == "warning":
-                tripwire_lines.append(
-                    f"[dim]→ {suggestion_safe}[/dim]"
-                )
+                # First wrapped line gets the → arrow; continuations
+                # indent under it so the suggestion reads as a
+                # cohesive paragraph rather than a blob of arrows.
+                wrapped_sugg = _wrap_at(suggestion_safe, width=70)
+                if wrapped_sugg:
+                    tripwire_lines.append(
+                        f"[dim]→ {wrapped_sugg[0]}[/dim]"
+                    )
+                    for cont in wrapped_sugg[1:]:
+                        tripwire_lines.append(
+                            f"[dim]  {cont}[/dim]"
+                        )
             text = text + "\n" + "\n".join(tripwire_lines)
         try:
             self.query_one("#pane_delay", Label).update(text)
