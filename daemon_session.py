@@ -57,6 +57,7 @@ class DaemonSession:
             Callable[[Optional["Profile"], Optional[list[str]]], str]
         ] = None,
         default_caliber: Optional["Caliber"] = None,
+        periodic_wake_seconds: float = 60.0,
     ) -> None:
         self.daemon = daemon
         self.fleet = fleet
@@ -79,6 +80,17 @@ class DaemonSession:
             on_daemon_event, bus,
         )
         self.outcome_batch_delay = outcome_batch_delay
+        # Periodic wake nudge (filed 2026-05-07 from real-deck
+        # observation). Defends against state-sync wedges where
+        # outcomes arrive but the outcome loop's wake event never
+        # fires (asyncio scheduling quirk, lost edge, etc.). The
+        # background loop fires every periodic_wake_seconds and sets
+        # _outcome_event; the outcome loop's batch wait then unblocks
+        # and re-evaluates state. If no actual work is pending
+        # (no outcomes / goal_update / netrunner_messages /
+        # respawn_warnings), `run` skips the daemon turn so the wake
+        # doesn't burn tokens. Set to 0 to disable.
+        self.periodic_wake_seconds = periodic_wake_seconds
         # Hard cap on constructs per session. This is the wood-chipper
         # shutoff: if the daemon loops or fans out pathologically, we
         # stop before the token bill gets scary. Concurrency is capped
@@ -239,7 +251,24 @@ class DaemonSession:
 
     async def run(self, goal: str) -> None:
         """Drive the decide→execute→observe loop until the daemon
-        declares done/failed or shutdown() is called."""
+        declares done/failed or shutdown() is called.
+
+        Periodic wake (filed 2026-05-07): a background task fires
+        every `periodic_wake_seconds` and sets `_outcome_event` so
+        the outcome batch wait unblocks even when no real outcomes
+        landed. Defensive against state-sync wedges (outcomes
+        accumulate but the wake event was missed; daemon UI sticks
+        in 'waiting'). When the wake-driven batch comes through
+        empty + no goal_update / netrunner_messages / respawn
+        warnings, we skip the daemon turn entirely — the wake was
+        diagnostic, not a request to spend tokens.
+        """
+        wake_task: Optional[asyncio.Task] = None
+        if self.periodic_wake_seconds > 0:
+            wake_task = asyncio.create_task(
+                self._periodic_wake_loop(),
+                name="daemon-session-periodic-wake",
+            )
         try:
             # Turn 1: send the initial goal
             initial = (
@@ -256,6 +285,21 @@ class DaemonSession:
                     return
                 if self._goal_done.is_set():
                     return
+
+                # Periodic-wake skip: if the batch unblocked but
+                # there's no real work (no outcomes, no goal update,
+                # no netrunner messages, no respawn warnings),
+                # the wake timer fired diagnostic-only — loop back
+                # to wait without burning a daemon turn.
+                has_work = (
+                    bool(outcomes)
+                    or bool(self._respawn_warnings)
+                    or self._pending_goal_update is not None
+                    or bool(self._pending_netrunner_messages)
+                )
+                if not has_work:
+                    continue
+
                 blacklist_entries = (
                     self.blacklist.entries if self.blacklist is not None else []
                 )
@@ -271,12 +315,40 @@ class DaemonSession:
                 self._pending_netrunner_messages = []  # consumed
                 await self._process_turn(message)
         finally:
+            if wake_task is not None and not wake_task.done():
+                wake_task.cancel()
+                try:
+                    await wake_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if self._fleet_subscription is not None:
                 try:
                     self._fleet_subscription.unsubscribe()
                 except Exception:
                     pass
                 self._fleet_subscription = None
+
+    async def _periodic_wake_loop(self) -> None:
+        """Background task: every `periodic_wake_seconds`, set
+        `_outcome_event` so the outcome batch wait unblocks. Cheap
+        defense against state-sync bugs where the wake event was
+        supposed to fire on an outcome but didn't (asyncio
+        scheduling quirk, lost edge, subprocess wedge masking the
+        callback path, etc.).
+
+        Cancellation is the normal exit path — `run`'s finally
+        cancels this task and waits for it to drain."""
+        while not self._goal_done.is_set():
+            try:
+                await asyncio.sleep(self.periodic_wake_seconds)
+            except asyncio.CancelledError:
+                return
+            if self._goal_done.is_set():
+                return
+            # Set the event regardless of whether outcomes are
+            # actually pending — the outcome loop's no-work skip
+            # handles the diagnostic case.
+            self._outcome_event.set()
 
     def set_pending_goal_update(
         self,

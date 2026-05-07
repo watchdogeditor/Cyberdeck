@@ -629,17 +629,38 @@ class Daemon:
                 if raw_result:
                     break
         except asyncio.TimeoutError:
+            # Wedge recovery (filed gotcha — "preserve the wedged
+            # proc, hope it recovers" is always wrong; once stuck on
+            # a read-hang, fresh subprocess is the only reliable
+            # path). Pre-2026-05-07 fix: this just yielded an error
+            # event and returned, leaving the wedged subprocess
+            # alive. Real-deck observation: subsequent turns then
+            # tried to write to the dead-pipe subprocess, output
+            # got buffered until something else triggered a flush,
+            # and the netrunner saw the desync as "daemon goes
+            # silent until I send a message and the prior response
+            # appears with mine." Mirror the watchdog Q&A pattern:
+            # kill on timeout, null the proc handle, let the next
+            # turn re-spawn cleanly.
             yield DaemonEvent(
                 timestamp=time.time(),
                 kind="error",
                 payload={
                     "text": (
                         f"streaming daemon timed out after {timeout:.0f}s "
-                        f"(first_turn={first_turn}). The subprocess may be "
-                        "alive but stuck. Try one-shot mode if this repeats."
+                        f"(first_turn={first_turn}). Killing the wedged "
+                        f"subprocess; next turn will spawn fresh."
                     ),
                 },
             )
+            try:
+                await self._shutdown_streaming()
+            except Exception:
+                # Belt-and-suspenders: if shutdown raises (it has
+                # its own try/except internally, but futures-races
+                # are real), null the handle anyway so the next
+                # turn re-spawns instead of trying the corpse.
+                self._streaming_proc = None
             return
 
         self._streaming_turn_count += 1

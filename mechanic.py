@@ -486,6 +486,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--post-shutdown-grace",
+        type=float,
+        default=30.0,
+        help=(
+            "After the deck writes a clean log_footer (shutdown / "
+            "eject), wait up to this many seconds for the deck PID "
+            "to actually disappear before treating it as a clean "
+            "exit (default 30s). Real-deck observation 2026-05-07: "
+            "netrunner hits Ctrl+Q or EJECT, log_footer lands, but "
+            "the Python process hangs in asyncio teardown (Windows "
+            "ProactorEventLoop quirks, pending subprocess cleanup, "
+            "etc.) — the deck never actually dies. Pre-fix the "
+            "mechanic saw the footer and decided 'clean, no triage', "
+            "leaving the hung process and any orphan subprocesses "
+            "alive. Now: grace period before declaring clean. If "
+            "PID disappears within grace → clean, no triage. If not "
+            "→ force-kill the deck + tracked subprocesses and fire "
+            "wedge-kill triage. Set 0 to bypass (legacy behavior — "
+            "clean exit trusted instantly)."
+        ),
+    )
+    parser.add_argument(
         "--no-iterative",
         action="store_true",
         help=(
@@ -707,6 +729,15 @@ def main() -> int:
     # heartbeat stale Xs; supervisor force-killed for diagnosis."
     wedge_kill_context: Optional[str] = None
 
+    # Post-shutdown grace state (filed 2026-05-07 from real-deck
+    # observation): track when a clean log_footer landed so we can
+    # wait for the deck PID to actually disappear before declaring
+    # "clean exit." Pre-fix the mechanic trusted the footer alone,
+    # which let hung post-shutdown processes (Windows asyncio
+    # teardown quirks) slip through as "clean" — orphan subprocesses
+    # never reaped, no triage, deck stuck.
+    footer_observed_at: Optional[float] = None
+
     # Heartbeat loop. Catch up the log on every tick, check deck
     # liveness, check heartbeat freshness, sleep. Ctrl+C on the
     # supervisor terminal breaks out cleanly without killing tracked
@@ -718,7 +749,64 @@ def main() -> int:
                 reason = _apply_record(record, tracked)
                 if reason is not None:
                     clean_close_reason = reason
+                    if footer_observed_at is None:
+                        footer_observed_at = time.time()
+                        print(
+                            f"[mechanic] log_footer observed "
+                            f"(reason={reason!r}); waiting up to "
+                            f"{args.post_shutdown_grace:g}s for deck "
+                            f"pid={deck_pid} to actually exit",
+                            file=sys.stderr,
+                        )
             if not pid_alive(deck_pid):
+                break
+
+            # Post-shutdown grace check: if a clean footer landed
+            # but the PID is still alive, wait the grace period
+            # then escalate. Force-kill the deck + treat as wedge
+            # for triage purposes (the netrunner asked for an exit
+            # but the process is stuck — same diagnostic shape as
+            # a stale-heartbeat wedge).
+            if (
+                footer_observed_at is not None
+                and args.post_shutdown_grace > 0
+                and time.time() - footer_observed_at
+                    > args.post_shutdown_grace
+            ):
+                stuck_age = time.time() - footer_observed_at
+                print(
+                    f"[mechanic] deck pid={deck_pid} STILL ALIVE "
+                    f"{stuck_age:.1f}s after clean footer "
+                    f"(reason={clean_close_reason!r}); the deck is "
+                    f"hung in shutdown. Force-killing for diagnosis.",
+                    file=sys.stderr,
+                )
+                wedge_kill_context = (
+                    f"Deck wrote clean log_footer (reason="
+                    f"{clean_close_reason!r}) but the Python process "
+                    f"stayed alive {stuck_age:.1f}s after — typical "
+                    f"signature of an asyncio teardown hang on "
+                    f"Windows ProactorEventLoop. Mechanic force-"
+                    f"killed at the end of the post-shutdown grace "
+                    f"period. Triage as a 'clean signal but stuck "
+                    f"process' wedge."
+                )
+                if kill_pid(deck_pid):
+                    print(
+                        f"[mechanic] deck pid={deck_pid} killed; "
+                        f"proceeding to triage",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"[mechanic] kill_pid({deck_pid}) reported "
+                        f"failure; proceeding anyway",
+                        file=sys.stderr,
+                    )
+                # Reset clean_close_reason — the deck didn't actually
+                # exit cleanly, so triage should fire. wedge_kill_
+                # context carries the diagnostic context.
+                clean_close_reason = None
                 break
 
             age = heartbeat_age_seconds(heartbeat_path)

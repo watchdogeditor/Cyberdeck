@@ -667,13 +667,35 @@ class DaemonPane(Static, can_focus=False):
             pass
 
     def write_thinking(self, text: str) -> None:
-        """Daemon's thinking block. Multi-line content preserved
-        (RichLog with wrap=False renders each \\n as a real line
-        break) so paragraph structure shows in the pane."""
+        """Daemon's thinking block. Indented + grey to visually
+        subordinate it to the conversation flow — goal / daemon /
+        netrunner messages stay at the left margin; thinking is
+        inset 2 spaces and rendered in `bright_black italic` (grey
+        italic) so the block reads as the daemon's interior
+        monologue, not a peer in the conversation. Multi-line
+        content preserved (RichLog with wrap=False renders each
+        \\n as a real line break); continuation lines carry the
+        same indent so the block stays cohesive.
+
+        Style choice (netrunner direction 2026-05-07): the older
+        `[dim italic]› thinking:[/dim italic] <text>` shape sat at
+        the left margin and read as a peer of `▶ daemon:` /
+        `≫ netrunner:` output. Indent + explicit grey makes the
+        visual hierarchy obvious — conversation flows down the
+        margin, internal reasoning sits inside it."""
         text = (text or "").rstrip()
         if not text:
             return
-        self._write_line(f"[dim italic]› thinking:[/dim italic] {text}")
+        indent = "  "
+        style = "bright_black italic"
+        lines = text.split("\n")
+        out_lines = [
+            f"{indent}[{style}]› thinking:[/{style}] "
+            f"[{style}]{lines[0]}[/{style}]"
+        ]
+        for line in lines[1:]:
+            out_lines.append(f"{indent}[{style}]{line}[/{style}]")
+        self._write_line("\n".join(out_lines))
 
     def write_chat(self, text: str) -> None:
         """Daemon's chat output (the conversation-side response).
