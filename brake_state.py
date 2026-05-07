@@ -389,21 +389,21 @@ def make_spawn_settings(
     rarely vs. construct spawns). Within a stable window, the file
     content doesn't shift — Anthropic's cache should hit cleanly.
 
-    The hook installs even under YOLO when delay > 0 — that's the
-    "pause-before-allowing" lane in the delay matrix.
+    YOLO never installs the hook. Period. YOLO is the live-fast-and-
+    die brake — no hooks, no delays, no overrides. The earlier
+    "YOLO + delay > 0 installs the hook for a pause-before-allowing
+    window" branch was retired in the 2026-05-07 tripwires redesign:
+    it forced X to be bidirectional (approve under default/paranoid,
+    interrupt under YOLO), and the netrunner's spec is that X is
+    unidirectional — always "allow this particular action to ignore
+    the rules." Removing the YOLO+delay branch makes that consistent.
     """
-    # Hook installs unless: (YOLO brake AND no delay window AND no
-    # fast_mode). With delay > 0 under YOLO, we still need the hook
-    # for the pause-before-allowing lane. With fast_mode=True, we
-    # need a settings file even under YOLO to set "fastMode": true —
-    # there's no CLI flag for fast mode, settings.json is the only
-    # input surface. The hook itself short-circuits to allow under
-    # YOLO when no delay is set.
-    if (
-        brake == BrakeState.YOLO
-        and delay_window_seconds <= 0
-        and not fast_mode
-    ):
+    # Hook installs unless YOLO. With fast_mode=True we still need
+    # a settings file under YOLO to set "fastMode": true (no CLI flag
+    # exists for fast mode; settings.json is the only input surface),
+    # but the file in that case carries ONLY the fastMode flag —
+    # no hooks block.
+    if brake == BrakeState.YOLO and not fast_mode:
         return None
 
     hook_path = Path(__file__).resolve().parent / "brake_hook.py"
@@ -420,9 +420,9 @@ def make_spawn_settings(
     # is NOT in this command — see docstring + brake_hook.py for the
     # session_id → cid runtime resolution path.
     settings: dict = {}
-    # Hook block only when brake is non-YOLO or delay > 0; fast_mode
-    # alone doesn't need the hook (it's just a behavioral flag).
-    install_hook = brake != BrakeState.YOLO or delay_window_seconds > 0
+    # Hook block only when brake is non-YOLO; fast_mode alone doesn't
+    # need the hook (it's just a behavioral flag).
+    install_hook = brake != BrakeState.YOLO
     if install_hook:
         settings["hooks"] = {
             "PreToolUse": [

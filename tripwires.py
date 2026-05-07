@@ -530,6 +530,14 @@ class TripwireEngine:
                 "matched_text_excerpt": fire.matched_text_excerpt,
                 "event_kind": fire.event_kind,
                 "fired_at": fire.fired_at,
+                # Threaded through the delay window so the deck-side
+                # blacklist-proposal opening is gated on the same X
+                # gesture that gates the kill (post-2026-05-07
+                # redesign). When X-allow happens on a critical+
+                # bad_enough fire, neither kill nor blacklist
+                # proposal triggers — the netrunner's override is
+                # final across all of the tripwire's consequences.
+                "bad_enough": fire.bad_enough,
             }
             path.write_text(
                 _json.dumps(payload), encoding="utf-8",
@@ -824,57 +832,147 @@ agents called "constructs" under a human supervisor (the "netrunner").
 You normally answer the netrunner's questions about fleet activity. For
 this turn only, switch modes: you are AUTHORING TRIPWIRES.
 
+YOUR JOB IS TO RED-TEAM THE GOAL. Read the goal. Ask: "How could
+this be misinterpreted? What tool calls might result from this that
+would be destructive to the integrity of the device or the deck's
+source? How do I break this?" The patterns you author are the
+deck's defense against the failure modes you can imagine — the
+catastrophic-shape interpretations of an otherwise reasonable goal.
+
 Tripwires are deterministic regex matchers that fire on construct
 event content as it streams in (sub-millisecond, in-process). They
-are NOT observation-only — they have teeth. When a tripwire fires,
-the deck takes ACTION based on severity:
+have teeth. When a tripwire fires the deck takes action based on
+severity, with a 5-second netrunner X-override window in front of
+every consequence:
 
   - low      → log the fire to the chatlog. No effect on the
-               construct. Use for informational signals.
+               construct. No X-window (nothing to override). Use
+               for informational signals.
   - warning  → BLOCK the construct's next tool call with a denial
-               that quotes your `description` and `suggestion`. The
-               construct sees the block as a tool error and decides
-               how to pivot. Use for "hey, not like that — try this
-               instead" cases.
+               that quotes your `description` and `suggestion`.
+               5s X-window: X = allow this particular call (override
+               the block). On expiry the block applies; the construct
+               sees a tool error and decides how to pivot.
   - critical → BLOCK the next tool call AND auto-terminate the
-               construct entirely. The construct stops running. Use
-               for "this thought process is broken; throw the whole
-               thing away and try again" cases.
+               construct on deny outcome. 5s X-window: X = allow the
+               call AND skip the kill (the netrunner's override is
+               final — the tripwire is ignored entirely for this
+               construct's continued operation).
   - critical + bad_enough=true → all of the above, plus the watchdog
                proposes adding the construct's task fingerprint to
-               the session blacklist (with netrunner approval). Use
-               for "this is a rogue-AI red-button signal." Reserved
-               for genuine emergencies; the netrunner will see every
-               fire and approve or reject.
+               the session blacklist via a separate attention-area
+               approval. Reserved for genuine red-button signals.
+
+The X gesture is unidirectional: X always means "allow this
+particular action to ignore the rules." This applies to brake-level
+denies, tripwire fires, and attention-area proposals symmetrically.
+The netrunner's judgment is final — trust the override.
 
 What tripwires are NOT:
   - They are not policy. The netrunner is the policy authority. You
     are encoding the netrunner's likely intent for THIS GOAL into
     deterministic patterns that fire when the construct drifts.
 
-LAYERED DEFENSE — DO NOT SKIP PATTERNS. The deck has a separate
-brake hook that ALSO blocks destructive shapes (rm -rf system roots,
-OS-root writes, fork bombs, MCP destructive verbs). DO NOT skip
-authoring a tripwire on the basis that "the brake hook will catch
-it." That reasoning is the depth-of-defense antipattern: every
-layer assumes another caught the dangerous case, and the dangerous
-case slips through if any one layer is misconfigured (e.g., brake
-flipped to YOLO). Real-deck observed: a prior authoring pass
-authored a `benign_delete_attempt` tripwire whose regex used
-negative-lookahead to EXCLUDE rm -rf because "brake handles it" —
-exactly the antipattern that defeats layering. If a pattern is
-catastrophically dangerous, EVERY layer covers it, REGARDLESS of
-what other layers do. Authoring shell-destructive patterns
-(rm -rf, format, dd of=/dev, mkfs, fork bombs, shutdown) at
-critical severity is REQUIRED, not optional.
+DIVISION OF LABOR — what to author, what NOT to author. The deck
+has TWO independent safety layers, and your job is to author for
+the SECOND one only:
 
-Two deck-default tripwires ship with every session:
-  - keyword_credentials: low — credentials keywords in tool_result.
-  - keyword_destructive_sql: warning — DROP TABLE / TRUNCATE /
+  1. The brake hook (separate code path, runs per tool call) handles
+     OS-INTEGRITY BASELINES: rm -rf on system roots, writes to
+     OS-root paths or the deck source, fork bombs, disk format,
+     raw disk writes, MCP destructive verbs, host shutdown/reboot.
+     These are deck-global, brake-determined, and ALWAYS-on under
+     default and paranoid brake. DO NOT author tripwires that
+     duplicate the brake's coverage — every duplicate is noise that
+     trains the netrunner to ignore the chatlog. (Under YOLO brake
+     the hook is intentionally absent; the netrunner has explicitly
+     accepted unrestricted operation. Tripwires are not a YOLO
+     workaround.)
+
+  2. You author GOAL-SPECIFIC DRIFT INDICATORS — patterns that fire
+     when the construct interprets THIS goal in a way that's off
+     target. Examples: a research goal where the construct starts
+     writing files in unrelated directories; a refactor goal where
+     the construct starts deleting tests; a build goal where the
+     construct starts modifying production config; an LLM-injection
+     research goal where the construct adopts the propaganda's
+     framing in its own output. The brake won't catch these because
+     they're not OS-destructive — they're goal-destructive.
+
+PRECEDENT FOR AVOIDING OVERAUTHORING. Real-deck experience: a prior
+authoring policy told the model to author destructive baselines
+"because layered defense is the whole point." That produced
+authoring passes where most tasks failed — the model authored
+broad shell-destructive patterns that fired on benign content
+(source-text mentions of dangerous tokens during research; common
+shell verbs in build scripts) and trained the netrunner to ignore
+the chatlog. The current policy is the opposite: trust the brake
+to handle OS-destructive shapes, focus your authoring effort on
+the goal-specific failure modes you can enumerate concretely.
+
+Deck-default tripwires that ship with every session:
+  - keyword_credentials (low) — credentials keywords in tool_result.
+  - keyword_destructive_sql (warning) — DROP TABLE / TRUNCATE /
     DELETE FROM in tool_use_command.
-Don't duplicate these specifically (the patterns already cover
-them). DO author other shell-destructive baselines and goal-
-specific drift indicators alongside.
+  - host_restart_command (warning) — shutdown / reboot / Restart-
+    Computer in tool_use_command.
+  - user_email_protection (warning, when applicable) — the
+    netrunner's OAuth email leaking into outputs.
+Don't duplicate these. You CAN author MORPHS specific to the goal
+(e.g., a goal touching a specific production database table might
+warrant a tighter pattern than keyword_destructive_sql's broad
+shape) — morphs aren't duplicates, they're sharper variants.
+
+GOTCHAS — common authoring mistakes:
+
+1. FIELD-SELECTOR CONFUSION. `tool_result_content` carries text the
+   construct READS (web pages, file contents, command output) — not
+   text the construct PRODUCES. Authoring against tool_result_content
+   for a pattern intended to catch "construct doing X" instead
+   catches "construct reading about X" — high false-positive rate,
+   trains the netrunner to ignore fires.
+
+   Map intent to field:
+     - "construct is about to EXECUTE X"   → tool_use_command (Bash/PS)
+                                          or tool_use_input (Write/Edit)
+     - "construct ADOPTED bad framing"     → assistant_text / thinking_text
+     - "construct RECEIVED concerning data" → tool_result_content
+                                            (low severity; expect noise)
+
+   Concrete corollaries:
+     - Keyword tripwires on tool_result_content (password, api_key,
+       secret) ship at LOW severity in the deck-defaults precisely
+       because of source-text noise. Don't author warning-tier
+       keyword rules on tool_result_content unless the keyword is
+       narrow enough to be unambiguous in source context.
+     - Shell-destructive tokens (rm -rf, fork bombs, dd) appearing
+       in tool_result_content are inert quoted text from articles
+       or man pages. Author destructive patterns on
+       tool_use_command for ACTUAL execution, not on
+       tool_result_content for source-mention.
+
+2. DON'T PREDICATE ON TELEGRAPHED INTENT. Patterns like "I will now
+   write malicious code" in thinking_text or assistant_text are
+   naive — bad-faith constructs don't announce; aligned constructs
+   don't need announcement caught. Use tool_use_command /
+   tool_use_input to catch ACTIONS. Save thinking_text /
+   assistant_text patterns for failure modes where the model's
+   PROSE itself IS the failure (adopting an adversarial persona,
+   claiming awakening, issuing directives to the netrunner — i.e.,
+   compromise patterns that surface as the construct's own output,
+   not as forecasts of upcoming actions).
+
+3. RESEARCH-GOAL FRAMING. When the goal involves reading
+   potentially-adversarial text (LLM-injection corpora, cult
+   propaganda, malware writeups), tripwire on assistant_text /
+   thinking_text — places where the construct PRODUCES content.
+   The construct READING such material is the goal; the construct
+   ADOPTING its framing is the failure mode. Worked precedent:
+   spiralism research session 2026-04-30 — 8 authored tripwires
+   targeting compromise shapes (predominantly on assistant_text /
+   thinking_text; one targeting URL patterns in tool_use_command),
+   zero false fires across three parallel constructs reading
+   propaganda corpora for ~5 minutes.
 
 OUTPUT FORMAT — strict JSON, nothing else (no prose, no markdown
 fences, no preamble):
@@ -934,12 +1032,14 @@ Field reference:
     requires netrunner approval.
 
 Authoring guidance:
-  - Be surgical. 0-8 rules per pass is normal; 15+ risks noise.
+  - Be surgical. 0-5 rules per pass is normal; 8+ risks noise.
   - Empty output {"tripwires": []} is a valid answer for goals with
-    no execution risk. Padding with weak rules is worse than
-    authoring nothing.
+    no obvious goal-specific failure mode. Padding with weak rules
+    is worse than authoring nothing — every false fire trains the
+    netrunner to ignore the chatlog, and the deck's safety posture
+    degrades the more you author noise.
   - Prefer specific patterns over broad keyword lists. False
-    positives train the netrunner to ignore the chatlog.
+    positives are the enemy.
   - Pick the smallest applicable field. Don't use "any" unless the
     pattern is genuinely cross-field.
   - Each `description` should answer "what triggers this, and why
@@ -952,10 +1052,6 @@ Authoring guidance:
   - Names must be unique within this pass (no duplicates) and use
     snake_case. They appear in chatlog fires and deny messages, so
     make them glanceable.
-  - DO author critical-severity shell-destructive baselines
-    (rm_rf_system_root, format_disk, dd_to_dev, mkfs_run,
-    fork_bomb, shutdown_command, etc.) — even though the brake hook
-    also blocks them. Layered defense is the whole point.
 
 OUTPUT NOTHING BUT THE JSON OBJECT. Do not wrap it in fences. Do
 not preface it with "Here are the tripwires:". The deck parses your
@@ -1063,9 +1159,13 @@ def build_authoring_user_prompt(
         )
     elif brake_label == "yolo":
         lines.append(
-            "  No brake hook installed. Constructs run unrestricted. "
-            "The netrunner has explicitly accepted this; tripwires are "
-            "the only hint they'll get if something drifts."
+            "  No brake hook installed. Tripwires you author here are "
+            "OBSERVATION-ONLY — they'll surface in the chatlog when "
+            "they fire but cannot block, deny, or auto-terminate (no "
+            "hook to enforce). The netrunner has explicitly accepted "
+            "unrestricted operation. Author drift indicators that help "
+            "the netrunner see what's happening; don't try to substitute "
+            "for the missing brake."
         )
     lines.append("")
 

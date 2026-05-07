@@ -49,17 +49,34 @@ from typing import Optional
 @dataclass
 class DelayEntry:
     """One pending delay window. Mirrors the JSON shape brake_hook.py
-    writes; see `run_delay_window` in that file for the producer side."""
+    writes; see `run_delay_window` in that file for the producer side.
+
+    Tripwire fields (post-2026-05-07 redesign): set when the delay was
+    opened in response to a tripwire fire (engine wrote deny_pending
+    .json, hook routed through delay window). Empty for brake-only
+    delays. The deck-side overlay reads these to label "tripwire
+    blocked" vs "brake blocked"; the kill-on-critical subscriber to
+    brake.delay_resolved reads severity to decide whether to terminate
+    the construct on a deny outcome.
+    """
     construct_id: str
     tool_name: str
     tool_input_summary: str
     brake: str
     default_action: str       # "allow" | "deny"
     default_reason: str        # human-readable; empty when default_action=allow
-    override_action: str       # "allow" | "deny" — what X means for THIS delay
+    override_action: str       # "allow" | "deny" — always "allow" post-2026-05-07
     opened_at: float
     deadline_ts: float
     delay_window_seconds: float
+    # Optional tripwire context — empty strings (bool False) when the
+    # delay is purely brake-driven (no tripwire fired).
+    tripwire_name: str = ""
+    tripwire_severity: str = ""        # "warning" | "critical" | ""
+    tripwire_description: str = ""
+    tripwire_suggestion: str = ""
+    tripwire_excerpt: str = ""
+    tripwire_bad_enough: bool = False  # critical+bad_enough → blacklist proposal on deny
 
     @classmethod
     def from_dict(cls, d: dict) -> Optional["DelayEntry"]:
@@ -80,9 +97,22 @@ class DelayEntry:
                 delay_window_seconds=float(
                     d.get("delay_window_seconds", 0.0)
                 ),
+                tripwire_name=str(d.get("tripwire_name", "")),
+                tripwire_severity=str(d.get("tripwire_severity", "")),
+                tripwire_description=str(d.get("tripwire_description", "")),
+                tripwire_suggestion=str(d.get("tripwire_suggestion", "")),
+                tripwire_excerpt=str(d.get("tripwire_excerpt", "")),
+                tripwire_bad_enough=bool(d.get("tripwire_bad_enough", False)),
             )
         except (KeyError, TypeError, ValueError):
             return None
+
+    @property
+    def is_tripwire_driven(self) -> bool:
+        """True if a tripwire fire is what opened this delay window
+        (vs. a brake-level deny). Convenience for the chatlog/overlay
+        renderers."""
+        return bool(self.tripwire_name) or bool(self.tripwire_severity)
 
     @property
     def remaining_seconds(self) -> float:
@@ -108,10 +138,21 @@ class DelayResolution:
     'default applied.' DelayMonitor's bookkeeping is best-effort —
     races between the X-press file write and the hook's polling can
     occasionally produce reason="unknown" — but human-observation
-    accuracy is fine without filesystem-level precision."""
+    accuracy is fine without filesystem-level precision.
+
+    Tripwire context (post-2026-05-07 redesign): when the delay was
+    tripwire-driven, severity is set so the deck's critical-kill
+    subscriber can fire a kill iff severity == "critical" AND
+    applied_action == "deny" (i.e., the tripwire fired AND the
+    netrunner did NOT X-allow). For brake-only delays, severity is
+    "" and tripwire_name is "" — the kill subscriber ignores them.
+    """
     construct_id: str
     reason: str  # "override" | "expired" | "unknown"
     applied_action: str  # "allow" | "deny"
+    tripwire_name: str = ""
+    tripwire_severity: str = ""  # "warning" | "critical" | ""
+    tripwire_bad_enough: bool = False  # propagated for blacklist-proposal gating
 
 
 # ---------------------------------------------------------------------- paths
@@ -342,6 +383,9 @@ class DelayMonitor:
                         construct_id=cid,
                         reason=reason,
                         applied_action=applied,
+                        tripwire_name=prior.tripwire_name,
+                        tripwire_severity=prior.tripwire_severity,
+                        tripwire_bad_enough=prior.tripwire_bad_enough,
                     )
                     self._publish(
                         kind="brake.delay_resolved",

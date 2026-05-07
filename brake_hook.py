@@ -385,6 +385,43 @@ def bash_touches_protected_path(cmd: str) -> tuple[bool, str]:
             if prefix in haystack:
                 return True, f"writes to protected OS path '{prefix}'"
 
+    # Deck source dir check — mirrors the workspace-exemption logic
+    # in `path_is_protected` (which gates Write/Edit). Filed
+    # 2026-05-07 closing the Bash-redirect bypass found during
+    # redesign-validation testing: pre-fix, `echo "test" > "<deck
+    # source>/test.txt"` sailed through this function because it
+    # only checked OS-root prefixes and sentinel filenames — the
+    # deck source dir as a whole was unprotected for shell commands
+    # even though it WAS protected for Write/Edit. Now Bash and
+    # PowerShell match the Write/Edit gate.
+    #
+    # Heuristic, not airtight (same threat model as the rest of this
+    # function — off-rails construct, not adversarial): substring
+    # match on absolute paths. A construct that does
+    # `cd .. && tee daemon.py` from the workspace bypasses this
+    # because the absolute deck path never appears in the command
+    # string. Filed gotchas list documents the limit; tighter
+    # sandboxing belongs at the OS layer.
+    deck_str = str(deck_source_dir())
+    home_str = str(cyberdeck_home_dir())
+    if on_windows:
+        deck_norm = deck_str.lower().replace("\\", "/")
+        home_norm = home_str.lower().replace("\\", "/")
+    else:
+        deck_norm = deck_str
+        home_norm = home_str
+    if deck_norm in haystack_alt:
+        # Deck-internal state under the workspace: protected even
+        # though the workspace itself is exempt. State.json, spawn
+        # settings, deny_pending flags, etc. live here.
+        if (home_norm + "/.cyberdeck") in haystack_alt:
+            return True, "writes to deck-internal state ('.cyberdeck/')"
+        # Workspace target: allowed (constructs are supposed to do
+        # work here). Fall through to the sentinel-filename check
+        # below — sentinels still apply inside the workspace.
+        if home_norm not in haystack_alt:
+            return True, "writes to deck source"
+
     # Deck-owned filenames (sentinel substring match). Catches the
     # "construct cd's into the deck source then runs `> brake_hook.py`"
     # path even when the deck source dir prefix isn't in the same
@@ -664,25 +701,32 @@ def is_write_class(tool: str) -> bool:
 
 
 # =============================================================================
-# Slice 3 of the safety architecture pass: variable-outcome delay window.
+# Variable-outcome delay window (post-2026-05-07 redesign).
 #
-# When the deck's `delay_window_seconds` is > 0, this hook holds
-# "interesting" tool calls for up to that many seconds, watching for a
-# netrunner X-keypress override file. The call's default action depends
-# on the brake state:
+# When the deck's `delay_window_seconds` is > 0 and a tool call would
+# be denied (brake-level deny OR tripwire flag from the engine), this
+# hook holds the call for up to that many seconds, watching for a
+# netrunner X-keypress override file. X is unidirectional — always
+# "allow this particular action to ignore the rules":
 #
-#   YOLO     — every side-effect call delayed; default = allow; X = deny
-#   Default  — only would-deny calls delayed; default = deny;  X = approve
-#   Paranoid — only would-deny calls delayed; default = deny;  X = approve
+#   YOLO     — hook NOT installed; lives entirely outside this code path
+#   Default  — would-deny calls delayed; default = deny; X = allow
+#   Paranoid — would-deny calls delayed; default = deny; X = allow
+#
+# Tripwire fires (warning + critical) route through the same delay flow:
+# the engine writes deny_pending.json, the hook reads it, and treats
+# it as a would_deny condition with the tripwire's reason as the deny
+# stderr. The kill-on-critical consequence happens deck-side via a
+# subscriber to brake.delay_resolved that fires only when severity=
+# critical AND applied_action=deny — X-allow on a critical tripwire
+# also skips the kill, per the netrunner's "X is final" semantic.
 #
 # Communication with the deck is via two files in the spawns/ dir:
 #   <cid>.delay_pending.json   — written by hook, read by deck
 #   <cid>.delay_override.json  — written by deck (on X press), read by hook
 #
 # The hook owns cleanup: it deletes both files on resolution (override
-# applied or expiry). Tripwire-driven denies (deny_pending.json from
-# slice 2) bypass the delay entirely — those are hard-stop signals
-# from the watchdog, not negotiable.
+# applied or expiry).
 # =============================================================================
 
 
@@ -744,27 +788,25 @@ def should_delay(
 ) -> bool:
     """Decide whether a call should enter the delay window.
 
-    Matrix per brake state (assumes delay_window_seconds > 0):
+    Post-2026-05-07 tripwires redesign: would-deny calls get the delay
+    window, every other call passes through. There is no YOLO+delay
+    "interrupt-an-allow" branch anymore — the netrunner's spec is X
+    is unidirectional ("allow this particular action to ignore the
+    rules"), so a delay window whose default is `allow` would have
+    nothing to override toward. YOLO is also no longer reached by
+    this hook (brake_state.make_spawn_settings doesn't install the
+    hook under YOLO at all), so the brake argument here is effectively
+    "default" or "paranoid" in practice.
 
-      Default / Paranoid: delay only would-deny calls. Allow-class
-        calls pass through immediately — they were going to allow
-        anyway, no override needed.
-
-      YOLO: delay every side-effect-capable call. Default action is
-        allow (would have been allowed anyway); the delay gives the
-        netrunner a chance to interrupt with X. Read-class calls
-        skip the delay (Read/Glob/Grep/etc. — uninteresting under
-        any brake). This means YOLO + delay is opt-in friction
-        proportional to the netrunner's intent: "I want ceremony
-        on the things that touch state."
+    `would_deny` covers both brake-deny shapes (destructive bash, OS-
+    root writes, paranoid wholesale) AND tripwire-driven denies
+    (deny_pending.json present from the engine). Both qualify; the
+    delay surface treats them uniformly because the netrunner override
+    semantic is the same — X allows the call.
     """
     if delay_window_seconds <= 0:
         return False
-    if would_deny:
-        return True
-    if brake == "yolo" and is_write_class(tool):
-        return True
-    return False
+    return would_deny
 
 
 def run_delay_window(
@@ -775,6 +817,7 @@ def run_delay_window(
     default_action: str,
     default_reason: str,
     delay_window_seconds: float,
+    tripwire_flag: dict = None,
 ) -> tuple[str, str]:
     """Run the delay window for one tool call.
 
@@ -789,14 +832,19 @@ def run_delay_window(
          brake.delay_opened bus event.
       2. DelayPanel renders an entry with countdown.
       3. Netrunner focuses entry, presses X.
-      4. action_x_focused writes delay_override.json with the
-         flipped action.
+      4. action_x_focused writes delay_override.json with action=allow.
       5. We poll, see the override, apply it, clean up.
 
     If steps 3-5 don't happen within delay_window_seconds, we apply
-    default_action and clean up. Either way the construct sees a
-    deterministic outcome — same protocol the brake hook always had,
-    just with timing.
+    default_action (always "deny" post-2026-05-07 redesign) and clean
+    up. Either way the construct sees a deterministic outcome.
+
+    `tripwire_flag` is the parsed deny_pending.json if a tripwire
+    drove the delay (vs. a brake-level deny). Embedded in the panel
+    payload so the UI can label the overlay "tripwire blocked"
+    instead of "brake blocked" and so the deck-side delay-resolved
+    subscriber knows whether to fire the critical-kill on expiry
+    (severity=critical → kill).
     """
     pending_path = delay_pending_path(construct_id)
     override_path = delay_override_path(construct_id)
@@ -804,10 +852,12 @@ def run_delay_window(
     opened_at = time.time()
     deadline = opened_at + delay_window_seconds
 
-    # The flipped-default is what X means for this delay. We pre-
-    # compute it so the deck doesn't have to know the matrix; the
-    # panel just shows "press X to <override_action>".
-    override_action = "deny" if default_action == "allow" else "allow"
+    # X is unidirectional: always "allow this particular action to
+    # ignore the rules" (netrunner's spec, 2026-05-07). Pre-redesign
+    # this was bidirectional ("interrupt" under YOLO+delay) but YOLO
+    # no longer installs the hook so the deny-default is the only
+    # path that reaches run_delay_window — X always means allow.
+    override_action = "allow"
 
     pending = {
         "construct_id": construct_id,
@@ -821,6 +871,23 @@ def run_delay_window(
         "deadline_ts": deadline,
         "delay_window_seconds": delay_window_seconds,
     }
+    # Embed tripwire context when present. Optional fields keep the
+    # panel/log shape stable for brake-only delays (which don't carry
+    # tripwire context); the deck-side render checks for these and
+    # adjusts the overlay label accordingly. The kill-on-critical
+    # subscriber reads tripwire_severity off the resolution event to
+    # decide whether to terminate the construct on deny outcome.
+    if tripwire_flag is not None:
+        pending["tripwire_name"] = tripwire_flag.get("tripwire_name", "")
+        pending["tripwire_severity"] = tripwire_flag.get("severity", "")
+        pending["tripwire_description"] = tripwire_flag.get("description", "")
+        pending["tripwire_suggestion"] = tripwire_flag.get("suggestion", "")
+        pending["tripwire_excerpt"] = tripwire_flag.get(
+            "matched_text_excerpt", "",
+        )
+        pending["tripwire_bad_enough"] = bool(
+            tripwire_flag.get("bad_enough", False)
+        )
     try:
         pending_path.write_text(
             json.dumps(pending), encoding="utf-8",
@@ -904,12 +971,12 @@ def main() -> int:
     except ValueError:
         delay_window_seconds = 0.0
 
-    # YOLO + no delay short-circuits to allow. The deck normally
-    # omits --settings under YOLO so we wouldn't be invoked at all,
-    # but with delay > 0 the deck installs the hook even under YOLO
-    # so we run the delay window. Without a delay configured, we're
-    # back to the original "fail open under YOLO" behavior.
-    if brake == "yolo" and delay_window_seconds <= 0:
+    # YOLO short-circuits to allow. The deck doesn't install --settings
+    # under YOLO at all (post-2026-05-07 redesign — see
+    # brake_state.make_spawn_settings), so we shouldn't be invoked.
+    # Defensive fail-open in case a stale settings file from an old
+    # deck launch is still in place when YOLO is set.
+    if brake == "yolo":
         return 0
 
     try:
@@ -957,11 +1024,11 @@ def main() -> int:
         except OSError:
             pass
 
-    # Slice 2 of the safety architecture pass: tripwire deny_pending
-    # check. The watchdog's TripwireEngine writes the flag when a
-    # warning or critical tripwire matches a bus event; we read it
-    # here at the top of every invocation so the next tool call from
-    # this construct gets denied with the recorded reason.
+    # Tripwire deny_pending check. The watchdog's TripwireEngine
+    # writes the flag when a warning or critical tripwire matches a
+    # bus event; we read it here at the top of every invocation so
+    # the next tool call from this construct enters the same delay-
+    # window flow as a brake-level deny.
     #
     # Race mitigation: when the engine fires on the SAME tool_use
     # event we're currently evaluating (engine sees it via bus, we
@@ -973,32 +1040,29 @@ def main() -> int:
     # against it), so the recheck would just add latency for no
     # safety gain.
     #
-    # Tripwire denies BYPASS the slice-3 delay window. Tripwires are
-    # hard-stop signals from the watchdog (the construct just fired
-    # a critical pattern); the delay UX is for the brake's own
-    # default-action, not for tripwire-driven denials. The auto-
-    # blacklist proposal that critical+bad_enough fires (deferred
-    # in slice 2) DOES go through a delay-shaped approval window,
-    # but that's a separate file the engine owns, not the brake
-    # hook's call.
+    # Post-2026-05-07 redesign: tripwire flags NO LONGER bypass the
+    # delay window. They're treated as a would_deny=True signal
+    # alongside brake-level denies. The delay window is the
+    # netrunner's universal X-override surface — bypassing it for
+    # tripwires made the X gesture inconsistent (tripwire fires
+    # gave the netrunner no way to override). The kill-on-critical
+    # consequence is now gated on the delay outcome (deck-side
+    # subscriber to brake.delay_resolved with severity=critical AND
+    # applied_action=deny).
+    tripwire_flag = None
     if construct_id:
-        flag = read_and_clear_deny_pending(construct_id)
-        if flag is None and is_write_class(tool):
+        tripwire_flag = read_and_clear_deny_pending(construct_id)
+        if tripwire_flag is None and is_write_class(tool):
             time.sleep(0.1)
-            flag = read_and_clear_deny_pending(construct_id)
-        if flag is not None:
-            print(format_deny_pending_reason(flag), file=sys.stderr)
-            return 2
+            tripwire_flag = read_and_clear_deny_pending(construct_id)
 
-    # Compute the brake's default outcome. YOLO falls through to
-    # would_deny=False — every call is allow-by-default, but the
-    # delay window can still wrap it (see should_delay).
+    # Compute the brake's default outcome. YOLO is unreachable here
+    # (we returned above); the unknown-brake fallthrough still fails
+    # open in case the deck somehow passes a stale value.
     if brake == "paranoid":
         would_deny, default_reason = check_paranoid(tool, inp)
     elif brake == "default":
         would_deny, default_reason = check_default(tool, inp)
-    elif brake == "yolo":
-        would_deny, default_reason = False, ""
     else:
         # Unknown brake state — log and allow. The deck shouldn't
         # produce this, but better to fail open than to silently
@@ -1009,12 +1073,20 @@ def main() -> int:
         )
         return 0
 
-    # Slice 3: variable-outcome delay window. When delay > 0 and
-    # this call qualifies (see should_delay matrix), pause the call
-    # and watch for a netrunner X-press override. The deck's
-    # DelayMonitor sees the delay_pending.json appear, the
-    # DelayPanel renders it with a countdown, the netrunner can
-    # focus + press X to flip the default action.
+    # If a tripwire fired, override the brake's outcome with the
+    # tripwire's deny reason. The tripwire reason is more specific
+    # (names the pattern, includes suggestion text the model can
+    # pivot on) so it's the more useful stderr text. Brake's reason
+    # would have been too generic in this case.
+    if tripwire_flag is not None:
+        would_deny = True
+        default_reason = format_deny_pending_reason(tripwire_flag)
+
+    # Variable-outcome delay window. When delay > 0 and this call
+    # qualifies (would_deny=True), pause and watch for a netrunner
+    # X-press override. The deck's DelayMonitor sees the
+    # delay_pending.json appear, the construct pane renders the
+    # countdown overlay, the netrunner can focus + press X to allow.
     if construct_id and should_delay(
         brake, tool, would_deny, delay_window_seconds
     ):
@@ -1027,6 +1099,7 @@ def main() -> int:
             default_action=default_action,
             default_reason=default_reason,
             delay_window_seconds=delay_window_seconds,
+            tripwire_flag=tripwire_flag,
         )
         if final_action == "deny":
             print(final_reason or "denied", file=sys.stderr)

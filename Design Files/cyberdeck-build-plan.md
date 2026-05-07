@@ -105,42 +105,51 @@ see `cyberdeck-state.md`. This is a one-line index.
 - *Design:* `in-flight/cyberdeck-maintbot-design.md` (v0–v1.5 sections)
 - Living inventory `cyberdeck-platform-portability.md` filed
 
+### Tripwires redesign — brake/tripwire unification (2026-05-07)
+
+Major reshape of tripwire enforcement in response to a real-deck operational pain point ("most tasks failed because tripwires fired on benign content"). Lands as one slice; touches `brake_state.py`, `brake_hook.py`, `brake_delay.py`, `tripwires.py`, `tui.py`.
+
+- **Item 0000** — Tripwire-authoring GOTCHAS addendum (field-selector intent-mapping, telegraphed-intent, research-goal framing) was the first piece; subsumed by the larger rewrite when scope expanded.
+- **X is unidirectional now** — always means "allow this particular action to ignore the rules." Key design decision #24 revised; YOLO+delay→interrupt branch retired.
+- **YOLO never installs the hook** — live-fast-and-die, no enforcement, no overrides. `make_spawn_settings` returns None (or fast-mode-only settings) under YOLO.
+- **Tripwire fires route through the same delay window as brake denies** — engine writes `deny_pending.json` (now with `bad_enough`); hook reads it, opens standard delay window with tripwire context embedded; X-allow skips kill + skips blacklist proposal.
+- **Critical-kill + bad_enough blacklist moved deck-side** — `_handle_tripwire_fire` renders only; consequences fire from `_handle_delay_resolved` gated on `severity=critical AND applied_action=deny`.
+- **Authoring-prompt rewrite** — drop "DO author critical-severity shell-destructive baselines" (the contradiction at the root of overauthoring); add explicit DIVISION OF LABOR (brake = OS integrity; tripwires = goal-specific drift; no overlap); reframe to "how do I break this?" red-team; tighten cardinality 0-8 → 0-5; preserve GOTCHAS section.
+- **DelayEntry / DelayResolution** carry tripwire context fields (`tripwire_name`, `tripwire_severity`, `tripwire_description`, `tripwire_suggestion`, `tripwire_excerpt`, `tripwire_bad_enough`).
+- *Design:* spec'd inline + filed in `cyberdeck-state.md` Filed gotchas (overauthoring contradiction) + key design decisions #24, #27, #28.
+- *Pending real-deck verification:* X-allow on critical fire skips kill; YOLO truly installs no settings file; tripwire fires under default brake produce visible delay overlays with tripwire context; authored tripwires for goal-specific drift land cleanly without OS-baseline duplicates.
+
 ---
 
 ## CURRENT FRONTIER
 
 Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Deck at clean phase point. Candidates ranked by tractability:
 
-### 1. Item 0000 — Tripwire-authoring "gotchas" addendum
-- ~150 LOC. Curated content teaching the authoring spawn what NOT to fire on
-- Low urgency post phase-1 of item 000 (real-deck observation: authoring "seems to be working" with less overzealous behavior)
-- *Design:* none yet — small enough to spec inline; touches `tripwires.py` `TRIPWIRE_AUTHORING_SYSTEM_PROMPT`
-
-### 2. Item 000 phase 2 — Role-injection infrastructure
+### 1. Item 000 phase 2 — Role-injection infrastructure
 - Conditional. ~600-1000 LOC. Pull forward only on concrete regression
 - Real-deck verification of phase-1 confirmed daemon + constructs do NOT regress without CLAUDE.md auto-load
 - New `roles_registry.py`, `general.toml`, `<deck-source>/roles/*.md`, `--system-prompt`/`--append-system-prompt-file` injection
 - *Design:* `in-flight/cyberdeck-spawn-context-isolation.md` (Phase 2 section)
 
-### 3. Item 0f — Adversarial dyad
+### 2. Item 0f — Adversarial dyad
 - Generator/discriminator paired-construct pattern. Daemon synthesizes both opinions; provides "is this work good enough" signal for caliber escalation
 - ~600-900 LOC + new design doc `cyberdeck-adversarial-dyad-design.md` (TBC)
 - Picks up post-architecture-review
 - Companion to caliber Phase 4 (provides quality signal alongside item 13's quota signal)
 - *Design:* doc to be filed; concept summary in this build plan + user auto-memory `project_prompt_shaping_design.md`
 
-### 4. Item 0g — Mechanic iterative triage
+### 3. Item 0g — Mechanic iterative triage
 - Multi-pass deepening with stderr prompts between passes ("Keep delving?"). Each pass thickens the report
 - ~200-300 LOC. Reuses streaming + v1.5 prompt-thread infrastructure
 - *Design:* `in-flight/cyberdeck-maintbot-design.md` (v2 / iterative section)
 
-### 5. Item 0h — Mechanic repair authority for non-source issues
+### 4. Item 0h — Mechanic repair authority for non-source issues
 - Promotes maintbot v2. Diff-preview + per-fix approval for config files (state.json, profile TOML, tools.toml — NOT deck source)
 - ~300-400 LOC; new `mechanic_repair.py`
 - Composes with 0g as a "third pass" trigger when iterative triage detects config issues
 - *Design:* `in-flight/cyberdeck-maintbot-design.md` (v2 section)
 
-### 6. Architecture review
+### 5. Architecture review
 - Scheduled to fire 2026-06-01 09:00 EDT (taskId `cyberdeck-architecture-review`)
 - Read-only; outputs `Design Files/cyberdeck-review-<date>.md`
 - Findings under (A) architecture coherence, (B) hard-rules compliance, (C) filed-gotcha re-introduction risk, (D) tech debt + TODOs

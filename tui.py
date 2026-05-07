@@ -5902,11 +5902,23 @@ class CyberdeckApp(App):
         #main; we don't auto-reorder back. The netrunner just saw
         the resolution; leaving the pane at top keeps it findable
         for follow-up. Once finalized, the existing compact-to-
-        bottom path takes over."""
+        bottom path takes over.
+
+        Post-2026-05-07 redesign: this handler is also where critical
+        tripwire consequences fire (kill + optional blacklist
+        proposal). Both gated on `severity=critical AND applied_action
+        =deny` — i.e., the tripwire fired AND the netrunner did NOT
+        X-allow within the 5s window. X-allow on a critical tripwire
+        skips both the kill and the blacklist proposal; the
+        netrunner's override is final.
+        """
         resolution = deck_event.payload
         cid = getattr(resolution, "construct_id", "")
         reason = getattr(resolution, "reason", "unknown")
         applied = getattr(resolution, "applied_action", "?")
+        tripwire_name = getattr(resolution, "tripwire_name", "")
+        tripwire_severity = getattr(resolution, "tripwire_severity", "")
+        tripwire_bad_enough = getattr(resolution, "tripwire_bad_enough", False)
         try:
             pane = self.panes.get(cid)
             if pane is not None:
@@ -5927,6 +5939,68 @@ class CyberdeckApp(App):
             )
         except Exception:
             pass
+
+        # Critical tripwire consequences (kill + blacklist proposal)
+        # gated here. We fire only on (severity=critical AND
+        # applied_action=deny). X-allow short-circuits both.
+        from tripwires import Severity
+        if (
+            tripwire_severity == Severity.CRITICAL
+            and applied == "deny"
+            and self.fleet is not None
+        ):
+            # Auto-term the construct. Source label keeps the
+            # post-hoc diagnostic trail intact ("which tripwire
+            # caused this construct's death?").
+            try:
+                self.run_worker(
+                    self.fleet.kill_construct(
+                        cid,
+                        source=f"tripwire_critical:{tripwire_name}",
+                    ),
+                    name=f"tripwire-kill-{cid}",
+                )
+                self._chatlog_write(
+                    f"[red b]× auto-term[/red b] [cyan]{cid}[/cyan] "
+                    f"[dim](critical tripwire {tripwire_name})[/dim]"
+                )
+            except Exception:
+                # run_worker can fail if the App isn't fully mounted
+                # or if the fleet is in transitional state. The
+                # tripwire's deny already blocked the dangerous call;
+                # missing the kill leaves the construct running but
+                # not actively destructive. Acceptable degradation.
+                pass
+
+            # bad_enough → propose adding the construct's task
+            # fingerprint to the session blacklist. Independent of
+            # the kill (the kill stops THIS construct; the blacklist
+            # prevents future respawns matching the same task shape).
+            # Threaded through the delay-resolution payload so the
+            # netrunner's X-allow on the call ALSO suppresses this
+            # proposal (otherwise the netrunner would face two
+            # decisions per fire — confusing).
+            if tripwire_bad_enough:
+                # Reconstruct enough of a TripwireFire-shaped object
+                # for _open_blacklist_proposal. We only have the
+                # subset of fields propagated through the resolution;
+                # the proposal renderer uses tripwire_name +
+                # construct_id primarily.
+                try:
+                    from tripwires import TripwireFire
+                    synthetic_fire = TripwireFire(
+                        tripwire_name=tripwire_name,
+                        severity=tripwire_severity,
+                        construct_id=cid,
+                        matched_text_excerpt="",
+                        event_kind="",
+                        description="",
+                        suggestion="",
+                        bad_enough=True,
+                    )
+                    self._open_blacklist_proposal(synthetic_fire)
+                except Exception:
+                    pass
 
     def _refresh_delay_countdowns(self) -> None:
         """100ms timer tick: walk every active pane, refresh the
@@ -9354,25 +9428,34 @@ class CyberdeckApp(App):
     def action_x_focused(self) -> None:
         """Universal deck-wide approval / execute keypress.
 
+        X is unidirectional (post-2026-05-07 redesign): X always means
+        "allow this particular action to ignore the rules." The
+        netrunner's judgment is final — no surface where X means
+        "stop / interrupt." YOLO no longer installs the hook, so the
+        prior bidirectional matrix collapsed cleanly.
+
         Resolution order (first match wins):
-          1. A focused ConstructPane with an open delay → use that
-             pane's delay entry. (Primary path: delaying panes get
-             promoted to the top of #main with a magenta border, so
-             "find the construct that needs attention, focus it, X"
-             is the everyday flow.)
-          2. Single open brake-hook delay anywhere → use it. (If
-             only one delay is pending, X always lands on it
+          1. A focused ConstructPane with an open delay → allow that
+             pane's blocked tool call. (Primary path: delaying panes
+             get promoted to the top of #main with a magenta border,
+             so "find the construct that needs attention, focus it,
+             X" is the everyday flow.)
+          2. Single open brake/tripwire delay anywhere → allow it.
+             (If only one delay is pending, X always lands on it
              regardless of focus.)
-          3. Most-recent open AttentionItem → approve it. (Phase 2:
-             blacklist proposals from critical+bad_enough tripwires
-             land here. Items render in the AttentionPanel above the
-             construct pool with their own countdown bars.)
+          3. Most-recent open AttentionItem → approve it. (Blacklist
+             proposals from critical+bad_enough tripwires land here.
+             Items render in the AttentionPanel above the construct
+             pool with their own countdown bars.)
           4. Nothing → toast "no pending action".
 
-        X-press semantic per surface:
-          - Brake delay (default/paranoid → deny default): X = approve
-          - Brake delay (YOLO → allow default):           X = interrupt
-          - Attention item (blacklist proposal):          X = approve
+        X-press semantic per surface (all unidirectional approve):
+          - Brake delay (deny default):       X = allow the call
+          - Tripwire delay (deny default):    X = allow + skip kill
+                                              (and skip blacklist
+                                              proposal if bad_enough)
+          - Attention item (blacklist proposal): X = approve the
+                                              blacklist add
         The per-pane overlay / panel always shows what X will do
         BEFORE the netrunner presses, so it's never ambiguous.
         """
@@ -9484,16 +9567,22 @@ class CyberdeckApp(App):
             pass
 
     def _handle_tripwire_fire(self, fire: "TripwireFire") -> None:
-        """Render a tripwire fire to the chatlog. Today: single visual
-        tier across severities. Slice 3 will split rendering by
-        severity (critical pulls focus, warning badges, low logs).
+        """Render a tripwire fire to the chatlog.
 
-        Severity color preview is stashed now (low=dim, warning=
-        yellow, critical=red) so when the per-severity routing lands
-        the styling is already calibrated. The line shape is meant
-        to look like other chatlog markers (`⚠ tripwire ...`)
-        consistent with the brake-blocked / blacklist-refused
-        visual language."""
+        Post-2026-05-07 redesign: the kill-on-critical and the
+        bad_enough → blacklist-proposal effects MOVED to
+        `_handle_delay_resolved`. Both are now gated on the netrunner's
+        X-window outcome — if the netrunner X-allows the offending
+        tool call within the 5s delay, kill is skipped AND the
+        blacklist proposal is suppressed. The netrunner's override
+        is final across all of the tripwire's consequences.
+
+        This handler renders the immediate fire to chatlog so the
+        netrunner sees the event the moment the engine fires; the
+        consequence rendering ("auto-term" / blacklist proposal)
+        happens in the delay-resolved handler when the X-window
+        actually closes.
+        """
         # Severity → markup style. Yellow for warning matches the
         # brake-blocked treatment elsewhere in the chatlog.
         from tripwires import Severity
@@ -9517,60 +9606,6 @@ class CyberdeckApp(App):
             )
         except Exception:
             pass
-        # Slice 2 of the safety architecture pass: critical tripwires
-        # auto-terminate the construct. The brake hook's deny_pending
-        # check has already blocked the construct's next tool call
-        # (or will, on the next invocation), so the construct can't
-        # run the dangerous action. Killing it ensures it can't keep
-        # trying variations of the same dangerous approach. The deck-
-        # global brake hook still applies to any future spawns.
-        #
-        # Best-effort: if the construct already finalized between the
-        # tripwire fire and this handler, kill_construct returns
-        # False — no harm. If fleet isn't wired (headless test
-        # contexts), skip silently. Critical fires still render to
-        # chatlog so the netrunner sees the event regardless.
-        if fire.severity == Severity.CRITICAL and self.fleet is not None:
-            try:
-                # Source label includes the tripwire NAME so post-hoc
-                # diagnosis (and watchdog Q&A) can tell which tripwire
-                # fired. Format follows the colon-separated convention
-                # for parametrized sources: "tripwire_critical:<name>".
-                self.run_worker(
-                    self.fleet.kill_construct(
-                        fire.construct_id,
-                        source=f"tripwire_critical:{fire.tripwire_name}",
-                    ),
-                    name=f"tripwire-kill-{fire.construct_id}",
-                )
-                self._chatlog_write(
-                    f"[red b]× auto-term[/red b] [cyan]"
-                    f"{fire.construct_id}[/cyan] [dim](critical "
-                    f"tripwire {fire.tripwire_name})[/dim]"
-                )
-            except Exception:
-                # run_worker can fail if the App isn't fully mounted
-                # yet, or if the fleet is in a transitional state.
-                # Log to chatlog and move on — the construct may
-                # finalize on its own; the deny_pending flag still
-                # blocks its next call.
-                pass
-
-            # Slice 3 phase 2 of safety architecture pass: when the
-            # tripwire was authored with bad_enough=True, file an
-            # auto-blacklist proposal. The construct is already being
-            # auto-termed (above); this proposal asks the netrunner
-            # to ALSO blacklist the task fingerprint so future
-            # spawns matching it get refused at spawn time. X to
-            # approve within blacklist_proposal_window_seconds; expiry
-            # drops it silently (cheap mistake — netrunner can always
-            # Shift+K a future occurrence to blacklist on demand).
-            #
-            # Slice 2 deferred this application path waiting on the
-            # variable-outcome pause UX from slice 3; this is where
-            # it lands.
-            if fire.bad_enough:
-                self._open_blacklist_proposal(fire)
 
     # ---- slice 2: LLM-authored tripwires --------------------------------
     #
