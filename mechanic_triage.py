@@ -167,6 +167,14 @@ class TriageResult:
     on disk (when we got far enough to write one). `summary_line`
     is a one-line stderr-friendly recap (~80 chars).
 
+    `is_partial` is True when the triage timed out but
+    partial-recovery wrote a useful report from collected stream
+    events (assistant text, thinking blocks, tool calls). Lets
+    the supervisor distinguish a USEFUL timeout-recovery report
+    from a literal failure stub when surfacing the result to the
+    netrunner — the difference matters because partial reports
+    contain real diagnostic content the netrunner can act on.
+
     The supervisor uses summary_line for its stderr output; the
     netrunner reads report_path for the full story.
     """
@@ -176,6 +184,7 @@ class TriageResult:
     summary_line: str = ""
     error: Optional[str] = None
     elapsed_s: float = 0.0
+    is_partial: bool = False
 
 
 # System prompt for the mechanic v1 LLM session. Family A — full
@@ -877,6 +886,7 @@ def run_triage(req: TriageRequest) -> TriageResult:
             report_path = None
         return TriageResult(
             success=False,
+            is_partial=True,
             report_text=partial_report,
             report_path=report_path,
             error=f"claude -p timed out after {req.timeout}s",

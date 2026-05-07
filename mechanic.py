@@ -468,12 +468,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--triage-timeout",
         type=float,
-        default=180.0,
+        default=300.0,
         help=(
-            "Per-call hard timeout for the v1 triage subprocess "
-            "(default 180s). Mechanic kills the claude process and "
-            "writes a stub failure report if the LLM call doesn't "
-            "complete in time."
+            "Per-call hard timeout for the triage subprocess "
+            "(default 300s). Real-deck data 2026-05-06: simple "
+            "triages finish in ~50s, deep investigations into a "
+            "complex log + design docs can take 180-300s. Bumped "
+            "from 180s to 300s after observing that the model "
+            "naturally goes deep when it has the tools (Read / "
+            "Glob / Grep on deck source) and the timeout was "
+            "interrupting good investigations. Partial-recovery "
+            "kicks in on timeout — even when the cap is hit, the "
+            "supervisor writes a structured report from collected "
+            "stream events (in-progress text, tool calls, thinking "
+            "blocks). Bump higher (e.g. 600) if you're routinely "
+            "hitting the cap and want to give the model more room."
         ),
     )
     parser.add_argument(
@@ -993,7 +1002,33 @@ def main() -> int:
             f"[mechanic] summary: {triage_result.summary_line}",
             file=sys.stderr,
         )
+    elif triage_result.is_partial:
+        # Timeout fired but partial-recovery wrote a useful report
+        # from collected stream events. Different framing from a
+        # literal stub: the netrunner has real diagnostic content
+        # to read; "FAILED" + "stub" would understate that.
+        print(
+            f"[mechanic] triage timed out at "
+            f"{triage_result.elapsed_s:.1f}s — partial report saved",
+            file=sys.stderr,
+        )
+        print(
+            f"[mechanic] partial -> {triage_result.report_path}",
+            file=sys.stderr,
+        )
+        print(
+            f"[mechanic] summary: {triage_result.summary_line}",
+            file=sys.stderr,
+        )
+        print(
+            f"[mechanic] re-run with --triage-timeout "
+            f"{triage_result.elapsed_s * 2:.0f} for more headroom",
+            file=sys.stderr,
+        )
     else:
+        # Real failure (claude not found, non-zero exit, missing
+        # result event, file-system error). Stub written carries
+        # the failure reason; no useful diagnostic content.
         print(
             f"[mechanic] triage FAILED ({triage_result.elapsed_s:.1f}s): "
             f"{triage_result.error}",
