@@ -930,8 +930,20 @@ push, ranked by tractability:
    follow-up is firing triage when the deck PID is alive but the
    TUI is wedged. Needs design around log-write-vs-read race.
 
-4. **Caliber Phase 4** — STILL BLOCKED on build-plan item 13
+4. **Adversarial dyad** (build-plan 0f, filed 2026-05-06).
+   Daemon-orchestrated generator/discriminator pattern for
+   refining task work + adaptive caliber escalation. Filed as
+   substantial deferred slice (~600-900 LOC + design doc);
+   composes cleanly with caliber Phase 4 (provides the missing
+   "is the work good enough" feedback signal alongside the
+   "did we hit quota" signal item 13 will provide). Picks up
+   post architecture review.
+
+5. **Caliber Phase 4** — STILL BLOCKED on build-plan item 13
    (quota signal). Don't pick this up until item 13 lands.
+   When it lands, item 0f (adversarial dyad) is its natural
+   companion — Phase 4 needs both signals (quota AND quality)
+   to make smart escalation decisions.
 
 4. **Discrete bugs** — both still deferred:
    - Kill doesn't interrupt in-flight assistant turns (needs
@@ -939,7 +951,7 @@ push, ranked by tractability:
    - Silent wedge investigation cx-796e0468 (needs more
      real-deck data points)
 
-5. **Architecture review** fires automatically 2026-06-01 09:00
+6. **Architecture review** fires automatically 2026-06-01 09:00
    EDT (taskId `cyberdeck-architecture-review`). The agent
    phase-checks first; expect findings on the heavy churn from
    this session (tools/plugins/profiles retool + caliber slice +

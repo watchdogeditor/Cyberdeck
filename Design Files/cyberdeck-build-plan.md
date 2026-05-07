@@ -582,6 +582,125 @@ Roughly ordered by likely appeal:
    `<log-basename>-triage.md` lands next to the log with a
    structured report.
 
+0f. **Adversarial dyad — generator/discriminator validation
+   pattern** (filed 2026-05-06 by netrunner). A daemon-orchestrated
+   pattern for refining generated work via paired constructs. When
+   the daemon is uncertain whether a task will work the way it
+   thinks (or what caliber is sufficient), it spawns two
+   constructs as a dyad:
+
+     - **Generator** — does the actual task at the daemon's first-
+       pick caliber (often the cheap end of the curve: haiku/low
+       or sonnet/medium for "should be doable" tasks).
+     - **Discriminator** — receives the generator's output + the
+       original goal, evaluates how well the result matches what
+       was asked for. Returns a structured opinion (effective /
+       partial / off-target + reasoning).
+
+   The daemon synthesizes both opinions:
+     - Generator's output as raw work
+     - Discriminator's judgment of that work
+   …and decides whether to ship it, retry with a more powerful
+   model (caliber escalation: haiku → sonnet → opus), or surface
+   to the netrunner.
+
+   **Why this matters.** Today the daemon picks a caliber per
+   spawn (caliber slice Phase 1-3 shipped) but has no feedback
+   loop to know whether it picked correctly. If haiku fails, the
+   daemon sees a refusal / weak output and has to guess the next
+   move. The dyad gives it a calibrated quality signal it didn't
+   have before — turning caliber selection from a one-shot guess
+   into an adaptive process.
+
+   **Composition with existing slices:**
+     - **Caliber** (cyberdeck-model-effort-design.md): the dyad
+       is the missing feedback loop for Phase 4 (quota-aware
+       fallback). Currently Phase 4 is blocked on build-plan
+       item 13 (quota signal). The dyad provides a SECOND
+       trigger for caliber escalation: not "we hit quota" but
+       "the work isn't good enough."
+     - **Daemon spawn schema** (daemon.py + DAEMON_SYSTEM_PROMPT):
+       new action shape — `spawn_dyad` with separate generator/
+       discriminator task strings, calibers, profiles. Or extend
+       the existing `spawn` action with a `pair_with` field.
+       Probably the former (cleaner; the dyad is a different
+       conceptual unit than a lone spawn).
+     - **Output routing** (NEW infrastructure): generator's
+       final_output needs to flow into the discriminator's input.
+       Today the deck doesn't route construct output to other
+       constructs — it goes back to the daemon. Two options:
+       (a) daemon mediates synchronously (wait for generator
+       finalize, then spawn discriminator with the output as
+       its task addendum); (b) deck-level wiring routes
+       generator output to discriminator's stdin directly.
+       (a) is simpler and composes cleanly with current spawn
+       primitives; (b) is faster but new infrastructure.
+     - **UI surface** (tui.py): paired panes need visual
+       relationship — maybe a connector glyph in the chatlog
+       (`gen→disc`) and a stacked pane layout when both are
+       running. Composes with the magenta-border attention-area
+       work from slice 3 phase 2 (similar concept: "this is
+       a coordinated unit, not isolated").
+     - **Profiles** (profiles.py): natural fit for a
+       `discriminator` profile — read-only evaluator with a
+       structured-output addendum. Pre-baked profiles save the
+       daemon from authoring discriminator instructions per
+       spawn.
+
+   **Open design questions** (resolve before implementation):
+     - **Synchronous vs parallel.** Generator finishes →
+       discriminator runs vs both spawn together. Synchronous
+       is simpler (clean output handoff); parallel could let
+       the discriminator pre-load context. Lean synchronous
+       for v1.
+     - **Discriminator's caliber relative to generator.** Same
+       caliber? One tier up? Heuristic: the discriminator
+       should be ≥ generator caliber, since "is this output
+       good?" is a non-trivial reasoning task. Default:
+       generator+1 tier (haiku gen → sonnet disc; sonnet gen
+       → opus disc).
+     - **Disagreement resolution.** Discriminator says "off-
+       target," generator says "I did it." Daemon decides:
+       retry with higher caliber? Surface to netrunner?
+       Probably both — surface as an attention-area item
+       (slice 3 framing) with X-press to approve current
+       output OR escalate.
+     - **Cost ceiling.** A dyad is 2x spawns minimum. Naive
+       use eats quota. Daemon needs a heuristic for WHEN to
+       use the pattern: "creative tasks" (writing, design),
+       "uncertain-success tasks" (anything novel), "below-Opus
+       calibers" (don't dyad an Opus generator — already top-
+       tier). Probably a daemon-side classifier with netrunner
+       overrides.
+     - **Chaining.** If first dyad fails, escalate to a higher-
+       caliber dyad? Or just retry the generator alone at a
+       higher caliber? Lean toward the latter (cheaper, simpler).
+     - **Discriminator hallucination.** The discriminator might
+       declare correct work "off-target" or hallucinate quality.
+       Without ground truth, the daemon can't know. Mitigation:
+       discriminator profile's system prompt forces it to cite
+       specific deficiencies; non-citing "off-target" verdicts
+       get downgraded.
+
+   **Estimated size:** ~600-900 LOC + design doc. Daemon system
+   prompt expansion (~100 LOC of guidance), new
+   `spawn_dyad` action parsing (~150 LOC daemon_session +
+   fleet), output routing primitive (~200 LOC), UI surface
+   (~200 LOC tui.py), discriminator profile (~50 LOC), tests
+   + verification (~100 LOC). **Bigger than any previous
+   slice; deserves its own design doc before starting.**
+   File new `Design Files/cyberdeck-adversarial-dyad-design.md`
+   when picked up.
+
+   **Status:** filed 2026-05-06; deferred. Picks up after the
+   architecture review (2026-06-01) — the review may reshape
+   how we think about daemon/construct orchestration, and the
+   dyad pattern is exactly the kind of thing that benefits
+   from "see the whole system fresh first." Also composes with
+   item 0000 (tripwire-authoring gotchas) — the discriminator
+   pattern is conceptually related to "evaluate output quality"
+   work.
+
 1. **Plugin scaffolding** — ✓ shipped (v1: stateless, screenshot
    plugin as first example, brake hook gates invocations naturally
    via existing bash/path patterns). Sub-features still deferred:
