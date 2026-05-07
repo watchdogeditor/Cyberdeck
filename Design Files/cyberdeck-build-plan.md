@@ -206,6 +206,24 @@ Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Deck at clean ph
 - **Daemon narrative fix** — daemon mislabels brake-hook denials as tripwire fires; tighten daemon system prompt to distinguish `permission_denials` from `tripwire.fire`
 - **Verify Claude Code's fast-mode settings.json key** — current `{"fastMode": true}` may need to be `{"speed": "fast"}`; real-deck verify via `system_init` event's `fast_mode_state` field
 
+### Q-inject (interrupt-inject) revisit — DEFERRED, may DROP
+Filed 2026-05-07 evening from real-deck observation. Netrunner direction: postpone, possibly remove the feature entirely depending on what the redesign reveals.
+
+Current behavior is impractical: pressing `Q` (interrupt-inject) sends SIGTERM to the construct's claude subprocess + queues a follow-up spawn, but per filed gotcha "Kill doesn't interrupt in-flight assistant turns," the kill lands AFTER the current model turn finishes. From the netrunner's perspective `Q` is functionally identical to `q` (queue-inject) plus an extra kill+respawn step — the construct keeps doing the wrong thing for 30-180s before the redirect takes effect, defeating the point of "interrupt."
+
+Three redesign options sketched (dropped-feature is also on the table):
+
+1. **Rename + tighten expectations** (~10 LOC). Drop the "interrupt" framing; both q and Q are queue-shape with different post-current-turn dispositions. Honest naming, doesn't fix the actual problem.
+2. **Stdin-injection mid-turn** (medium ambition, likely doesn't deliver). Inject the netrunner's message into the construct's stream-json stdin while a turn is in-flight. Probably ignored by claude-code until current turn finishes; same wedge gotcha applies.
+3. **Kill-and-respawn-fresh with abandoned-tool-call framing** (~150 LOC). SIGKILL the subprocess immediately, spawn a new construct with a "previous construct's work was abandoned mid-flight; netrunner's redirect: <message>" preamble. Optionally `--resume <session_id>` so the new construct inherits prior conversation context.
+4. **Drop the feature.** If options 1-3 don't justify the binding's existence, remove `Q` and live with `q` (queue-inject) as the only inject path. The netrunner can `k` then `n` for a hard cut-and-replace if they want the interrupt UX.
+
+Help modal updated 2026-05-07 to honestly note the disconnect: "Q intent: kill current work + redirect; today behaves as queue-inject due to Claude's mid-turn kill discipline — see filed gotcha." That keeps the binding from lying until we commit to a direction.
+
+Pending decision when picking up: option 1 vs option 3 vs drop. Real-deck data on how often the netrunner reaches for `Q` (vs `q` + `k` separately) would help — feature usage might already be low enough that drop is the right call.
+
+*Design:* spec'd inline above; touches `tui.py:action_interrupt_inject` + Construct kill discipline + (option 3) construct spawn-with-resume infrastructure.
+
 ### UI polish pass — partial (construct/daemon panes + tripwire overlay shipped 2026-05-07)
 Filed 2026-05-07 from real-deck observation. Netrunner flagged several render surfaces as needing substantial improvement. First batch shipped same day; sidebar + advisor truncation still outstanding.
 
