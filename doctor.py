@@ -25,16 +25,23 @@ Policy (post-2026-05-07 split):
     environments. FAIL → print hint + exit 1; netrunner fixes
     manually.
   - PLUGIN DEPS (each plugin.toml's `requires.python_imports`) are
-    DETECT + PROMPT-TO-INSTALL. Pre-policy these were WARN-and-
-    continue (plugin marked unavailable, deck still launched). The
-    netrunner's stance after real-deck use: plugin deps shouldn't
-    change mid-engagement — if a plugin is in the plugins/ dir, the
-    deck should be fully outfitted at launch. New flow: if a plugin
-    dep is missing, prompt "install via pip? [y/N]". On yes, run
-    `<python> -m pip install <pkgs>`, re-check; if still missing,
-    exit 1. On no (or non-TTY stdin), exit 1 cleanly with a
-    manual-install hint — no download attempted without explicit
-    consent.
+    DETECT + OPTIONAL-PROMPT-TO-INSTALL. Missing deps NEVER block
+    deck launch — affected plugins simply appear in the Tools panel
+    as `unavailable: missing python imports: <pkg>`, the same way
+    binary tools that aren't on PATH show up. If stdin is a TTY and
+    deps are missing, the doctor offers a one-shot prompt: "install
+    via pip? [y/N]". On yes → run `<python> -m pip install <pkgs>`
+    + re-check (any still-missing plugins remain unavailable;
+    install failures don't block launch either). On no / non-TTY /
+    Ctrl+D → skip cleanly, deck launches with affected plugins
+    marked unavailable. NO download is ever attempted without
+    explicit y/yes from the prompt.
+
+    Policy history: pre-2026-05-07 was WARN-and-continue (no
+    prompt). 2026-05-07 morning was PROMPT-TO-INSTALL-OR-ABORT.
+    2026-05-07 afternoon (current) is PROMPT-TO-INSTALL-OR-SKIP —
+    netrunner direction: plugins should degrade gracefully like
+    tools, not gate launch.
 
 Sentinel: `<home>/.cyberdeck/first_run_complete`. After a run where
 no FAIL is encountered, write the sentinel; subsequent runs skip
@@ -513,18 +520,20 @@ def prompt_install_plugin_deps(
     """Show the missing-packages list and prompt for install consent.
 
     Reads from stdin via `input()`. Returns True on affirmative
-    ("y" / "yes", case-insensitive). Returns False on anything
-    else (empty enter, "n", "no", etc.).
+    ("y" / "yes", case-insensitive). Returns False on anything else
+    (empty enter, "n", "no", "skip", etc.).
 
     Non-TTY behavior: stdin not interactive (piped input, CI run,
     detached process) → returns False without prompting. The caller
-    treats this as "decline + exit clean" — matching the policy
-    that no download is ever attempted without explicit consent.
+    treats False as "skip install, launch with affected plugins
+    marked unavailable" (post-2026-05-07 policy). No download is
+    attempted without explicit consent.
     """
     if not sys.stdin.isatty():
         print(
-            "cyberdeck: stdin is not a TTY; cannot prompt for "
-            "plugin-dep install. Aborting cleanly.",
+            "cyberdeck: stdin is not a TTY; skipping plugin-dep "
+            "install prompt. Affected plugins will be marked "
+            "unavailable.",
             file=sys.stderr,
         )
         return False
@@ -539,11 +548,14 @@ def prompt_install_plugin_deps(
         print(f"  - {plugin}: {joined}")
     print()
     pkg_set = sorted({pkg for _, pkg in missing})
-    print(f"Install via pip?  ({' '.join(pkg_set)})")
+    print(
+        f"Install via pip?  ({' '.join(pkg_set)})  "
+        f"Skipping launches the deck with these plugins unavailable."
+    )
     try:
         response = input("[y/N] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        # Ctrl+D / Ctrl+C during the prompt — treat as decline.
+        # Ctrl+D / Ctrl+C during the prompt — treat as skip.
         print()
         return False
     return response in ("y", "yes")
@@ -598,14 +610,24 @@ def run_doctor_or_exit(
       1. Run checks.
       2. If first run / `--doctor` / any FAIL: print the report.
       3. If `--doctor` flag: exit (0 on PASS-only, 1 on any FAIL).
-         Observational mode — no install prompt even when plugin
-         deps are missing.
-      4. If any FAIL: print error + exit 1. Hard prereqs are
-         DETECT + SUGGEST per the docstring policy.
-      5. If any plugin dep WARN: prompt to install. Yes → pip
-         install + re-check + exit 1 if still missing. No / non-TTY
-         → exit 1 cleanly with manual-install hint.
-      6. Otherwise: mark first-run done, return.
+         Observational mode — no install prompt.
+      4. If any FAIL on hard prereqs (Python, textual, claude): exit 1.
+         These are environment-level issues; the deck cannot launch
+         without them.
+      5. If any plugin dep WARN: optional prompt to install (TTY
+         only). Yes → pip install + re-check (still-missing plugins
+         remain unavailable). No / non-TTY / Ctrl+D / install
+         failure → continue. Affected plugins surface in the Tools
+         panel as `unavailable: missing python imports: <pkg>`,
+         same way binary tools that aren't on PATH show up.
+      6. Mark first-run done, return.
+
+    Plugin-dep handling never blocks launch (post-2026-05-07
+    netrunner direction). Pre-policy this exited 1 on decline /
+    install failure; current policy treats those as graceful
+    degradation — the plugin registry already marks unavailable
+    plugins with a reason, so the netrunner sees the consequence
+    in the Tools panel without the doctor needing to gate launch.
 
     Caller is expected to skip this entirely when the netrunner
     passes `--no-doctor` (escape hatch for development with mock
@@ -635,54 +657,65 @@ def run_doctor_or_exit(
         )
         sys.exit(1)
 
-    # Plugin-dep prompt-to-install (post-2026-05-07 policy).
+    # Plugin-dep optional prompt-to-install (post-2026-05-07 policy).
+    # Never blocks launch — decline and install failure both fall
+    # through to the deck launching with affected plugins marked
+    # unavailable in the Tools panel.
     missing = get_missing_plugin_packages(results)
     if missing:
-        # Make sure the netrunner sees the report (which lists
-        # which plugin needs what) before they answer the prompt.
-        # If we already printed it above (first_run / FAIL), this
-        # is a no-op double-print guard.
+        # Make sure the netrunner sees the report before answering.
+        # No-op if we already printed it above (first_run / FAIL).
         if not (force_show or failed):
             color = sys.stdout.isatty()
             print(format_report(results, color=color))
             print()
-        if not prompt_install_plugin_deps(missing):
-            packages = sorted({pkg for _, pkg in missing})
-            print(
-                f"cyberdeck: aborting. To install manually: "
-                f"pip install {' '.join(packages)}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        # Affirmative → run pip install.
         packages = sorted({pkg for _, pkg in missing})
-        ok, output = install_packages(packages)
-        if not ok:
+        if prompt_install_plugin_deps(missing):
+            # Affirmative → run pip install. Failures don't gate
+            # launch; the plugin just stays unavailable.
+            ok, output = install_packages(packages)
+            if not ok:
+                print(
+                    f"cyberdeck: pip install failed:\n{output}\n"
+                    f"Continuing — affected plugins will be "
+                    f"unavailable in the Tools panel.",
+                    file=sys.stderr,
+                )
+            else:
+                # Re-check to confirm everything resolved. Pip can
+                # exit 0 but leave imports unfindable (version
+                # mismatch, namespace package, install into wrong
+                # site-packages, etc.). Still-missing plugins just
+                # stay unavailable; we don't gate launch on them.
+                results = run_checks(claude_bin)
+                still_missing = get_missing_plugin_packages(results)
+                if still_missing:
+                    pkgs = ", ".join(
+                        pkg for _, pkg in still_missing
+                    )
+                    print(
+                        f"cyberdeck: install completed but the "
+                        f"following are still missing: {pkgs}. "
+                        f"Affected plugins will be unavailable.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "cyberdeck: plugin dependencies installed."
+                    )
+        else:
+            # Skip path: no install attempted. Print the manual-
+            # install hint so the netrunner has the command if they
+            # change their mind later. Deck launches normally.
             print(
-                f"cyberdeck: pip install failed:\n{output}",
-                file=sys.stderr,
+                f"cyberdeck: skipping install. Affected plugins "
+                f"will be marked unavailable in the Tools panel. "
+                f"To install later: pip install "
+                f"{' '.join(packages)}",
             )
-            sys.exit(1)
-        # Re-check to confirm everything resolved. This catches
-        # cases where pip "succeeded" (exit 0) but the import is
-        # still unfindable — version mismatch, namespace package
-        # issue, install into wrong site-packages, etc.
-        results = run_checks(claude_bin)
-        still_missing = get_missing_plugin_packages(results)
-        if still_missing:
-            packages_str = ", ".join(
-                pkg for _, pkg in still_missing
-            )
-            print(
-                f"cyberdeck: install completed but the following "
-                f"are still missing: {packages_str}. Check pip "
-                f"output above and your Python environment.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        print("cyberdeck: plugin dependencies installed.")
 
-    # PASS (or WARN-only that we just installed) → mark first-run
-    # done so future launches stay quiet. Best-effort; a write
-    # failure means the diagnostics show again next launch.
+    # PASS (or WARN with plugin deps either installed or skipped)
+    # → mark first-run done so future launches stay quiet. Best-
+    # effort; a write failure means the diagnostics show again
+    # next launch.
     mark_first_run_complete(home_dir)
