@@ -885,6 +885,24 @@ Curated real-deck-tunable content teaching the authoring spawn
 what NOT to fire on. Follow-up to first-phase 000 (which already
 killed the noisy CLAUDE.md auto-load for the authoring spawn).
 
+**🔓 userEmail leak — upstream-bug-mitigated 2026-05-06.**
+Anthropic auto-injects the OAuth-account email into every Claude
+Code session as a `# userEmail` block (issue
+anthropics/claude-code#55743 — no opt-out flag exists yet).
+Verified empirically that NO documented suppression mechanism
+works (env vars, --system-prompt, --exclude-dynamic-system-
+prompt-sections, --tools "" — none gate this channel).
+**Mitigation: new default tripwire `user_email_protection`** in
+`tripwires.py`. Reads the email from `~/.claude.json` at deck
+startup, builds a regex matcher, fires at warning severity on
+TOOL_USE + ASSISTANT events containing the literal email. Brake
+hook denies the next call with: "You are not permitted to
+utilize the netrunner's email unless specifically instructed
+to." Use-the-leak-to-prevent-the-leak — the model already
+knows the email is in its context, so the tripwire matches
+verbatim. Filed in `cyberdeck-state.md` Filed gotchas → Async/
+subprocess for the full diagnosis + suppression matrix.
+
 ---
 
 ## Next session battle plan

@@ -37,9 +37,11 @@ Mirrors the Blacklist data ownership pattern from yesterday.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from construct import EventKind
@@ -655,12 +657,131 @@ DEFAULT_TRIPWIRES: tuple[Tripwire, ...] = (
 )
 
 
+def _user_email_from_claude_json() -> Optional[str]:
+    """Read the OAuth-account email from `~/.claude.json`.
+
+    Anthropic's Claude Code stores the OAuth-account email here and
+    auto-injects it into every session's context as a `# userEmail`
+    block — see https://github.com/anthropics/claude-code/issues/55743.
+    There is no documented opt-out flag (`CLAUDE_CODE_DISABLE_AUTO_
+    MEMORY=1`, `_DISABLE_CLAUDE_MDS=1`, `--bare`, `--system-prompt`,
+    `--exclude-dynamic-system-prompt-sections` — none suppress this
+    specific channel; verified empirically 2026-05-06). The deck
+    reads this field at startup so it can build a tripwire that
+    catches unintended exfiltration of the email to third-party
+    services (User-Agent headers, form fields, contact info in
+    HTTP requests).
+
+    Returns None on any failure (file missing, parse error, key
+    absent, non-string value). The default-tripwire installer
+    skips user-email protection in that case — no email known
+    means no pattern to match.
+
+    Privacy note: the email lives ONLY in ~/.claude.json (Anthropic-
+    written) and the tripwire's compiled regex (in-memory only at
+    runtime). The deck never writes the email to disk, never
+    commits it to git, never logs it.
+    """
+    try:
+        path = Path.home() / ".claude.json"
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    account = data.get("oauthAccount")
+    if not isinstance(account, dict):
+        return None
+    email = account.get("emailAddress")
+    if isinstance(email, str) and "@" in email:
+        return email
+    return None
+
+
+def _user_email_tripwire(email: str) -> Tripwire:
+    """Build a deck-global tripwire that blocks the netrunner's
+    OAuth-account email from appearing in tool commands, tool
+    inputs, or visible assistant text.
+
+    Pattern: the email, regex-escaped. Match the literal string.
+    No clever obfuscation handling — the threat model is "model
+    auto-uses the email it sees in its `# userEmail` context block
+    as a User-Agent / contact value," which produces the literal
+    email verbatim. If a future leak vector emits an obfuscated
+    form (rot13, base64, etc.), we'd extend the pattern then.
+
+    Field selector is ANY (joined extracted text from the event)
+    rather than tool_use_command alone, because the leak vector
+    has three flavors:
+      1. Bash/PowerShell tool calls embedding the email →
+         caught via tool_use_command (covered by ANY)
+      2. Write/Edit tool calls writing files containing the email →
+         caught via tool_use_input (covered by ANY)
+      3. Assistant text mentioning the email in chat output →
+         caught via assistant_text (covered by ANY when
+         event_kind=ASSISTANT)
+
+    Severity is WARNING — the brake hook denies the next call
+    from the offending construct with the suggestion below as
+    the model-visible deny reason. Not CRITICAL, because the
+    netrunner can legitimately ask a construct to use the email
+    (e.g. "draft an email to my support contact"); the redirect
+    posture preserves that affordance.
+
+    bad_enough=False — auto-blacklist would be too aggressive for
+    a privacy-mitigation rule. The construct gets denied + told
+    why, and continues on the next turn.
+    """
+    return Tripwire(
+        name="user_email_protection",
+        description=(
+            "Construct attempted to include the netrunner's OAuth "
+            "account email in an output. Anthropic auto-injects "
+            "this email into every Claude Code session's context "
+            "as a `# userEmail` block — see GitHub issue "
+            "anthropics/claude-code#55743. No opt-out flag exists "
+            "yet. This tripwire keeps the email from being "
+            "transmitted to third parties without explicit "
+            "netrunner consent."
+        ),
+        pattern_type="regex",
+        pattern=re.escape(email),
+        event_kinds=(EventKind.TOOL_USE, EventKind.ASSISTANT),
+        field=Field.ANY,
+        severity=Severity.WARNING,
+        scope=Scope.DECK_GLOBAL,
+        origin=Origin.DEFAULT,
+        suggestion=(
+            "You are not permitted to utilize the netrunner's "
+            "email unless specifically instructed to. The "
+            "`# userEmail` block in your context comes from a "
+            "Claude Code privacy leak (anthropics/claude-code"
+            "#55743), not a directive to use it. If a task needs "
+            "contact info (User-Agent header, form field, etc.), "
+            "use a generic placeholder like `cyberdeck@example."
+            "invalid` or ask the netrunner for explicit "
+            "permission first."
+        ),
+        bad_enough=False,
+    )
+
+
 def install_default_tripwires(engine: TripwireEngine) -> None:
     """Register the deck's default tripwires on a fresh engine.
     Idempotent — calling twice doesn't double-register since names
-    are unique."""
+    are unique.
+
+    Includes a runtime-derived `user_email_protection` tripwire
+    when the OAuth-account email is readable from `~/.claude.json`.
+    See `_user_email_from_claude_json` for the rationale (Anthropic
+    auto-injection bug, no upstream opt-out)."""
     for tw in DEFAULT_TRIPWIRES:
         engine.register(tw)
+    email = _user_email_from_claude_json()
+    if email:
+        engine.register(_user_email_tripwire(email))
 
 
 # -- slice 2: LLM-authored tripwires ----------------------------------------

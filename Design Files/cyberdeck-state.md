@@ -2061,6 +2061,59 @@ and 11.
   splits it into Strips, so scrolling stays line-by-line.
 
 ### Async / subprocess
+- **🔓 USER EMAIL AUTO-INJECTED BY CLAUDE CODE — UPSTREAM BUG #55743.**
+  Filed 2026-05-06 during item-000 verification. Anthropic's
+  Claude Code reads the OAuth-account email from `~/.claude.json`
+  and injects it into every session's user-message context as a
+  `# userEmail` block. **There is no documented opt-out.** The
+  reporter (vgexpeditions, anthropics/claude-code#55743) confirms
+  the leak path; we verified empirically on 2026-05-06: NONE of
+  these suppress it on Claude Code 2.1.126 + Windows 11:
+    - `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`
+    - `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`
+    - `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`
+    - `--bare` (would suppress, but breaks Claude Max OAuth — see
+      sibling gotcha)
+    - `--system-prompt <text>` (full-replace; doesn't help — the
+      block is in user-message context, not system prompt)
+    - `--exclude-dynamic-system-prompt-sections`
+    - `--tools ""` + `--disable-slash-commands`
+  We confirmed the env vars ARE reaching the spawned subprocess
+  (a probe construct ran `Get-ChildItem Env:` and dumped all
+  three `CLAUDE_CODE_DISABLE_*=1` entries). The leak channel
+  isn't gated by any of them.
+
+  **Mitigation shipped 2026-05-06:** new default tripwire
+  `user_email_protection` (`tripwires.py`). Reads the email from
+  `~/.claude.json` at deck startup, builds a regex matching that
+  literal string, registers as a deck-global warning-tier
+  tripwire scanning TOOL_USE + ASSISTANT events with field=ANY.
+  When a construct attempts to include the email in a tool
+  command (e.g. `curl -A "contact: <email>"`), tool input
+  (e.g. Write to a file containing the email), or assistant
+  text, the brake hook denies the next tool call with the
+  suggestion: "You are not permitted to utilize the netrunner's
+  email unless specifically instructed to. ... If a task needs
+  contact info (User-Agent header, form field, etc.), use a
+  generic placeholder like `cyberdeck@example.invalid` or ask
+  the netrunner for explicit permission first." Carve-out for
+  explicit netrunner consent: severity is WARNING (deny + redirect),
+  not CRITICAL, so the construct can be told to use the email
+  on a per-task basis without permanent blacklist. **The model
+  already knows the email** because it's in every spawn's context
+  via the leak — we use the leak as the trigger; the deck
+  itself never writes the email to disk, never commits to git,
+  never logs it. Email lives ONLY in `~/.claude.json` (Anthropic-
+  written) and the compiled regex (in-memory at runtime).
+
+  **When Anthropic ships a privacy flag** (issue's request: a
+  `privacy.injectUserEmail: false` in settings.json, or an env
+  var like `CLAUDE_CODE_DISABLE_USER_EMAIL=1`): add it to the
+  env-var belt in `construct.py` / `daemon.py` / `watchdog.py`,
+  and consider whether to retire or keep `user_email_protection`
+  (probably keep — the tripwire is cheap and provides
+  defense-in-depth).
+
 - **🚨 MULTI-LINE ARGV ON WINDOWS — TRUNCATES AT FIRST NEWLINE.**
   THE most recurring bug in the project's history. Six or seven
   separate incidents across chat-era and Claude Code era; we keep
