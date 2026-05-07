@@ -36,6 +36,7 @@ Active designs. Slices in `cyberdeck-build-plan.md` reference these by name. Upd
 | `cyberdeck-maintbot-design.md` | v0/v0.5/v1/v1.5 shipped; v2 active (item 0h); v3 deferred indefinitely | build-plan items 0d/0e/0g/0h |
 | `cyberdeck-model-effort-design.md` | Phases 1-3, 5 shipped 2026-05-04; Phase 4 blocked on quota signal (item 13) | "caliber" cluster |
 | `cyberdeck-keymap-revision.md` | ON HOLD since 2026-04-27. Layer 1 inventory done; Layers 2-3 blank. Blocks new global keybinds | build-plan keymap revision |
+| `cyberdeck-prompt-shaping-design.md` | Filed 2026-05-07; no code yet. Coordinate with spawn-context-isolation Phase 2 | build-plan "Prompt-shaping pass" |
 | `cyberdeck-collections-intake-design.md` | Filed 2026-05-06; queued behind prompt-shaping pass + Mechanic v2 | build-plan collections intake |
 | `cyberdeck-tools-default-kit.md` | v2 design 2026-04-30; downstream of retool; no code yet | build-plan default-kit implementation |
 
