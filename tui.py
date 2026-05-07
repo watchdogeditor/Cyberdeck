@@ -2336,6 +2336,15 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             "e", "open_effort_picker", "Set daemon effort",
             show=True, priority=True,
         ),
+        # F toggles the deck-wide fast_mode governor. Same priority
+        # rationale as `e` above — Inputs would swallow it otherwise.
+        # Toggle is in-modal only; commit happens on Ctrl+S/Enter
+        # like every other field. The label updates live so the
+        # netrunner sees the new state before submitting.
+        Binding(
+            "f", "toggle_fast_mode", "Toggle fast mode",
+            show=True, priority=True,
+        ),
     ]
 
     def __init__(
@@ -2382,7 +2391,8 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             yield Label(
                 "[dim]Adjust caps + power levels. Tab between fields, "
                 "Enter or Ctrl+S to save, Esc to cancel. Press "
-                "[b]E[/b] to set daemon effort.[/dim]"
+                "[b]E[/b] to set daemon effort, [b]F[/b] to toggle "
+                "fast-mode.[/dim]"
             )
             with Horizontal(id="limits_columns"):
                 # ---- Left column: numeric caps -----------------------
@@ -2454,14 +2464,9 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                         id="effort_button",
                         variant="primary",
                     )
-                    fm_text = (
-                        "[green]ON[/green]" if self.fast_mode
-                        else "[dim]off[/dim]"
-                    )
                     yield Label(
-                        f"Fast-mode governor: {fm_text}\n"
-                        f"[dim]Opus 4.6 only · 6x cost / 2.5x speed · "
-                        f"toggle via --fast-mode CLI[/dim]",
+                        self._fast_mode_label_text(),
+                        id="fast_mode_label",
                         classes="power_line",
                     )
                     yield Label(
@@ -2561,7 +2566,35 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             "wedge_timeout_seconds": float(wt),
             "delay_window_seconds": float(dw),
             "daemon_effort": self.daemon_effort,
+            "fast_mode": self.fast_mode,
         })
+
+    def _fast_mode_label_text(self) -> str:
+        """Compose the fast-mode label content. Extracted so
+        action_toggle_fast_mode can re-render in place after a flip
+        without duplicating the markup string."""
+        fm_text = (
+            "[green]ON[/green]" if self.fast_mode
+            else "[dim]off[/dim]"
+        )
+        return (
+            f"Fast-mode governor: {fm_text}\n"
+            f"[dim]Opus 4.6 only · 6x cost / 2.5x speed · "
+            f"press [b]F[/b] to toggle[/dim]"
+        )
+
+    def action_toggle_fast_mode(self) -> None:
+        """Flip the fast-mode governor in-modal. Updates the label
+        live; commit happens with the rest of the modal state on
+        Ctrl+S / Enter (action_submit puts fast_mode in the dismiss
+        dict and _handle_limits_submitted persists via prefs.save).
+        Cancel (Esc) discards the toggle along with everything else."""
+        self.fast_mode = not self.fast_mode
+        try:
+            lbl = self.query_one("#fast_mode_label", Label)
+            lbl.update(self._fast_mode_label_text())
+        except Exception:
+            pass
 
     def action_open_effort_picker(self) -> None:
         """Push the EffortPickerScreen for daemon effort selection.
@@ -10883,16 +10916,30 @@ class CyberdeckApp(App):
                 except Exception:
                     pass
 
+        # Fast-mode toggle (post-2026-05-07: F-key in LimitsScreen).
+        # Pre-fix this was --fast-mode CLI only. Applies on next
+        # spawn for constructs (settings file is per-spawn under
+        # fast_mode=True for cache reasons); daemon model/effort
+        # bake at next goal start same as daemon_effort.
+        new_fm = result.get("fast_mode", self.fast_mode)
+        if new_fm != self.fast_mode:
+            changes.append(
+                f"fast_mode: {'on' if self.fast_mode else 'off'} → "
+                f"{'on' if new_fm else 'off'} (applies to next spawn)"
+            )
+            self.fast_mode = new_fm
+
         if not changes:
             return
 
         # Phase 1.5: persist the runtime tunables so a deck restart
         # doesn't lose the netrunner's just-submitted values.
         # delay_window_seconds + wedge_timeout_seconds + daemon_effort
-        # are persisted; max_concurrent / max_total_spawns / pool_size
-        # are session-scoped (the netrunner sets caps for THIS goal;
-        # the next session might want different caps). save_limits
-        # is best-effort; failures don't block the in-session apply.
+        # + fast_mode are persisted; max_concurrent / max_total_spawns /
+        # pool_size are session-scoped (the netrunner sets caps for
+        # THIS goal; the next session might want different caps).
+        # save_limits is best-effort; failures don't block the
+        # in-session apply.
         try:
             # Build-plan item 0b: route through Preferences. Same
             # underlying state.json file; same read-merge-write
@@ -10901,6 +10948,7 @@ class CyberdeckApp(App):
                 delay_window_seconds=self.delay_window_seconds,
                 wedge_timeout_seconds=self.wedge_timeout_seconds,
                 daemon_effort=self.daemon_effort,
+                fast_mode=self.fast_mode,
             )
         except Exception:
             pass

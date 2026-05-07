@@ -80,7 +80,7 @@ see `cyberdeck-state.md`. This is a one-line index.
 ### Tools-UI "Thought of Dave" slice — 3/3
 - space-launch (TOOL: / PLUGIN: envelopes)
 - z-info (synthesized info / README view)
-- h-Advisor (modal-scoped per-tool Q&A bot, haiku+low)
+- h-Advisor (modal-scoped per-tool Q&A bot, sonnet+medium — bumped from haiku+low 2026-05-05 for scope-following reliability)
 
 ### Public-repo readiness (2026-05-04)
 - Item 0 — README restructure

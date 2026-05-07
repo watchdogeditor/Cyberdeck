@@ -110,7 +110,7 @@ below for the cumulative record.
 | `plugin_registry.py` / `plugins.py` | Plugin scan + manifest |
 | `plugin_bridge.py` | Plugin dispatcher (P2 of retool) |
 | `dispatcher.py` | Deck-control script (deck-side stdout protocol) |
-| `advisor.py` | Per-tool Q&A bot (modal-scoped, haiku+low) |
+| `advisor.py` | Per-tool Q&A bot (modal-scoped, sonnet+medium) |
 | `mechanic.py` | Sibling-process supervisor (v0+v1+v1.5) |
 | `mechanic_triage.py` | LLM-session triage (mechanic v1) |
 | `doctor.py` | First-run prerequisite check |
@@ -180,7 +180,7 @@ is the rich-reference description of HOW each feature works.
 - Tools tab: single ListView with binaries → scripts → plugins (alphabetical within kind). Single header `TOOLS (N/total available)`.
 - LaunchScreen modal (space on row → launch with TOOL: / PLUGIN: envelope; plugin path passes `spawn_plugins=[name]`).
 - z-info: synthesized info modal for tools (manifest + availability); README.md view for plugins.
-- h-Advisor (within info modal): narrowly-scoped per-tool Q&A bot; haiku+low; cyan accent; greeting echoes scope rule.
+- h-Advisor (within info modal): narrowly-scoped per-tool Q&A bot; **sonnet+medium** (originally haiku+low; bumped 2026-05-05 after real-deck Q&A pass surfaced two failure modes — Haiku-low losing scope anchor and asking "which plugin?" when already told, plus pulling context from project-root CLAUDE.md auto-load. Sonnet+medium follows scope reliably; the netrunner sees the caliber in the modal subtitle so cost is explicit). Cyan accent; greeting echoes scope rule.
 - Dispatcher protocol: `__CYBERDECK::v1::ACTION::PAYLOAD__` (one-way script → deck, versioned).
 - `dispatcher.py` bootstrapped to `<home>/tools/deck/cyberdeck.py`; `plugin_bridge.py` bootstrapped alongside.
 - Verified end-to-end on real Windows construct.

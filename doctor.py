@@ -31,7 +31,14 @@ Hard prereqs (FAIL = exit before TUI mount):
   - `claude --version` runs cleanly within 5s
 
 Soft prereqs (WARN only):
-  - `import mss` (screenshot plugin specific)
+  - Plugin python_imports — walked from each <deck-source>/plugins/
+    <name>/plugin.toml manifest's `requires.python_imports` field.
+    One WARN per missing import. Pre-2026-05-07 this was a
+    hardcoded `import mss` check; now plugin-derived so adding a
+    new plugin auto-extends the dep matrix without touching
+    doctor.py. (The deck still works without these — the missing
+    plugin just refuses to load via plugins.load_plugin's
+    requires-check.)
   - `claude --help` looks healthy (auth check; can't verify
     without a real API call which we don't want to spend tokens on)
 
@@ -121,27 +128,81 @@ def check_textual() -> Result:
     )
 
 
-def check_mss() -> Result:
-    """Soft check for the mss library — screenshot plugin's
-    runtime dep. WARN-only; missing mss just means the screenshot
-    plugin will refuse to load (graceful degradation in
-    plugins.load_plugin's requires-check)."""
-    if importlib.util.find_spec("mss") is not None:
-        return Result(
-            severity=Severity.PASS,
-            label="mss",
-            detail="mss library available (screenshot plugin OK)",
-        )
-    return Result(
-        severity=Severity.WARN,
-        label="mss",
-        detail="mss library not found",
-        hint=(
-            "screenshot plugin will be unavailable. "
-            "install: pip install mss (only needed if you want "
-            "the screenshot plugin)"
-        ),
-    )
+def check_plugin_dependencies(plugins_dir: Path) -> list[Result]:
+    """Walk <deck-source>/plugins/, read each plugin.toml's
+    `requires.python_imports`, return one Result per declared import.
+
+    Soft prereqs (WARN on missing) — a missing plugin dep just means
+    that plugin will refuse to load (graceful degradation in
+    `plugins.load_plugin`'s requires-check). The deck itself still
+    works.
+
+    Pre-2026-05-07 this was a hardcoded `import mss` check tied to
+    the screenshot plugin specifically. Adding a new plugin with
+    its own dependency required editing doctor.py — easy to forget,
+    and a divergence between manifest and doctor would silently
+    miss the dep in the first-run check. Plugin-derived means new
+    plugins auto-extend the dep matrix.
+
+    Best-effort: missing/malformed plugins.toml entries are skipped
+    silently. Plugin registry's own scan-time validation surfaces
+    those errors; doctor.py shouldn't double-report them at a
+    pre-TUI layer where the bus isn't even up yet."""
+    results: list[Result] = []
+    if not plugins_dir.is_dir():
+        return results
+    try:
+        import tomllib
+    except ImportError:
+        # Pre-3.11 — would have FAILed the python check above
+        # already, so getting here is unexpected. Fall through
+        # silently rather than masquerade as a plugin issue.
+        return results
+
+    for entry in sorted(plugins_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        manifest = entry / "plugin.toml"
+        if not manifest.is_file():
+            continue
+        try:
+            with manifest.open("rb") as f:
+                data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        plugin_name = data.get("name", entry.name)
+        if not isinstance(plugin_name, str) or not plugin_name:
+            plugin_name = entry.name
+        requires = data.get("requires") or {}
+        if not isinstance(requires, dict):
+            continue
+        imports = requires.get("python_imports") or []
+        if not isinstance(imports, list):
+            continue
+        for imp in imports:
+            if not isinstance(imp, str) or not imp.strip():
+                continue
+            imp = imp.strip()
+            label = f"plugin:{plugin_name}:{imp}"
+            if importlib.util.find_spec(imp) is not None:
+                results.append(Result(
+                    severity=Severity.PASS,
+                    label=label,
+                    detail=f"{imp} available ({plugin_name} OK)",
+                ))
+            else:
+                results.append(Result(
+                    severity=Severity.WARN,
+                    label=label,
+                    detail=f"{imp} not found",
+                    hint=(
+                        f"plugin '{plugin_name}' will be unavailable. "
+                        f"install: pip install {imp}"
+                    ),
+                ))
+    return results
 
 
 def check_claude_bin(claude_bin: str) -> Result:
@@ -277,7 +338,13 @@ def run_checks(claude_bin: str = "claude") -> list[Result]:
     results: list[Result] = []
     results.append(check_python_version())
     results.append(check_textual())
-    results.append(check_mss())
+    # Plugin python_imports — derived from each plugin.toml's
+    # `requires.python_imports`. One Result per declared import.
+    # Plugins live at <deck-source>/plugins/<name>/, where deck
+    # source = the directory containing this file (doctor.py sits
+    # next to tui.py / brake_hook.py / etc.).
+    plugins_dir = Path(__file__).resolve().parent / "plugins"
+    results.extend(check_plugin_dependencies(plugins_dir))
     results.append(check_claude_bin(claude_bin))
     # Only run the version probe when the binary check passed —
     # otherwise we'd report two redundant FAILs for the same
