@@ -3145,86 +3145,167 @@ class KeybindsScreen(ModalScreen[None]):
     #keybinds_body {
         height: auto;
     }
+    #keybinds_pager {
+        height: 1;
+        margin-bottom: 1;
+        padding: 0;
+    }
     """
 
     BINDINGS = [
         Binding("escape", "dismiss", "Close", show=True),
         Binding("question_mark", "dismiss", "Close", show=False),
         Binding("space", "dismiss", "Close", show=False),
+        # Page navigation (post-2026-05-07 evening rebuild). The help
+        # outgrew a single scrolling list; pages + q/e nav keeps each
+        # category readable without a wall-of-text. q wraps to last
+        # page from page 0; e wraps to page 0 from the last page.
+        Binding("q", "prev_page", "Prev page", show=True),
+        Binding("e", "next_page", "Next page", show=True),
     ]
 
-    # Static map of bindings. Kept here (rather than auto-derived from
-    # CyberdeckApp.BINDINGS) because the spec wants logical grouping and
-    # human-readable descriptions, not a mechanical key dump.
-    # Sections shown in the help modal. Slimmed to what actually
-    # works today — stubbed bindings (t/T/E/c/Shift+C/p/r/f, plus N
-    # invisible-spawn) are intentionally NOT listed here. They reappear
-    # when their action lands, not before — listing them as if they
-    # work makes the modal lie to the netrunner. Esc/Enter are listed
-    # in NAVIGATION/PRIMARY rather than getting their own MODAL section
-    # since they behave the same in modals as everywhere else.
-    SECTIONS = [
+    # Pages of bindings. Audited 2026-05-07 against the actual
+    # CyberdeckApp BINDINGS list — pre-rebuild this map drifted
+    # significantly (listed bindings that didn't exist; missed
+    # bindings that did). Every entry below corresponds to a real
+    # Binding in CyberdeckApp's BINDINGS or a documented modal-
+    # universal behavior (Esc / Enter). Stubbed bindings whose
+    # actions only toast "not yet implemented" stay off the map —
+    # listing them lies to the netrunner about what works.
+    #
+    # Page order is by likely-use-frequency, not alphabetical:
+    # the netrunner hits NAVIGATION + PRIMARY constantly,
+    # CONSTRUCTS during work, COMMUNICATION when checking on the
+    # daemon/watchdog, RUN CONTROL only at session boundaries.
+    PAGES = [
         ("NAVIGATION", [
             ("w / s", "Scroll focused widget up / down. Pauses "
                       "auto-follow on scroll-up; resumes at bottom."),
             ("a / d", "Scroll focused widget left / right "
                       "(when content overflows)."),
             ("W / S", "Walk focus up / down within current section."),
-            ("A / D", "Cross sections (sidebar ↔ main ↔ right)."),
+            ("A / D", "Cross sections (sidebar / main / right / daemon-bar)."),
             ("Tab / Shift+Tab", "Cycle focus within current section."),
-            ("1–9 / Ctrl+1–9", "Jump to element N in section / "
-                                "construct N globally."),
-            ("Esc", "Unfocus / cancel modal."),
+            ("Esc", "Unfocus current widget / cancel modal."),
         ]),
-        ("PRIMARY", [
+        ("PRIMARY ACTION", [
             ("Space", "Primary interact with focused element "
-                      "(pane expand toggle, goal edit, future: "
-                      "list-item launch)."),
-            ("z", "Zoom focused widget — fullscreen reader with "
-                   "un-truncated content."),
-            ("y", "Yank focused widget's content to the OS "
-                  "clipboard. Inside a Zoom modal, yanks the full "
-                  "snapshot."),
-            ("Y", "Yank focused widget's structured data as JSON "
-                  "(raw events, bus snapshot, list-item record). "
-                  "Companion to y."),
+                      "(pane expand, list-item launch, modal "
+                      "confirm-on-hold)."),
             ("Enter", "Submit / accept (universal in modals)."),
+            ("z", "Zoom focused widget — fullscreen reader with "
+                   "un-truncated content + syntax highlight."),
+            ("y", "Yank focused widget's content to the OS "
+                  "clipboard."),
+            ("Y", "Yank focused widget's structured data as JSON "
+                  "(events, bus snapshot, list-item record). "
+                  "Companion to y."),
+            ("x / X", "X-ecute — approve a delay window (brake "
+                      "or tripwire) or attention-area item. "
+                      "Always means \"allow this action.\""),
         ]),
         ("CONSTRUCTS", [
-            ("n", "Spawn new construct."),
-            ("k / K", "Soft-kill / hard-kill focused construct."),
-            ("q / Q", "Queue-inject / interrupt-inject focused "
-                      "construct."),
+            ("n", "Spawn new construct (modal)."),
+            ("k", "Soft-kill focused construct."),
+            ("K", "Hard-kill focused construct (also adds task "
+                  "fingerprint to session blacklist)."),
+            ("q", "Queue-inject focused construct (delivered at "
+                  "next natural break)."),
+            ("Q", "Interrupt-inject focused construct (intent: "
+                  "kill current work + redirect; today behaves "
+                  "as queue-inject due to Claude's mid-turn "
+                  "kill discipline — see filed gotcha)."),
+        ]),
+        ("COMMUNICATION", [
+            ("t", "Ask the Watchdog — async, informational. "
+                  "Yellow-themed modal."),
+            ("T", "Talk to the Daemon — sync, plan-affecting. "
+                  "Cyan-themed modal."),
+            ("e", "Edit / set the goal. First press starts a "
+                  "session; subsequent presses edit mid-flight "
+                  "and the daemon picks up the change at next "
+                  "outcome turn."),
         ]),
         ("RUN CONTROL", [
-            ("e", "Edit / set goal."),
-            ("l", "Open Limits modal."),
-            ("Ctrl+F", "EJECT — emergency halt with confirm modal."),
-            ("Ctrl+Q", "Quit."),
-            ("?", "Show / dismiss this help."),
+            ("l", "Open Limits modal — caps + power levels. "
+                  "Inside: E sets daemon effort, F toggles "
+                  "fast-mode, Tab between fields."),
+            ("b", "Open Brake modal — paranoid / default / yolo. "
+                  "YOLO requires a 3s held confirmation."),
+            ("Ctrl+F", "EJECT — emergency halt with deliberate-"
+                       "consent countdown modal."),
+            ("Ctrl+Q", "Quit (idle only; running session blocks "
+                       "with a toast — use EJECT for in-flight)."),
+            ("?", "Show / dismiss this help. q / e navigate pages."),
         ]),
     ]
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._page = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="keybinds_dialog"):
             yield Label(
                 "[b]CYBERDECK KEYBINDS[/b]  "
-                "[dim]([reverse b] Esc [/reverse b] / "
+                "[dim]([reverse b] q [/reverse b]/"
+                "[reverse b] e [/reverse b] page · "
+                "[reverse b] Esc [/reverse b] / "
                 "[reverse b] ? [/reverse b] / "
                 "[reverse b] Space [/reverse b] close)[/dim]"
             )
+            yield Label(self._page_indicator_text(), id="keybinds_pager")
             with VerticalScroll(id="keybinds_scroll"):
-                yield Static(self._build_keybinds_text(), id="keybinds_body")
+                yield Static(self._build_page_text(), id="keybinds_body")
 
-    def _build_keybinds_text(self) -> str:
-        lines = []
-        for section, entries in self.SECTIONS:
-            lines.append(f"[b]{section}[/b]")
-            for key, desc in entries:
-                # Pad keys to consistent width for readability
-                lines.append(f"  [cyan]{key:<22s}[/cyan] {desc}")
-            lines.append("")
-        return "\n".join(lines).rstrip()
+    def _page_indicator_text(self) -> str:
+        """Top-of-modal pager: shows all section names with the
+        current page highlighted via [reverse b] chrome (matches
+        the keycap convention used elsewhere). Lets the netrunner
+        see at a glance which page they're on AND what's on the
+        other pages without flipping through them all."""
+        bits: list[str] = []
+        for idx, (title, _) in enumerate(self.PAGES):
+            if idx == self._page:
+                bits.append(f"[reverse b] {title} [/reverse b]")
+            else:
+                bits.append(f"[dim]{title}[/dim]")
+        n = len(self.PAGES)
+        i = self._page + 1
+        return f"[dim]Page {i}/{n}[/dim]   " + "  ".join(bits)
+
+    def _build_page_text(self) -> str:
+        """Render the current page's bindings as a Rich-markup
+        block. One section per page; key column padded to 22
+        chars so descriptions align across rows."""
+        title, entries = self.PAGES[self._page]
+        lines: list[str] = [f"[b]{title}[/b]", ""]
+        for key, desc in entries:
+            lines.append(f"  [cyan]{key:<22s}[/cyan] {desc}")
+        return "\n".join(lines)
+
+    def _refresh(self) -> None:
+        """Re-render after a page change. Best-effort guards in
+        case query_one fails (mount race / torn-down)."""
+        try:
+            self.query_one("#keybinds_body", Static).update(
+                self._build_page_text(),
+            )
+            self.query_one("#keybinds_pager", Label).update(
+                self._page_indicator_text(),
+            )
+        except Exception:
+            pass
+
+    def action_prev_page(self) -> None:
+        """q — wrap to the last page from page 0."""
+        self._page = (self._page - 1) % len(self.PAGES)
+        self._refresh()
+
+    def action_next_page(self) -> None:
+        """e — wrap to page 0 from the last page."""
+        self._page = (self._page + 1) % len(self.PAGES)
+        self._refresh()
 
     def action_dismiss(self) -> None:
         self.dismiss(None)
