@@ -1189,6 +1189,86 @@ in the report.
 
 ---
 
+**✅ MECHANIC TRIAGE LIVE-NARRATION SHIPPED 2026-05-06.**
+Real-deck observation: triage spawn went radio-silent for ~2
+minutes ("a thousand fucking years" — netrunner) while reading
+log + walking design files. The original `subprocess.run`
+captured stdout end-to-end, so the mechanic window showed
+nothing until the LLM finished. Felt like a hang even when
+working correctly.
+
+Fix: streaming output via `--output-format stream-json --verbose`,
+read events line-by-line on a daemon thread, pretty-print one
+short line per significant event to mechanic's stderr.
+
+What the netrunner now sees in the mechanic window:
+
+  [mechanic] firing v1 triage (unclean exit; reason=None); ...
+  [mechanic.triage] session started · model=sonnet
+  [mechanic.triage] thinking: Looking at the death point in the log...
+  [mechanic.triage] Read: logs/cyberdeck-2026-05-06-204828.log
+  [mechanic.triage] tool result: 30968 chars
+  [mechanic.triage] thinking: Matching against filed gotchas...
+  [mechanic.triage] Read: Design Files/cyberdeck-state.md
+  [mechanic.triage] tool result: 87341 chars
+  [mechanic.triage] Grep: 'STATUS_CONTROL_C_EXIT' in Design Files/...
+  [mechanic.triage] tool result: 412 chars
+  [mechanic.triage] writing: # Triage report — cyberdeck-...
+  [mechanic.triage] result received (8743 chars)
+  [mechanic] triage written (47.3s) -> .../cyberdeck-2026-05-06-...-triage.md
+
+Same total wall time, but the netrunner sees what's happening
+in real time. Crucial for debugging "is it stuck or just slow"
+— a stuck triage now shows up as repeated reads of the same
+file (sign of confused model) rather than just dead air.
+
+**Implementation.**
+  - New `_emit(line)` helper (write+flush to stderr; no
+    buffering or live narration starves)
+  - New `_truncate(text, n)` helper (single-line cap with
+    ellipsis for stderr display)
+  - New `_print_triage_event(event)` pretty-printer mapping
+    stream-json event kinds to short narration lines:
+      system.init → "session started · model=X"
+      assistant.thinking → "thinking: <80-char preview>"
+      assistant.text → "writing: <80-char preview>"
+      tool_use Read → "Read: <file_path>"
+      tool_use Glob → "Glob: <pattern>"
+      tool_use Grep → "Grep: <pattern>[ in <path>]"
+      tool_use other → "<tool> tool"
+      tool_result → "tool result: <N> chars"
+      tool_result is_error → "tool error: <N> chars"
+      result → "result received (<N> chars)"
+      rate_limit_event / partial chunks → silent (noise filter)
+  - `run_triage` swapped from `subprocess.run` (blocking,
+    captures all output at end) to `subprocess.Popen` with
+    stdin/stdout pipes + stderr passthrough. Daemon reader
+    thread pulls events off stdout line-by-line, prints to
+    stderr, collects the final result event's `result` field.
+    Main thread does `proc.wait(timeout=req.timeout)`; on
+    TimeoutExpired, kill the proc + finalize as failure.
+    Reader thread joined post-wait with 5s grace to drain any
+    last-moment events.
+
+**Stderr passthrough.** claude code's own error output (rare
+but possible) flows directly to mechanic stderr without
+intermediate capture — the netrunner sees authentication
+errors, network errors, etc. immediately.
+
+**Verified.** Synthetic event tests cover all event types
+(system.init, thinking, text, Read/Glob/Grep tool_use,
+tool_result with/without is_error, result, rate_limit
+silence). Plumbing tests confirm cmd-construction has all
+streaming flags (`--output-format stream-json`, `--verbose`)
+and old blocking patterns (`subprocess.run`,
+`capture_output`) are gone.
+
+Real-deck verification: trigger an unclean exit, watch
+mechanic stderr — should narrate the triage live event-by-
+event rather than going silent for ~2 minutes.
+
+---
+
 **Next session picks up at: open netrunner choice.**
   - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
     build-plan item 13.

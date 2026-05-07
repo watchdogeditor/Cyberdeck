@@ -65,6 +65,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -494,6 +495,138 @@ def _summary_line(report_text: str, max_chars: int = 100) -> str:
     return "triage written"
 
 
+# ---- stream-json event pretty-printer -------------------------------------
+#
+# Filed 2026-05-06 after netrunner observed that the v1 / v1.5 triage
+# spawn went radio-silent for ~2 minutes ("a thousand fucking years"
+# was the netrunner's framing). The original `subprocess.run`
+# implementation captured stdout end-to-end with no live output, so
+# the mechanic window showed nothing while the LLM thought, walked
+# files, and assembled the report. Felt like a hang even when it
+# wasn't.
+#
+# Fix: spawn claude with `--output-format stream-json --verbose`,
+# read events line-by-line on a daemon thread, pretty-print one
+# short line per event to stderr (mechanic's window), collect the
+# final result event's text. Same total wall time, but the
+# netrunner sees what the model is actually doing — Read tool fires,
+# tool result lengths, thinking-block previews, the final result
+# event arriving. Live narration of progress.
+
+
+def _emit(line: str) -> None:
+    """Write one line to stderr with flush. Batched flushing would
+    defeat the live-narration UX (lines would buffer up and arrive
+    in chunks)."""
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _truncate(text: str, n: int = 80) -> str:
+    """Single-line truncation for stderr display — collapses
+    newlines to spaces, caps at n chars, adds an ellipsis if we
+    cut anything."""
+    s = " ".join((text or "").split())
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
+
+
+def _print_triage_event(event: dict) -> None:
+    """Pretty-print one stream-json event to mechanic's stderr.
+
+    Short human-readable lines, one per significant event. Silent
+    on noisy event kinds (rate_limit, partial assistant chunks)
+    that don't help the netrunner understand what's happening.
+    """
+    et = event.get("type")
+
+    if et == "system":
+        sub = event.get("subtype")
+        if sub == "init":
+            model = event.get("model", "?")
+            _emit(f"[mechanic.triage] session started · model={model}")
+        return
+
+    if et == "assistant":
+        msg = event.get("message", {})
+        for block in msg.get("content", []) or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "thinking":
+                txt = _truncate(block.get("thinking", ""), 100)
+                if txt:
+                    _emit(f"[mechanic.triage] thinking: {txt}")
+            elif btype == "text":
+                txt = _truncate(block.get("text", ""), 100)
+                if txt:
+                    _emit(f"[mechanic.triage] writing: {txt}")
+            elif btype == "tool_use":
+                tool = block.get("name", "?")
+                inp = block.get("input", {}) or {}
+                # Tool-specific summary so the netrunner sees WHAT
+                # the model is reading / searching. Matters
+                # because a stuck triage often shows up as repeated
+                # reads of the same file (sign of a confused
+                # model that needs a higher caliber or a tighter
+                # prompt).
+                if tool == "Read":
+                    fp = inp.get("file_path", "?")
+                    _emit(f"[mechanic.triage] Read: {fp}")
+                elif tool == "Glob":
+                    pat = inp.get("pattern", "?")
+                    where = inp.get("path", "")
+                    suffix = f" in {where}" if where else ""
+                    _emit(f"[mechanic.triage] Glob: {pat}{suffix}")
+                elif tool == "Grep":
+                    pat = inp.get("pattern", "?")
+                    where = inp.get("path", "")
+                    suffix = f" in {where}" if where else ""
+                    _emit(f"[mechanic.triage] Grep: {pat!r}{suffix}")
+                else:
+                    _emit(f"[mechanic.triage] {tool} tool")
+        return
+
+    if et == "user":
+        # tool_result envelope. Show length only — tool results
+        # are often kilobytes (the netrunner doesn't need the full
+        # content streamed to their terminal).
+        msg = event.get("message", {})
+        for block in msg.get("content", []) or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_result":
+                continue
+            content = block.get("content", "")
+            if isinstance(content, list):
+                # content may be [{type:text, text:...}, ...]
+                content = "".join(
+                    c.get("text", "") for c in content
+                    if isinstance(c, dict)
+                )
+            clen = len(str(content or ""))
+            is_err = bool(block.get("is_error"))
+            tag = "tool error" if is_err else "tool result"
+            _emit(f"[mechanic.triage] {tag}: {clen} chars")
+        return
+
+    if et == "result":
+        result_text = event.get("result", "") or ""
+        _emit(
+            f"[mechanic.triage] result received "
+            f"({len(result_text)} chars)"
+        )
+        return
+
+    # Other event kinds (rate_limit_event, partial assistant chunks
+    # under --include-partial-messages, etc.) are skipped silently
+    # to keep stderr signal-to-noise high.
+
+
 def run_triage(req: TriageRequest) -> TriageResult:
     """Spawn one `claude -p` subprocess for the triage and return
     the result.
@@ -572,6 +705,15 @@ def run_triage(req: TriageRequest) -> TriageResult:
         # read-only — Read/Glob/Grep don't have side effects, no
         # permission prompts needed for them.
         "--permission-mode", "bypassPermissions",
+        # Stream-json output + verbose so we get one event per
+        # line on stdout. The reader thread parses each line and
+        # pretty-prints to stderr, giving the netrunner live
+        # visibility into what the triage is doing (Read tool
+        # fires, thinking-block previews, tool-result lengths,
+        # etc.). claude code requires --verbose with stream-json
+        # in -p mode.
+        "--output-format", "stream-json",
+        "--verbose",
     ]
     # Allow the model to Read files outside the supervisor's cwd
     # (which is wherever launch.bat fired it). Pass the deck
@@ -586,12 +728,16 @@ def run_triage(req: TriageRequest) -> TriageResult:
         "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
     }
 
+    # Spawn the subprocess. stdout is captured for stream-json
+    # parsing; stderr passes through to mechanic's own stderr so
+    # any claude-internal error messages surface to the netrunner
+    # immediately. stdin is piped for the user-prompt write.
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            input=user_prompt.encode("utf-8"),
-            capture_output=True,
-            timeout=req.timeout,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,  # passthrough to mechanic stderr
             env=env,
         )
     except FileNotFoundError:
@@ -600,43 +746,168 @@ def run_triage(req: TriageRequest) -> TriageResult:
             f"claude binary not found: {req.claude_bin}",
             "triage failed: claude not found",
         )
-    except subprocess.TimeoutExpired:
-        return _finalize_failure(
-            req, sysprompt_path, started_at,
-            f"claude -p timed out after {req.timeout}s",
-            "triage failed: timeout",
-        )
     except Exception as e:
         return _finalize_failure(
             req, sysprompt_path, started_at,
             f"subprocess spawn failed: {e}",
             f"triage failed: spawn {e!r}",
         )
-    finally:
-        # Always cleanup the temp prompt file. Best-effort.
-        if sysprompt_path:
-            try:
-                os.unlink(sysprompt_path)
-            except Exception:
-                pass
+
+    # Send the user prompt + close stdin so claude knows that's the
+    # whole input. Best-effort — if the subprocess died between
+    # spawn and now, broken pipe is silent (the wait() below will
+    # reflect the failure).
+    try:
+        if proc.stdin is not None:
+            proc.stdin.write(user_prompt.encode("utf-8"))
+            proc.stdin.close()
+    except Exception:
+        pass
+
+    # Reader thread: pulls stream-json events line-by-line off
+    # stdout, pretty-prints each to stderr, AND accumulates
+    # in-progress state for partial-recovery on timeout. Running
+    # on a daemon thread so the main thread can wait on the
+    # subprocess with a timeout — readline() is blocking and
+    # would interfere with timeout enforcement otherwise.
+    #
+    # Partial-recovery state (filed 2026-05-06 after netrunner
+    # observed the 180s timeout produced ONLY a stub "triage
+    # failed: timed out" report with no actual content). With
+    # streaming output we ALREADY have the model's in-progress
+    # work in memory — it would be wasteful to throw it away just
+    # because the result event didn't arrive in time. Track
+    # everything that came through; assemble a partial report on
+    # timeout.
+    reader_state: dict = {
+        "final_text": "",         # set when `result` event arrives
+        "events_seen": 0,
+        "assistant_text": [],     # text blocks: the in-progress report
+        "thinking_blocks": [],    # all thinking strings (debug appendix)
+        "tool_calls": [],         # (tool, input_dict) tuples
+    }
+
+    def _reader_thread() -> None:
+        try:
+            assert proc.stdout is not None
+            for raw in iter(proc.stdout.readline, b""):
+                if not raw:
+                    break
+                try:
+                    event = json.loads(raw.decode("utf-8", "replace"))
+                except json.JSONDecodeError:
+                    continue
+                reader_state["events_seen"] += 1
+                _print_triage_event(event)
+
+                et = event.get("type")
+                if et == "result":
+                    reader_state["final_text"] = (
+                        event.get("result", "") or ""
+                    )
+                elif et == "assistant":
+                    msg = event.get("message", {})
+                    for block in msg.get("content", []) or []:
+                        if not isinstance(block, dict):
+                            continue
+                        bt = block.get("type")
+                        if bt == "text":
+                            t = block.get("text", "")
+                            if t:
+                                reader_state["assistant_text"].append(t)
+                        elif bt == "thinking":
+                            t = block.get("thinking", "")
+                            if t:
+                                reader_state["thinking_blocks"].append(t)
+                        elif bt == "tool_use":
+                            tool = block.get("name", "?")
+                            inp = block.get("input", {}) or {}
+                            reader_state["tool_calls"].append((tool, inp))
+        except Exception as e:
+            _emit(f"[mechanic.triage] reader thread error: {e}")
+
+    reader = threading.Thread(target=_reader_thread, daemon=True)
+    reader.start()
+
+    # Wait for the subprocess with timeout. timeout fires only if
+    # the model HANGS — normal completion sets returncode and the
+    # readline loop exits cleanly when stdout closes.
+    timed_out = False
+    try:
+        proc.wait(timeout=req.timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    # Give the reader a moment to drain any remaining events from
+    # stdout's pipe buffer. Daemon thread, so worst case it's
+    # abandoned at process exit — but the join lets us collect
+    # the final result event if it landed just before close.
+    reader.join(timeout=5)
+
+    # Cleanup the temp prompt file. Always best-effort.
+    if sysprompt_path:
+        try:
+            os.unlink(sysprompt_path)
+        except Exception:
+            pass
+
+    if timed_out:
+        # Partial-recovery path. The model went over the timeout
+        # cap, but streaming output means we have its in-progress
+        # work in `reader_state` — assistant text it was writing,
+        # thinking blocks it produced, tool calls it made. Assemble
+        # a "PARTIAL TRIAGE" report with that content rather than
+        # discarding everything and returning only the stub.
+        # Filed 2026-05-06 after netrunner observed the timeout
+        # path produced "Triage failed: timed out" with NO actual
+        # content despite the model having done substantial work.
+        partial_report = _build_partial_report(
+            req, reader_state, started_at,
+        )
+        report_path = _build_report_path(req)
+        try:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(partial_report, encoding="utf-8")
+        except Exception:
+            report_path = None
+        return TriageResult(
+            success=False,
+            report_text=partial_report,
+            report_path=report_path,
+            error=f"claude -p timed out after {req.timeout}s",
+            summary_line=(
+                f"timed out at {req.timeout:.0f}s — partial report "
+                f"saved with {len(reader_state['assistant_text'])} "
+                f"text blocks + {len(reader_state['tool_calls'])} "
+                f"tool calls"
+            ),
+            elapsed_s=time.time() - started_at,
+        )
 
     if proc.returncode != 0:
-        err_text = proc.stderr.decode("utf-8", errors="replace").strip()
         return _finalize_failure(
             req, None, started_at,
             (
-                f"claude exited {proc.returncode}: "
-                f"{err_text[:300] if err_text else '(no stderr)'}"
+                f"claude exited {proc.returncode} "
+                f"(events seen: {reader_state['events_seen']})"
             ),
             f"triage failed: claude exit {proc.returncode}",
         )
 
-    report_text = proc.stdout.decode("utf-8", errors="replace").strip()
+    report_text = (reader_state["final_text"] or "").strip()
     if not report_text:
         return _finalize_failure(
             req, None, started_at,
-            "claude returned empty output",
-            "triage failed: empty output",
+            (
+                f"claude returned no result event "
+                f"(events seen: {reader_state['events_seen']})"
+            ),
+            "triage failed: no result event",
         )
 
     # Write report to disk. Best-effort — even if the write fails,
@@ -662,6 +933,141 @@ def run_triage(req: TriageRequest) -> TriageResult:
         summary_line=_summary_line(report_text),
         elapsed_s=time.time() - started_at,
     )
+
+
+def _build_partial_report(
+    req: TriageRequest,
+    reader_state: dict,
+    started_at: float,
+) -> str:
+    """Assemble a partial triage report from streamed events when
+    the subprocess hit the timeout before producing a `result`
+    event.
+
+    The streamed events tell us what the model HAD done by the
+    deadline: thinking blocks (its reasoning chain so far), tool
+    calls (what it read / searched), and any assistant text
+    blocks (the in-progress report being written). This is real
+    diagnostic value; it would be wasteful to throw it away just
+    because the model didn't reach the final assembly step.
+
+    Format mirrors the normal triage report shape so the netrunner
+    can still skim it the same way, but with a clear "PARTIAL"
+    header and a "WHAT WE HAVE" section listing the captured
+    state. Failed-final-step framing rather than completed-but-
+    cut-off, because we don't actually know if the in-progress
+    text was the final answer or mid-paragraph reasoning.
+    """
+    elapsed = time.time() - started_at
+    text_blocks: list[str] = reader_state.get("assistant_text", [])
+    thinking_blocks: list[str] = reader_state.get("thinking_blocks", [])
+    tool_calls: list[tuple] = reader_state.get("tool_calls", [])
+
+    lines: list[str] = []
+    lines.append(f"# PARTIAL Triage report — {req.log_path.name}")
+    lines.append("")
+    lines.append("## Status")
+    lines.append("")
+    lines.append(
+        f"**Triage timed out at {req.timeout:.0f}s** "
+        f"(elapsed: {elapsed:.1f}s). The model was still working "
+        f"when the supervisor killed the subprocess — "
+        f"`{len(thinking_blocks)}` thinking block(s), "
+        f"`{len(tool_calls)}` tool call(s), "
+        f"`{len(text_blocks)}` text block(s) "
+        f"captured before the kill. Use the captured state below "
+        f"as a partial diagnostic; if it's not enough, re-run "
+        f"triage with a longer `--triage-timeout`."
+    )
+    lines.append("")
+
+    if text_blocks:
+        lines.append("## In-progress report (model was writing this)")
+        lines.append("")
+        lines.append(
+            "*This is what the model had typed by the deadline. May "
+            "be a complete report cut off at the last paragraph, OR "
+            "may be mid-reasoning that hadn't reached the final "
+            "structured output yet. Read with that caveat.*"
+        )
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        for block in text_blocks:
+            lines.append(block.rstrip())
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    if tool_calls:
+        lines.append("## Tools the model invoked")
+        lines.append("")
+        lines.append(
+            "*If the same file appears multiple times here, the "
+            "model may have been stuck in a re-read loop — sign "
+            "that the prompt is unclear or the caliber is too low.*"
+        )
+        lines.append("")
+        for tool, inp in tool_calls:
+            if tool == "Read":
+                fp = inp.get("file_path", "?")
+                lines.append(f"- `Read`: `{fp}`")
+            elif tool == "Glob":
+                pat = inp.get("pattern", "?")
+                where = inp.get("path", "")
+                suffix = f" in `{where}`" if where else ""
+                lines.append(f"- `Glob`: `{pat}`{suffix}")
+            elif tool == "Grep":
+                pat = inp.get("pattern", "?")
+                where = inp.get("path", "")
+                suffix = f" in `{where}`" if where else ""
+                lines.append(f"- `Grep`: `{pat!r}`{suffix}")
+            else:
+                lines.append(f"- `{tool}`")
+        lines.append("")
+
+    if thinking_blocks:
+        lines.append("## Thinking blocks (model's reasoning chain)")
+        lines.append("")
+        lines.append(
+            "*Captured for debugging — usually the netrunner "
+            "doesn't need to read these, but they help when "
+            "diagnosing why the model got stuck.*"
+        )
+        lines.append("")
+        for i, t in enumerate(thinking_blocks, 1):
+            lines.append(f"### Block {i}")
+            lines.append("")
+            # Quote-block the thinking so it's visually distinct
+            # from the model's actual prose.
+            for line in t.splitlines():
+                lines.append(f"> {line}")
+            lines.append("")
+
+    lines.append("## Cleanup status (from supervisor)")
+    lines.append("")
+    lines.append(f"- Tracked subprocesses at death: {req.tracked_subprocesses}")
+    lines.append(f"- Subprocesses killed by supervisor: {req.subprocesses_killed}")
+    if req.clean_close_reason:
+        lines.append(f"- Clean close reason: `{req.clean_close_reason}`")
+    else:
+        lines.append("- Clean close reason: NONE — unclean exit")
+    if req.wedge_kill_context:
+        lines.append("")
+        lines.append("### v1.5 wedge-kill context")
+        lines.append("")
+        lines.append(req.wedge_kill_context)
+    lines.append("")
+    lines.append("## Re-running")
+    lines.append("")
+    lines.append(
+        f"To re-run with a longer cap: launch the mechanic with "
+        f"`--triage-timeout {req.timeout * 2:.0f}` (or whatever "
+        f"feels right). To suppress triage entirely on this branch "
+        f"while you debug: `--no-triage`."
+    )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _finalize_failure(
