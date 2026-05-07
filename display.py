@@ -25,7 +25,18 @@ from construct import EventKind
 
 
 def summarize(raw: dict, *, untruncated: bool = False) -> str:
-    """One-line human-readable summary of a stream-json event.
+    """Multi-line human-readable summary of a stream-json event.
+
+    Pre-2026-05-07 this returned a single ' | '-joined string with all
+    newlines collapsed to spaces. Real-deck observation: that produced
+    one long line per event that RichLog soft-wrapped at pane width,
+    breaking commands and tool results mid-token and making the pane
+    log basically illegible. New shape: one block (event-type chrome
+    + indented body) per line, blocks separated by blank lines so the
+    pane reads as a vertically-stacked sequence of distinct events
+    instead of a flat wall of text. RichLog with `wrap=False` (per the
+    filed gotcha) renders each `\\n` as a real line break, so multi-
+    line bodies preserve their structure.
 
     `untruncated=True` raises the per-block sanity cap from 500 to 5000
     chars and the unknown-event fallback cap likewise. Used by the
@@ -61,62 +72,258 @@ def summarize(raw: dict, *, untruncated: bool = False) -> str:
                 for b in content
                 if isinstance(b, dict)
             ]
-            return " | ".join(p for p in parts if p)
+            non_empty = [p for p in parts if p]
+            if not non_empty:
+                return ""
+            # Blank line between blocks so the pane log reads as
+            # distinct vertical entries — the netrunner can scan from
+            # one event to the next without the visual collisions the
+            # old ' | ' joiner produced.
+            return "\n\n".join(non_empty)
     # Unknown event type — fall back to a sanity-capped repr.
     cap = 5000 if untruncated else 500
     s = str(raw)
     return s[:cap] + ("..." if len(s) > cap else "")
 
 
+# Per-event-type chrome. Leading glyph + Rich-markup style triple
+# (glyph_style, header_style, body_style). All three may be None for
+# unstyled output. Designed so each event type is glanceable at the
+# left margin of the pane log without reading word one of the body.
+#
+# Glyph choices:
+#   ▸ (right-pointing wedge) — tool_use: "construct is doing this"
+#   ◂ (left-pointing wedge)  — tool_result: "construct received this"
+#   ▒ (medium shade)          — thinking: "construct's reasoning,
+#                                muted because it's not action"
+#   ▌ (left half block)       — assistant text: prose, the "voice"
+_BLOCK_CHROME: dict[str, tuple[str, Optional[str], Optional[str], Optional[str]]] = {
+    "tool_use":   ("▸", "cyan b",        "cyan b",         "white"),
+    "tool_result": ("◂", "dim",           "dim",            "bright_black"),
+    "thinking":   ("▒", "dim italic",    "dim italic",     "dim italic"),
+    "text":       ("▌", None,            None,             None),
+}
+
+
+def _block_chrome(
+    glyph: str,
+    header: str,
+    body: str,
+    *,
+    glyph_style: Optional[str] = None,
+    header_style: Optional[str] = None,
+    body_style: Optional[str] = None,
+) -> str:
+    """Render an event block with a leading glyph + optional header
+    + body. Compact for short single-line bodies; multi-line for
+    bodies with newlines or longer content.
+
+    Compact shape:
+      ▸ Bash: python -m pytest tests/
+
+    Multi-line shape:
+      ▸ Bash
+        python -m pytest tests/ -v --tb=short
+        └ Run unit tests
+
+    Rich markup tags wrap each segment. Tags persist across newlines
+    in Rich's parser, but we close-and-reopen per body line so the
+    netrunner can copy individual lines without inheriting style
+    state from a prior line."""
+    glyph_open = f"[{glyph_style}]" if glyph_style else ""
+    glyph_close = f"[/{glyph_style}]" if glyph_style else ""
+    header_open = f"[{header_style}]" if header_style else ""
+    header_close = f"[/{header_style}]" if header_style else ""
+    body_open = f"[{body_style}]" if body_style else ""
+    body_close = f"[/{body_style}]" if body_style else ""
+
+    glyph_md = f"{glyph_open}{glyph}{glyph_close}"
+
+    if not body:
+        if header:
+            return f"{glyph_md} {header_open}{header}{header_close}"
+        return glyph_md
+
+    # Single-line + short body → inline shape. ~80 chars threshold so
+    # short Bash commands / file paths render compactly.
+    if "\n" not in body and len(body) <= 80:
+        if header:
+            return (
+                f"{glyph_md} {header_open}{header}{header_close}: "
+                f"{body_open}{body}{body_close}"
+            )
+        return f"{glyph_md} {body_open}{body}{body_close}"
+
+    # Multi-line shape: glyph + header on row 1, indented body rows.
+    lines: list[str] = []
+    if header:
+        lines.append(f"{glyph_md} {header_open}{header}{header_close}")
+    else:
+        lines.append(glyph_md)
+    for body_line in body.split("\n"):
+        # Two-space indent under the header glyph keeps the visual
+        # nesting clear. Rich markup applies per-line so each line
+        # can be copied independently.
+        lines.append(f"  {body_open}{body_line}{body_close}")
+    return "\n".join(lines)
+
+
 def render_block(block: dict, *, untruncated: bool = False) -> str:
-    """Render a single content block to a short string.
+    """Render a single content block as multi-line styled text.
 
-    "Short" is relative — we used to chop at 100 chars to keep things
-    legible in narrow panes, but with W/A/S/D horizontal scroll and
-    the expand modal (z on a focused log) the netrunner can always
-    see the full content. The 500-char caps here are sanity bounds
-    against megabyte tool results, not stylistic limits.
+    Per-event-type chrome (`_BLOCK_CHROME`) gives each block a
+    distinct leading glyph + style. Bodies preserve newlines (the
+    pane's RichLog runs with `wrap=False`, so `\\n` becomes real
+    line breaks; collapsing to single lines was the source of the
+    "wraps randomly mid-token" UX problem before 2026-05-07).
 
-    `untruncated=True` raises the per-block cap from 500 to 5000 for
-    the modal re-render path."""
+    Per-block sanity cap: 500 chars in normal mode, 5000 in
+    `untruncated` (used by the ExpandModal). Caps protect against
+    megabyte tool results blowing up the pane; truncation happens
+    AFTER newline preservation so the truncated tail still reads
+    naturally."""
     cap = 5000 if untruncated else 500
     bt = block.get("type")
+
     if bt == "text":
-        txt = block.get("text", "").replace("\n", " ")
-        return f"text: {txt[:cap]}" + ("..." if len(txt) > cap else "")
+        txt = block.get("text", "").rstrip()
+        if not txt:
+            return ""
+        if len(txt) > cap:
+            txt = txt[:cap].rstrip() + "..."
+        glyph, glyph_st, hdr_st, body_st = _BLOCK_CHROME["text"]
+        return _block_chrome(
+            glyph, "", txt,
+            glyph_style=glyph_st,
+            header_style=hdr_st,
+            body_style=body_st,
+        )
+
     if bt == "tool_use":
         name = block.get("name", "?")
-        inp = block.get("input", {})
-        return f"tool_use: {name}({fmt_input(inp, untruncated=untruncated)})"
+        inp = block.get("input", {}) or {}
+        body = _format_tool_input_body(inp, cap=cap)
+        glyph, glyph_st, hdr_st, body_st = _BLOCK_CHROME["tool_use"]
+        return _block_chrome(
+            glyph, name, body,
+            glyph_style=glyph_st,
+            header_style=hdr_st,
+            body_style=body_st,
+        )
+
     if bt == "tool_result":
         c = block.get("content", "")
-        if isinstance(c, str):
-            c = c.replace("\n", " ")
-            return f"tool_result: {c[:cap]}" + ("..." if len(c) > cap else "")
-        return "tool_result: (structured)"
+        if isinstance(c, list):
+            # Structured tool_result content: list of {type:text,text:...}
+            # blocks. Flatten the text fields preserving newlines.
+            c = "\n".join(
+                str(b.get("text", ""))
+                for b in c
+                if isinstance(b, dict)
+            )
+        if not isinstance(c, str):
+            c = str(c)
+        c_stripped = c.rstrip()
+        is_err = bool(block.get("is_error", False))
+        if not c_stripped:
+            return "[dim]◂ result (empty)[/dim]"
+        full_len = len(c_stripped)
+        if full_len > cap:
+            c_stripped = c_stripped[:cap].rstrip() + "..."
+        if is_err:
+            # Errors get red chrome to pop visually — netrunner needs
+            # to spot a denied / failed tool call quickly.
+            return _block_chrome(
+                "◂", "ERROR", c_stripped,
+                glyph_style="red",
+                header_style="red b",
+                body_style="red",
+            )
+        # Normal result: dim chrome (it's plumbing, not the
+        # interesting bit). Show length when the body is large
+        # enough that the netrunner might want to z-zoom for the
+        # full content.
+        header = (
+            f"result ({full_len} chars)"
+            if full_len > 100 else "result"
+        )
+        glyph, glyph_st, hdr_st, body_st = _BLOCK_CHROME["tool_result"]
+        return _block_chrome(
+            glyph, header, c_stripped,
+            glyph_style=glyph_st,
+            header_style=hdr_st,
+            body_style=body_st,
+        )
+
     if bt == "thinking":
-        thought = block.get("thinking", "").replace("\n", " ")
-        return f"thinking: {thought[:cap]}" + ("..." if len(thought) > cap else "")
+        thought = block.get("thinking", "").rstrip()
+        if not thought:
+            return ""
+        if len(thought) > cap:
+            thought = thought[:cap].rstrip() + "..."
+        glyph, glyph_st, hdr_st, body_st = _BLOCK_CHROME["thinking"]
+        return _block_chrome(
+            glyph, "thinking", thought,
+            glyph_style=glyph_st,
+            header_style=hdr_st,
+            body_style=body_st,
+        )
+
     return f"[block: {bt or 'unknown'}]"
 
 
-def fmt_input(inp: dict, *, untruncated: bool = False) -> str:
-    """Format a tool's input dict for display. Per-value cap of 200
-    chars (2000 in untruncated mode) — high enough that file paths,
-    search patterns, command strings land intact in normal use; low
-    enough that the occasional enormous payload (a multi-KB Bash
-    heredoc, a giant Edit diff) doesn't blow up the pane log."""
+def _format_tool_input_body(inp: dict, *, cap: int) -> str:
+    """Format a tool_use input dict as a body string (newlines
+    preserved). Special-cases shell commands (Bash / PowerShell)
+    so the netrunner can read multi-line scripts as written;
+    other tools get one `key: value` line per param.
+
+    Per-value cap = cap // 2 so a single huge param doesn't eat the
+    whole budget; whole-body truncation handled by the caller's
+    cap on the rendered string.
+    """
     if not isinstance(inp, dict):
-        cap = 2000 if untruncated else 200
-        return str(inp)[:cap]
-    cap = 2000 if untruncated else 200
-    parts = []
+        s = str(inp)
+        return s[:cap] + ("..." if len(s) > cap else "")
+
+    if not inp:
+        return ""
+
+    # Shell commands: 'command' field is the headline; preserve its
+    # newlines exactly (the netrunner needs to see what's actually
+    # being executed). 'description' (Claude Code adds this for
+    # human-readable Bash explanations) becomes a tail line.
+    if "command" in inp and isinstance(inp["command"], str):
+        cmd = inp["command"].rstrip()
+        desc = str(inp.get("description") or "").strip()
+        if len(cmd) > cap:
+            cmd = cmd[:cap].rstrip() + "..."
+        if desc:
+            # └ glyph for the description line indicates it's
+            # subordinate to the command above (semantic nesting).
+            return f"{cmd}\n[dim]└ {desc}[/dim]"
+        return cmd
+
+    # Generic tool input: one key:value per line. Preserve internal
+    # newlines in long values (file contents, search corpora) so the
+    # structure is visible.
+    per_value_cap = max(80, cap // 2)
+    parts: list[str] = []
     for k, v in inp.items():
-        vs = str(v).replace("\n", " ")
-        if len(vs) > cap:
-            vs = vs[:cap - 3] + "..."
-        parts.append(f"{k}={vs}")
-    return ", ".join(parts)
+        vs = str(v).rstrip()
+        if not vs:
+            continue
+        if len(vs) > per_value_cap:
+            vs = vs[:per_value_cap].rstrip() + "..."
+        # Multi-line value: indent its tail lines so the key:
+        # alignment stays clear.
+        if "\n" in vs:
+            head, _, tail = vs.partition("\n")
+            indented_tail = "\n    ".join(tail.split("\n"))
+            parts.append(f"{k}: {head}\n    {indented_tail}")
+        else:
+            parts.append(f"{k}: {vs}")
+    return "\n".join(parts)
 
 
 # ---- Activity-line formatting (per-pane "what's happening now") -----------

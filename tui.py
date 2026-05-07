@@ -667,10 +667,24 @@ class DaemonPane(Static, can_focus=False):
             pass
 
     def write_thinking(self, text: str) -> None:
-        self._write_line(f"[dim]› thinking:[/dim] {text}")
+        """Daemon's thinking block. Multi-line content preserved
+        (RichLog with wrap=False renders each \\n as a real line
+        break) so paragraph structure shows in the pane."""
+        text = (text or "").rstrip()
+        if not text:
+            return
+        self._write_line(f"[dim italic]› thinking:[/dim italic] {text}")
 
     def write_chat(self, text: str) -> None:
-        self._write_line(f"[b]chat:[/b] {text}")
+        """Daemon's chat output (the conversation-side response).
+        Visually framed as ▶ daemon: to mirror the WatchdogPane's
+        Q/A shape — netrunner messages get ≫ netrunner: chrome via
+        write_netrunner_message; this is the daemon's reply side.
+        Multi-line preserved."""
+        text = (text or "").rstrip()
+        if not text:
+            return
+        self._write_line(f"[green b]▶ daemon:[/green b] {text}")
 
     def write_action(self, action: dict) -> None:
         atype = action.get("type", "?")
@@ -683,6 +697,50 @@ class DaemonPane(Static, can_focus=False):
 
     def write_error(self, text: str) -> None:
         self._write_line(f"[red]error:[/red] {text}")
+
+    def write_goal_set(self, goal: str) -> None:
+        """A new goal landed. Visual separator + ⚑ goal: chrome.
+        Mirrors WatchdogPane.write_question's ── + Q: pattern so
+        the daemon pane reads as a back-and-forth between the
+        netrunner (goal-set + injects) and the daemon
+        (thinking + chat). Called from the goal-set / goal-update
+        flows in _handle_goal_submitted."""
+        goal = (goal or "").strip()
+        if not goal:
+            return
+        self._write_line(
+            f"\n[dim]──────[/dim]  [cyan b]⚑ goal:[/cyan b] {goal}"
+        )
+
+    def write_goal_update(
+        self, goal: str, classification: str, old_goal: str,
+    ) -> None:
+        """Mid-flight goal change. Same visual shape as write_goal_set
+        but with the classification label so the netrunner can see
+        whether this was a clarification / scope-change / pivot at a
+        glance."""
+        goal = (goal or "").strip()
+        if not goal:
+            return
+        self._write_line(
+            f"\n[dim]──────[/dim]  "
+            f"[cyan b]⚑ goal-update[/cyan b] "
+            f"[dim]({classification}):[/dim] {goal}"
+        )
+
+    def write_netrunner_message(self, text: str) -> None:
+        """Netrunner injected a message via T (talk-daemon). Visual
+        separator + ≫ netrunner: chrome — matches the conversation
+        framing established by write_goal_set / write_chat. The
+        daemon's reply to this message will land via write_chat on
+        the next outcome turn, pairing visually as netrunner-said /
+        daemon-said."""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._write_line(
+            f"\n[dim]──────[/dim]  [cyan b]≫ netrunner:[/cyan b] {text}"
+        )
 
     def write_line(self, text: str) -> None:
         """Generic write to the daemon log, no formatting prefix."""
@@ -844,16 +902,20 @@ class ConstructPane(Static, can_focus=True):
         height: 1;
     }
     /* Slice 3: variable-outcome delay overlay. Hidden by default; the
-     * `.-delaying` class flips display:block + reserves two rows for
-     * the countdown bar + the X-press hint. Pops out automatically
-     * with the tool call (DelayMonitor → bus → pane.set_delay) so the
-     * netrunner doesn't have to switch tabs to see what's pending. */
+     * `.-delaying` class flips display:block + auto-sizes to content.
+     * Pops out automatically with the tool call (DelayMonitor → bus →
+     * pane.set_delay) so the netrunner doesn't have to switch tabs to
+     * see what's pending. Auto height (was pinned to 2 rows pre-2026-
+     * 05-07) lets the overlay grow to fit tripwire-context rows when
+     * the delay is tripwire-driven (tripwire name + severity + 1-2
+     * description/suggestion lines). Brake-only delays still render
+     * compact at 2 rows; tripwire delays stretch to 4-5. */
     ConstructPane > #pane_delay {
         height: 0;
         display: none;
     }
     ConstructPane.-delaying > #pane_delay {
-        height: 2;
+        height: auto;
         display: block;
         margin-top: 0;
     }
@@ -1059,7 +1121,23 @@ class ConstructPane(Static, can_focus=True):
         # affordance.
         yield Label("", id="pane_delay", markup=True)
         yield Label("", id="pane_current")
-        yield Log(id="pane_log", max_lines=200, highlight=False)
+        # RichLog (was Log pre-2026-05-07): the new per-event-type
+        # chrome from display.summarize uses Rich markup tags +
+        # preserved newlines. Log doesn't render markup and treats
+        # write_line input as a single line; RichLog renders markup
+        # when markup=True and splits embedded \n into separate log
+        # entries on write(). wrap=False keeps long single-row
+        # content (like a long bash command on its own line) from
+        # auto-wrapping mid-token; the netrunner can horizontal-scroll
+        # via W/A/S/D when needed. highlight=False mirrors the prior
+        # Log config (no rich-format auto-detection).
+        yield RichLog(
+            id="pane_log",
+            max_lines=200,
+            markup=True,
+            wrap=False,
+            highlight=False,
+        )
 
     def on_mount(self) -> None:
         self._mounted = True
@@ -1118,11 +1196,23 @@ class ConstructPane(Static, can_focus=True):
         """Render the bold-verb + bar + X-press hint into #pane_delay.
 
         Verb maps from default_action × brake intent:
-          - default=allow (only happens under YOLO+delay) → "Running"
-            (the call IS about to execute; X interrupts)
-          - default=deny  (Default+destructive or Paranoid) → "Redirecting"
-            (the call is about to bounce back to the construct as a
-            tool_result.is_error; X overrides to approve)
+          - default=allow (only happens under YOLO+delay; retired
+            post-2026-05-07 redesign but kept for defensive
+            compatibility) → "Running" (the call IS about to
+            execute; X interrupts)
+          - default=deny  (Default+destructive or Paranoid or any
+            tripwire fire) → "Redirecting" (the call is about to
+            bounce back to the construct as a tool_result.is_error;
+            X overrides to approve)
+
+        Tripwire-driven delays (post-2026-05-07): when the delay
+        carries `tripwire_name` / `tripwire_severity` etc., render a
+        third row below the X-press hint naming the tripwire that
+        fired and quoting its description / suggestion. Without this
+        row the netrunner sees "Redirecting in 3s, press X to
+        approve" with no clue WHICH rule they're overriding —
+        especially confusing when LLM-authored tripwires fire on
+        goal-specific patterns.
 
         Bar drains over delay_window_seconds — full at open, empty at
         deadline. EJECT-style 20 cells with █ filled / ░ empty."""
@@ -1154,6 +1244,45 @@ class ConstructPane(Static, can_focus=True):
             f"[bright_black]· brake={e.brake} · "
             f"{e.tool_name}[/bright_black][/dim]"
         )
+        # Tripwire context row (post-2026-05-07 redesign — DelayEntry
+        # carries tripwire_* fields when the engine drove the delay).
+        # Severity-colored chrome so the netrunner sees at a glance
+        # whether they're overriding a warning or a critical fire.
+        if getattr(e, "is_tripwire_driven", False):
+            severity = getattr(e, "tripwire_severity", "") or ""
+            name = getattr(e, "tripwire_name", "") or "?"
+            description = getattr(e, "tripwire_description", "") or ""
+            suggestion = getattr(e, "tripwire_suggestion", "") or ""
+            sev_color = (
+                "red b" if severity == "critical"
+                else "yellow b" if severity == "warning"
+                else "yellow"
+            )
+            sev_label = severity.upper() if severity else "TRIPWIRE"
+            # First inner-row: tripwire name + severity badge.
+            tripwire_header = (
+                f"[{sev_color}]⚠ tripwire[/{sev_color}] "
+                f"[b]{name}[/b] "
+                f"[{sev_color}]\\[{sev_label}][/{sev_color}]"
+            )
+            # Body lines: description (always) + suggestion (warning
+            # only — that's the field meant for the construct's pivot
+            # but the netrunner reading the overlay also benefits
+            # from seeing the recommended alternative). Rich markup
+            # bracket-escape so a description like "Don't do [X]"
+            # doesn't get parsed as markup.
+            description_safe = description.replace("[", r"\[")
+            suggestion_safe = suggestion.replace("[", r"\[")
+            tripwire_lines = [tripwire_header]
+            if description_safe:
+                tripwire_lines.append(
+                    f"[dim]{description_safe}[/dim]"
+                )
+            if suggestion_safe and severity == "warning":
+                tripwire_lines.append(
+                    f"[dim]→ {suggestion_safe}[/dim]"
+                )
+            text = text + "\n" + "\n".join(tripwire_lines)
         try:
             self.query_one("#pane_delay", Label).update(text)
         except Exception:
@@ -1310,8 +1439,19 @@ class ConstructPane(Static, can_focus=True):
             )
             return
         try:
-            log = self.query_one("#pane_log", Log)
-            log.write_line(f"{event_kind:14s} {log_summary}")
+            log = self.query_one("#pane_log", RichLog)
+            # Multi-line summaries (post-2026-05-07 chrome) need the
+            # event-kind prefix only on the first line, with
+            # continuations indented to hang under it. Format as a
+            # single string with embedded \n + 15-space indent (14-
+            # char event_kind padding + 1 space); RichLog.write
+            # splits on \n into separate log entries internally.
+            indent = " " * 15
+            prefixed = (
+                f"{event_kind:14s} "
+                + (log_summary or "").replace("\n", f"\n{indent}")
+            )
+            log.write(prefixed)
             if activity_summary is not None:
                 current = self.query_one("#pane_current", Label)
                 preview = (
@@ -1333,14 +1473,32 @@ class ConstructPane(Static, can_focus=True):
         (raw=None) pass through with their log_summary verbatim.
 
         Returns rich.text.Text instances rather than plain strings so
-        the modal renders consistently with the chatlog provider."""
+        the modal renders consistently with the chatlog provider.
+
+        Post-2026-05-07: summary strings now contain Rich markup
+        tags (per-event-type chrome) and embedded newlines (multi-
+        line bodies). Use Text.from_markup so the chrome renders
+        styled in the modal; replicate add_event's continuation-
+        line indent so the visual shape matches the live pane log."""
         out: list = []
+        indent = " " * 15
         for event_kind, log_summary, raw in self._raw_event_buffer:
             if raw is not None and untruncated:
                 summary = summarize(raw, untruncated=True)
             else:
                 summary = log_summary
-            out.append(Text(f"{event_kind:14s} {summary}"))
+            prefixed = (
+                f"{event_kind:14s} "
+                + (summary or "").replace("\n", f"\n{indent}")
+            )
+            try:
+                out.append(Text.from_markup(prefixed))
+            except Exception:
+                # Defensive: if a malformed markup tag slipped in,
+                # fall back to a plain Text so the modal still
+                # renders the row (better to show literal markup
+                # than to crash the modal render path).
+                out.append(Text(prefixed))
         return out
 
     def set_files_written(self, files: list[str]) -> None:
@@ -10558,11 +10716,10 @@ class CyberdeckApp(App):
         # Also surface in the daemon pane so the daemon-tab reader
         # gets a clean record of the conversation flowing in. The
         # daemon's response will appear here as normal daemon output
-        # on the next turn, pairing visually.
+        # on the next turn, pairing visually as netrunner-said /
+        # daemon-said.
         if self.daemon_pane is not None:
-            self.daemon_pane.write_line(
-                f"[primary]≫ netrunner:[/primary] {message}"
-            )
+            self.daemon_pane.write_netrunner_message(message)
 
     def action_edit_goal(self) -> None:
         """e — open the goal-set/edit modal.
@@ -10707,6 +10864,14 @@ class CyberdeckApp(App):
                 f"[yellow]\\[goal-update][/yellow] [dim]{classification}:[/dim] "
                 f"{goal[:100]}{'...' if len(goal) > 100 else ''}"
             )
+            # Also surface in the daemon pane with goal-update chrome
+            # (separator + ⚑ + classification label) so the daemon
+            # tab reads as a back-and-forth conversation between
+            # netrunner-side updates and daemon-side responses.
+            if self.daemon_pane is not None:
+                self.daemon_pane.write_goal_update(
+                    goal, classification, old_goal,
+                )
             self.session.set_pending_goal_update(goal, classification, old_goal)
             # Slice 2: re-author tripwires on scope-change / pivot —
             # the watch patterns for the new direction may differ from
@@ -10733,9 +10898,11 @@ class CyberdeckApp(App):
         self._refresh_sidebar_info()
         if self.daemon_pane is not None:
             self.daemon_pane.set_status("starting")
-            self.daemon_pane.write_line(
-                f"[dim]— new goal: {goal[:60]}{'...' if len(goal) > 60 else ''} —[/dim]"
-            )
+            # Goal-set chrome: separator + ⚑ goal: text. Mirrors the
+            # WatchdogPane's Q/A shape — the daemon pane reads as a
+            # back-and-forth conversation between netrunner side
+            # (goal + injects) and daemon side (thinking + chat).
+            self.daemon_pane.write_goal_set(goal)
         self._start_daemon_task()
 
     def action_toggle_daemon_pause(self) -> None:

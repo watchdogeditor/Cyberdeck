@@ -105,6 +105,14 @@ see `cyberdeck-state.md`. This is a one-line index.
 - *Design:* `in-flight/cyberdeck-maintbot-design.md` (v0–v1.5 sections)
 - Living inventory `cyberdeck-platform-portability.md` filed
 
+### Construct/daemon pane chrome + tripwire overlay (2026-05-07)
+Real-deck UX pass on the deck's primary read surfaces.
+
+- **Construct pane log** — `display.summarize` / `render_block` rewritten to emit per-event-type chrome with preserved newlines instead of a single ` | `-joined line with `\n` collapsed to spaces. Each block gets a leading glyph (`▸` tool_use, `◂` tool_result, `▒` thinking, `▌` text) + optional header (e.g., `Bash`, `result (1247 chars)`) + indented body with newlines preserved. Bash commands keep their shape; tool results scan vertically; thinking blocks read as paragraphs. Errors flagged in red. Pane log widget switched from `Log` (no markup, single-line writes) to `RichLog` (markup + `wrap=False` + auto-split on `\n`). `add_event` formats the event-kind prefix on the first line and indents continuations 15 spaces so multi-line bodies hang under the prefix visually. `render_buffer` (ExpandModal feed) uses `Text.from_markup` so the modal renders the same chrome.
+- **Daemon pane chrome** — mirrors WatchdogPane's Q/A shape. New methods on `DaemonPane`: `write_goal_set(goal)`, `write_goal_update(goal, classification, old_goal)`, `write_netrunner_message(text)`. Visual rule (`──────`) + `⚑ goal:` / `≫ netrunner:` chrome. Existing `write_thinking` / `write_chat` updated: `[dim italic]› thinking:[/dim italic]` and `[green b]▶ daemon:[/green b]` so the daemon's voice matches the Watchdog's `A:` framing. `_handle_goal_submitted` (idle + mid-flight branches) and the netrunner-message inject path wired to call the new methods.
+- **Tripwire delay overlay** — when the delay was tripwire-driven (`DelayEntry.is_tripwire_driven`), the per-pane overlay renders a third+ row below the countdown bar showing `⚠ tripwire <name> [SEVERITY]` + description + suggestion (warning only). Severity-colored chrome (red for critical, yellow for warning). Pre-fix the netrunner pressed X without knowing WHICH rule they were overriding; now the rule is named on screen during the X-window. `pane_delay` Label CSS switched from `height: 2` to `height: auto` so the overlay grows for tripwire context.
+- *Pending real-deck eyes:* construct pane chrome look in narrow panes (do glyphs render in cmd.exe's default font? do dim/cyan styles read clearly against the panel background?); daemon pane Q/A flow during a real goal cycle; tripwire-overlay text wrapping when description is long.
+
 ### Mechanic v1.6 — iterative triage (item 0g, 2026-05-07)
 - Multi-pass deepening on top of v1's single-pass shape. Pass 1 fires the standard triage; mechanic then prompts on stderr "Keep delving? [y/N]"; on yes, fires a deepening pass via `claude -p --resume <session_id>` and appends a `## Deeper analysis (pass N)` section to the same report file
 - Reuses v1.5's streaming + prompt-thread infrastructure. New helpers: `prompt_keep_delving()`, `run_iterative_triage()`, `_build_deepen_directive()`, `_append_pass_to_report()`. New `TriageResult.session_id` field captured from the first `system/init` stream event
@@ -198,12 +206,19 @@ Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Deck at clean ph
 - **Daemon narrative fix** — daemon mislabels brake-hook denials as tripwire fires; tighten daemon system prompt to distinguish `permission_denials` from `tripwire.fire`
 - **Verify Claude Code's fast-mode settings.json key** — current `{"fastMode": true}` may need to be `{"speed": "fast"}`; real-deck verify via `system_init` event's `fast_mode_state` field
 
-### UI polish pass
-Filed 2026-05-07 from real-deck observation. Netrunner flagged that several render surfaces need substantial improvement; no concrete design yet, but the intent is captured so the pass doesn't slip.
+### UI polish pass — partial (construct/daemon panes + tripwire overlay shipped 2026-05-07)
+Filed 2026-05-07 from real-deck observation. Netrunner flagged several render surfaces as needing substantial improvement. First batch shipped same day; sidebar + advisor truncation still outstanding.
+
+**Shipped 2026-05-07** (see SHIPPED → Construct/daemon pane chrome + tripwire overlay):
+- Construct pane log: per-event-type chrome (▸ tool_use, ◂ tool_result, ▒ thinking, ▌ text), preserved newlines, multi-line bodies indented under headers. Switched pane_log widget from Log to RichLog so markup + multi-line writes work.
+- Daemon pane: WatchdogPane-style chrome — `⚑ goal:` + separator on goal-set, `≫ netrunner:` + separator on inject, `▶ daemon:` for chat output (was just `chat:`).
+- Tripwire delay overlay: extra row below the countdown showing tripwire name + severity badge + description (+ suggestion for warnings). Pre-fix the netrunner saw "Redirecting in Xs, press X to approve" with no clue WHICH rule fired.
+
+**Still outstanding:**
 - **Sidebar (left bar)** — fleet log + status indicators (brake / connection / caliber / pool / cost / spawns). Functional but cramped. Layout, hierarchy, density all on the table.
-- **Chatlog (center activity stream)** — renders fleet events, daemon thinking, watchdog Q&A, tripwire fires, brake denials, attention items. Each event type has its own format and the cumulative result is dense. Concerns to surface during the design pass: visual hierarchy, event-type discoverability, scrollback navigation, search, density tuning.
-- **Advisor modal scroll truncation** — concrete sub-bug, real-deck observed 2026-05-07: asking the Advisor "what do you know?" produced output that got truncated by the scrollbar. The modal's content area should scroll cleanly through long Q&A responses. Investigate whether the scrollbar is consuming visible area or the content's height isn't being computed properly. Could ship as a discrete fix ahead of the broader pass. Touches `advisor.py` render path + the AdvisorScreen modal layout in `tui.py`.
-- *Design:* none yet — file an in-flight design doc when the pass picks up. Likely composes with universal list-names (MID FUTURE) since both touch the same render surfaces.
+- **Chatlog (center activity stream)** — renders fleet events, daemon thinking, watchdog Q&A, tripwire fires, brake denials, attention items. Each event type has its own format and the cumulative result is dense. Concerns: visual hierarchy, event-type discoverability, scrollback navigation, search, density tuning. (The construct/daemon pane work above is a model for what the central chatlog could look like.)
+- **Advisor modal scroll truncation** — concrete sub-bug, real-deck observed 2026-05-07: asking the Advisor "what do you know?" produced output that got truncated by the scrollbar. Investigate whether the scrollbar is consuming visible area or the content's height isn't being computed properly.
+- *Design:* none yet — file an in-flight design doc when the pass picks up.
 
 ### Tripwires slice 3 — severity-aware rendering
 - Critical pulls focus, warning badges, low logs only
