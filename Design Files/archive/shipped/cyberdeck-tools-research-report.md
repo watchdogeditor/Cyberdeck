@@ -1,5 +1,13 @@
 # Cyberdeck — Default Tools Research Report
 
+> **STATUS: ARCHIVED 2026-05-07.** This research report fed into
+> `cyberdeck-tools-default-kit.md` v2 (now in `Design Files/in-flight/`).
+> Conclusions and recommendations are consumed there. Kept for provenance —
+> read if you want the source-by-source analysis behind a v2 kit decision.
+> Don't update this doc; the live forward-looking design is the v2 kit.
+
+---
+
 *Critique and extension of `cyberdeck-tools-default-kit.md` v1, against the
 2024-2026 state of the offensive-security tooling field. Internet-research
 pass: prioritized changes, not exhaustive enumeration. Inputs to a v2

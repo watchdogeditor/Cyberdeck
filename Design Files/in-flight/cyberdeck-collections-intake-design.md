@@ -1,5 +1,13 @@
 # Cyberdeck — Collections Intake Design
 
+> **STATUS: IN-FLIGHT (filed 2026-05-06; no code yet).**
+> Updated 2026-05-07. Implementation queued behind the prompt-shaping
+> pass and Mechanic v2. Line item in `cyberdeck-build-plan.md` →
+> NEAR FUTURE. Read the whole doc when picking it up; the recipe
+> shape and assembler design are the load-bearing parts.
+
+---
+
 *Filed 2026-05-06 after a heist of transilienceai/communitytools surfaced
 the "github-distributed reference collection" as a recurring need (PATT,
 SecLists, nuclei-templates, GTFOBins, HackTricks) that doesn't fit the

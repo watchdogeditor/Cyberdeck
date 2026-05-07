@@ -267,7 +267,7 @@ class Fleet:
         # may be None when fleet.py runs standalone (the `python fleet.py`
         # console entry) — _render then publishes nothing and the
         # console-print path (when not quiet) is the only output. See
-        # `Design Files/cyberdeck-event-stream-design.md`.
+        # `Design Files/archive/shipped/cyberdeck-event-stream-design.md`.
         self.bus = bus
 
         # Upper bound for the post-stdout-close `c.wait()` in _consume's

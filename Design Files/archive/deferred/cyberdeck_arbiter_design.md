@@ -1,5 +1,14 @@
 # Wearable Cyberdeck Arbiter — Design Doc
 
+> **STATUS: DEFERRED (form-factor variant, not current scope).** Archived
+> 2026-05-07. The wearable build path is hardware-blocked + post-Linux-port.
+> Read this when (a) the Pi/Linux port is real and the form-factor question
+> reopens, or (b) you want context on the local-first dispatcher / egress
+> scrubber architecture — those concepts feed into the local-model substrate
+> work tracked in `cyberdeck-build-plan.md` (Phase D).
+
+---
+
 *Local-first dispatcher with cloud escalation, for cybersecurity research workflows.*
 
 ---

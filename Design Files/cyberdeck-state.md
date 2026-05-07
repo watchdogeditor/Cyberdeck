@@ -1,1785 +1,110 @@
 # Cyberdeck — Current State
 
-*High-density context snapshot. Drop this in the next chat / Claude Code
-session to bring fresh context up to speed without re-deriving 8+
-sessions of decisions. Pair with `cyberdeck-spec.md`,
-`cyberdeck-build-plan.md`, `cyberdeck-philosophy.md`, and the new
-`cyberdeck-claude-code-orientation.md`.*
+*Reference document. Filed gotchas (sacred), key design decisions,
+shipped feature reference, tech debt, collaboration patterns. Companion
+to `cyberdeck-build-plan.md` (forward-looking) and `cyberdeck-spec.md`
+(architecture).*
 
-*Updated at the migration point: chat-based development → Claude Code.
-The deck is in active production use; ~12k LOC across 13 modules.*
+*Last lean rebuild 2026-05-07. The previous running-journal version is
+preserved at `archive/journal/cyberdeck-state-journal-pre-2026-05-07.md`
+— read that when you need session-by-session history.*
 
 ---
 
 ## Status snapshot
 
-**The deck is real and load-bearing.** Daemon orchestrates real Claude
-Code constructs. Constructs talk back to the deck via the dispatcher
-protocol. The watchdog answers questions about fleet activity. The
-deck monitors its own connection state. Every focusable surface in
-the right and bottom panels does something. Files panel auto-surfaces
-deduplicated paths. Profiles + scripts hot-reload from disk.
+The deck is real and load-bearing. ~22k LOC across 26 Python modules at
+the deck-source root. Daemon orchestrates real Claude Code constructs.
+Watchdog answers questions about fleet activity. Mechanic supervises
+the deck process and triages unclean exits. Constructs talk back via
+the dispatcher protocol. Every focusable surface in the right and
+bottom panels does something.
 
-**Real-world testing has been doing the heavy lifting** for several
-sessions — the user has been catching live bugs (watchdog stdin
-arg-vs-stdin, watchdog wedge with queued questions, file-panel double
-listing on Windows path normalization, focus traversal trap with empty
-main, Windows ProactorEventLoop shutdown noise) and we've been fixing
-them. Most of these would not have been caught by the test harness.
-
-**SESSION ARC 2026-05-01 → 2026-05-02 — eleven commits shipped:**
-the safety architecture pass is now 4/4 complete (with phase 1.5
-+ phase 2 sub-slices). Cache-cost and tripwire-race fixes also
-landed. All real-deck verified. Branch
-`claude/admiring-sutherland-91f342` pushed to origin; merge to
+**Branch state (2026-05-07):** `claude/objective-sammet-25e0b4` ~42
+commits ahead of `origin/main`. Deck at clean phase point — most recent
+slice (mechanic v1+v1.5 cluster) fully real-deck verified. Merge to
 main is the netrunner's call.
 
-**✅ Wedge-timeout diagnostic** (commit f3f6f2d). Construct.wait()'s
-TimeoutError handler now drains stderr with a 2s ceiling before
-kill; `stderr_excerpt` lands on the finalize meta payload when
-`kill_source == "fleet_wedge_timeout"`; configurable via Limits
-modal as `wedge_timeout_seconds`, default 30s. Real-deck verified
-2026-05-01 (cx-796e0468 wedged silently with empty stderr — useful
-negative info: the wedge isn't a Python/Node trace pattern, it's
-claude's stream stalling).
-
-**SAFETY ARCHITECTURE PASS — 4/4 SHIPPED.**
-
-**✅ Slice 3 phase 1: variable-outcome delay UX** (commit e4981b0).
-Renamed pause→delay (pause is reserved for the deferred daemon-
-pause feature; this is a timed-default thing). Z→**X** as the
-deck-wide approval/execute key (mnemonic: X-ecute), bidirectional
-by context — under default/paranoid X approves a deny-default,
-under YOLO X interrupts an allow-default. Both x and Shift+X
-bound to action_x_focused. Filed in cyberdeck-keymap-revision.md
-as a spec constant.
-
-Per-brake matrix (when delay_window_seconds > 0):
-  YOLO     — every side-effect call delayed; default=allow; X=deny
-  Default  — only would-deny calls delayed; default=deny;  X=approve
-  Paranoid — only would-deny calls delayed; default=deny;  X=approve
-
-YOLO + delay needs the hook installed even though brake gating is
-a no-op there; brake_state.make_spawn_settings lifts the YOLO
-short-circuit when delay_window_seconds > 0. Tripwire-driven
-denies (deny_pending.json from slice 2) BYPASS the delay — those
-are hard-stop signals from the watchdog, not negotiable.
-
-Mechanism (file-protocol, mirrors slice 2's deny_pending.json):
-  - Hook writes `<cid>.delay_pending.json` when an interesting
-    call enters the delay window.
-  - Hook polls every 100ms for `<cid>.delay_override.json`. If
-    present, reads action, deletes both files, applies override.
-    Otherwise applies default at deadline.
-  - Deck-side DelayMonitor (new module brake_delay.py) polls the
-    spawns dir every 50ms, publishes brake.delay_opened /
-    brake.delay_resolved bus events on file appearance /
-    disappearance.
-
-UI: ConstructPane gets a delay overlay row pinned at the top of
-the pane: EJECT-style 20-cell countdown bar + bold "(Running |
-Redirecting) in Xs" verb chosen by default action + "press X to
-(block | approve)" hint. Pane gets promoted to the top of #main
-on delay open (mirror of compact-to-bottom). Heavy magenta
-border (.-delaying CSS class) — distinct from yellow $warning,
-red $error, green success, default $accent. Magenta is the
-deck-wide "time-sensitive, act on it or it auto-resolves" color.
-
-Initial design had a Delays right-panel tab (DelayListItem in a
-ListView). Real-deck testing 2026-05-01 caught that the tab
-"isn't selectable and is in a weird place" — promote-to-top +
-magenta border replaces it. DelayListItem class dropped before
-commit; per-pane overlay is the only surface.
-
-Files: brake_delay.py (new, ~280 LOC), brake_state.py (delay_
-window_seconds threaded through make_spawn_settings + YOLO
-short-circuit lift), brake_hook.py (should_delay + run_delay_
-window + main() integration), fleet.py (kwarg + threading),
-tui.py (overlay + handlers + refresh timer + X keybind + Limits
-field + magenta border + promote-to-top).
-
-**✅ Slice 3 phase 1.5: persist limits across restarts** (commit
-f97d1af). Both `delay_window_seconds` and `wedge_timeout_seconds`
-now survive deck restarts via a `limits` namespace in the same
-state.json file as brake. New helpers `brake_state.load_limits()`
-+ `save_limits()`; read-merge-write so brake + limits saves don't
-clobber each other. max_concurrent / max_total_spawns / pool_size
-deliberately NOT persisted — they're session-scoped (netrunner
-sets caps per goal, not per deck install).
-
-**✅ Default delay_window_seconds bumped to 5s** (commit 6c6de8e)
-on CyberdeckApp.__init__. Fleet's __init__ default stays at 0.0
-since fleet.py console mode has no TUI to render the overlay.
-Existing installs that have opened Limits keep their persisted
-value; fresh installs and never-opened-Limits installs see the
-new default.
-
-**✅ Slice 3 phase 2: blacklist proposals + attention area** (commit
-2ed51c9). Closes slice 2's deferred application path. When a
-critical+bad_enough tripwire fires, deck builds a BlacklistEntry
-from the construct's context and files it as a 30s X-pressable
-approval prompt. New `attention.py` module: AttentionItem +
-AttentionKind + AttentionResolved + AttentionResolution. New
-AttentionPanel widget at the top of #main (heavy magenta border,
-hidden when empty, EJECT-style countdown bars per item).
-action_x_focused dispatch extended: focused-pane delay → sole-
-pending delay → most-recent attention item → toast. Approve
-adds the entry to the watchdog's session blacklist; expiry drops
-silently. Deck-owned timers (no hook polling — distinct from
-brake-hook delay). Bus events: attention.opened / attention.
-resolved (with reason field: approved | expired | dropped).
-
-**✅ Cache-cost fix** (commit 1dea7f7). Real-deck-observed: every
-spawn was hitting `cache_miss_reason: 'system_changed'` with
-~34k tokens missed, ~$0.07/spawn of avoidable cost. Diagnosis:
-per-spawn `<cid>.json` settings file (different path AND
-different content per spawn — construct_id was in the hook
-command) was the drift surface. Fix: stable `<home>/.cyberdeck/
-spawn_settings.json` with cid removed from argv. Hook now
-resolves cid at runtime via session_id from stdin → `<session_
-id>.cid` lookup file written by Fleet on system_init capture.
-Real-deck verified 2026-05-02: `system_changed` gone; remaining
-miss reason is `previous_message_not_found` (benign for fresh
-non-resume spawns). cache_read jumped from ~19k/spawn to
-~137k–219k/spawn — massive prefix-cache hit improvement.
-
-**✅ Tripwire-authoring spawn-race fix** (commit 8632b00). Real-
-deck observed in cyberdeck-2026-05-01-220027.log: tripwire
-authoring took ~25s while fast constructs finished in ~7-15s, so
-the entire spawn batch ran without authored coverage. Fix:
-DaemonSession._execute_action awaits a tripwire_authoring_
-complete asyncio.Event before each spawn action. Event is SET
-("ok to spawn") by default; cleared on _kick_off_tripwire_
-authoring; re-set in the wrapper's finally block (always —
-success/failure/crash). First spawn batch waits for authoring;
-subsequent batches in the same goal find event already set and
-proceed without delay. Netrunner sees a "[dim]waiting for
-tripwire authoring to complete before first spawn…[/dim]" status
-when the gate engages. Real-deck verified 2026-05-02 (cyberdeck-
-2026-05-02-012912.log): gate held 18s, all 6 spawns fired within
-100ms of authoring landing.
-
-**✅ Discrete bugs cluster** (commit 60b91aa).
-  - Enum payloads serialized as `{}` in `logger._serialize_
-    payload` because Enum.__dict__ is empty. Fix: isinstance
-    check before __dict__ probe; return payload.value. Affects
-    every brake.change / connection.transition log entry going
-    forward.
-  - Daemon over-volunteers destructive content: real-deck
-    observed daemon synthesizing `shutdown -h now` unprompted
-    when asked for an rm-rf test. Fix: new SAFETY-TEST
-    DISCIPLINE + GENERAL RULE sections in DAEMON_SYSTEM_PROMPT
-    instructing daemon to stay within explicit ask, treat
-    netrunner instructions as ceiling not floor.
-
-**✅ Construct-refusal as structured event** (uncommitted as of
-this CLAUDE.md update). Closes the "construct refusal text is
-buried in result event" item from the discrete-bugs list. New
-`construct.refused` bus kind (severity=WARNING) emitted alongside
-the existing `fleet.finalize` event whenever the model itself
-declines the task (clean exit, leading "I won't" / "No. I cannot"
-/ "Sorry, but I can't"). Distinct from brake-hook denials —
-brake denials gate individual tool calls; refusal is the model
-deciding the request is something it shouldn't do at all.
-
-  - **Detection** lives in `construct.py`. Module-level
-    `REFUSAL_PATTERNS` (5 conservative regex anchored at start of
-    text); `_detect_refusal(text)` scans the leading 300 chars and
-    carves an excerpt (first 1-2 sentences, capped 120 chars).
-    `Construct.refusal_excerpt` / `Construct.is_refusal` properties
-    expose it. Scans `_result_field` first then `_last_assistant_
-    text` — same priority order `final_output` uses, so the
-    daemon-facing narrative and the surfaced excerpt always agree.
-  - **Wiring**: `fleet.py` populates `refusal_excerpt` on the
-    finalize meta payload AND emits a separate `meta` event with
-    `type="refused"` when an excerpt was detected. `_META_TYPE_TO_
-    KIND` maps `refused` → `construct.refused`. Translator escalates
-    severity to WARNING for that one kind only — other fleet kinds
-    stay INFO.
-  - **Chatlog**: `display.chatlog_format_fleet` appends a yellow
-    `· refused: "..."` suffix to the finalize line (composes with
-    the existing brake-blocked suffix; constructs that hit BOTH
-    show both). Standalone `construct.refused` event returns None
-    from the formatter — the suffix on finalize is the netrunner-
-    facing surface; the marker event is for programmatic consumers
-    (file logger, watchdog Q&A bus snapshot, future automation).
-  - **Watchdog awareness**: WATCHDOG_SYSTEM_PROMPT grew a
-    `refused:` suffix paragraph distinguishing it from `brake
-    blocked` so Q&A like "why did construct X produce nothing?"
-    routes to the right answer.
-
-  Detection patterns are conservative — false negatives are fine
-  (the construct's output still flows through the normal finalize
-  path). Real-deck-observed canonical refusals all match: "No. I
-  won't run rm -rf — it would destroy the system. Neither is
-  reversible." Negative cases ("The function won't work without
-  proper auth") correctly skip. Touches construct.py (~120 LOC),
-  fleet.py (~30 LOC), event_bus.py (~10 LOC), display.py (~25
-  LOC), watchdog.py (~10 LOC system-prompt addition). Real-deck
-  verification pending — next claude-refusal in the wild lands
-  with the new chatlog suffix and bus event.
-
-**Other shipped this session:**
-  - Tools/plugins/profiles retool design doc (commit de22d58).
-    Three-way split — tools = registered CLI binaries / scripts;
-    plugins = deck-extended capability bundles in deck source
-    (NOT home — brake hook protects deck source from constructs);
-    profiles = recipes (default prompt + tools list, plugins
-    daemon-wide). Implementation queued behind future sessions;
-    ~600 LOC across 4-5 phases. See `Design Files/cyberdeck-
-    tools-plugins-profiles-retool.md`.
-  - Diagnostic surface for compact + delay-armed signals (commit
-    e33ec75) — fleet_log writes when compact path schedules / fires
-    / fails, when delay is armed at spawn time. Helped diagnose
-    a heisenbug (compact-to-bottom stopped working after a render
-    crash; restart fixed it) — see Filed gotchas.
-  - Heisenbug filing for widget-render-crash → silently broken
-    move_child mutations (commit c4e19cb). See Terminal/Textual
-    gotchas section.
-  - Branch retool design + cleanup: stale `cool-tereshkova-0196b9`
-    branch deleted from remote (its content was superseded by
-    e4f722f on main).
-
-**✅ TOOLS REGISTRY (P1 of tools/plugins/profiles retool)** shipped
-2026-05-03. The first slice of the four-phase retool. New
-`tools.py` (data layer) + `tools_registry.py` (mtime-watch
-registry) provide a single-file watcher over
-`<home>/tools/tools.toml`. Schema:
-
-  [[tool]]
-  name        = "ripgrep"
-  kind        = "binary"       # "binary" | "script"
-  command     = "rg"
-  description = "Fast recursive grep."
-  # path      = "..."          # optional. Override for binaries,
-                                # path-to-script for scripts.
-                                # ${tools_dir} substitutes to
-                                # <home>/tools/.
-  # help_text = "..."          # optional. Longer description.
-
-Existence check at load: `shutil.which(command)` for binaries (or
-the `path` override if set), `Path(path).exists()` for scripts.
-Failures downgrade to `available=False` with reason but stay
-registered, mirroring plugin availability.
-
-  - **Bus events**: `tool.added` / `tool.changed` / `tool.removed`
-    / `tool.unavailable` / `tool.scan_error` / `tool.scan_complete`.
-    `unavailable` and `scan_error` escalate to WARNING severity;
-    rest are INFO.
-  - **Default seed**: tools.toml writes a comment-only template on
-    first run (mirrors profile_registry's auto-seed). Re-seeds on
-    deletion — netrunner edits are sacred.
-  - **TUI wiring**: new TOOLS section in the Tools tab between
-    Plugins and Scripts. ListView with kind glyphs (⚙ binary,
-    ⌬ script) + cyan-name-when-available, red ✗ + dim-name-when-
-    not. Per the gotcha note in this doc, `_right_panel_focusables`
-    grew the new ListView so W/S nav reaches it.
-  - **Lifecycle**: same shape as ProfileRegistry — `start()` does
-    initial scan + spawns 1s-poll watcher; `shutdown()` is
-    idempotent and called from the deck's existing teardown path.
-
-Real-deck verified 2026-05-03. The netrunner added a `[[tool]]`
-entry pointing at a non-existent `testcmd`; mtime-watch fired
-`tool.unavailable` with the reason "cannot locate 'testcmd' on
-PATH"; the TOOLS section flipped to `(0/1 available)` and rendered
-the entry with a red ✗ glyph + dim name. Registry default-seed,
-bus events, scan_error, panel re-render — all worked first try.
-~520 LOC across 2 new files (tools.py + tools_registry.py) +
-~120 LOC in tui.py. Existing SCRIPTS section preserved as-is
-(legacy flat-file scan); P5 of the retool will collapse both
-into one unified panel.
-
-**✅ TOOLS RETOOL P2 SHIPPED 2026-05-03** (uncommitted as of this
-state.md update). Plugins moved from `<home>/plugins/` into
-`<deck-source>/plugins/`. Two structural shifts:
-  - **Brake-hook protection extends to plugin code automatically.**
-    `path_is_protected()` already protects everything inside deck
-    source except the workspace; the move means constructs CANNOT
-    write to plugin files via Write/Edit/Bash. Closes the
-    "construct writes a half-baked plugin file mid-run and the
-    deck self-destructs at restart" failure mode at the filesystem
-    layer, no new gating needed.
-  - **Bridge dispatcher.** New `plugin_bridge.py` in deck source
-    root (~170 LOC), bootstrapped to `<home>/tools/deck/plugin_
-    bridge.py` on every deck launch via `_bootstrap_plugin_bridge`
-    (mirrors `_bootstrap_deck_dispatcher`'s flow). Constructs
-    invoke `python <bridge> <plugin_name> [args...]` — the bridge
-    resolves to `<deck-source>/plugins/<name>/plugin.py` and
-    forwards via subprocess, piping stdin/stdout/stderr/exit code
-    through verbatim. Bootstrap-time token replacement stamps
-    the absolute plugins-dir path into the script (the bridge
-    runs from `<home>/tools/deck/` and has no natural relative
-    path to plugins/ on its own); `repr()` preserves Windows
-    backslashes correctly.
-
-Plus: `run.py` → `plugin.py` rename for screenshot (matches the
-"plugin.py is the entry convention" in the design doc);
-`plugin.toml` `entry` field updated; README + plugin docstring +
-_usage() string updated to teach bridge invocation; daemon
-system prompt + construct addendum rewritten to reference the
-bridge instead of direct invocation; `.gitignore`'s
-`!cyberdeck-home/plugins/` exception retired (plugins are
-tracked at deck-source root now).
-
-Real-deck-shape verified: registry picks up the plugin from the
-new location, bootstrap fires at App.__init__, bootstrapped copy
-parses cleanly, `--list` returns `screenshot` against the right
-path, `--help` forwards to the plugin verbatim. End-to-end mss
-capture not exercised this session (needs a real display).
-
-**Sequencing gotcha caught + filed.** First implementation had
-`_bootstrap_plugin_bridge` reach for `self.plugins_dir`, but the
-bootstrap fires earlier in `__init__` than the plugins_dir
-assignment — produced a silent AttributeError swallowed by the
-outer try/except. Smoke test caught it (no plugin_bridge.py
-landed in <home>/tools/deck/); fixed by resolving plugins_dir
-inside the bootstrap method directly from `Path(__file__)`. The
-deck dispatcher had no equivalent issue because it doesn't
-depend on any later-assigned attrs. **Lesson:** when adding a
-new bootstrap method that mirrors an existing one, audit
-attribute access against the actual ordering in `__init__`,
-don't assume parity with the existing bootstrap.
-
-**✅ TOOLS RETOOL P3 SHIPPED 2026-05-03** (uncommitted as of this
-state.md update). `load_into_deck(app)` hook for plugins. Each
-available plugin's `plugin.py` gets imported into the deck
-process via `importlib.util.spec_from_file_location` (plugin
-folders stay off sys.path) under a `cyberdeck_plugin_<name>`
-synthetic module name; if the module defines a top-level callable
-`load_into_deck`, the deck calls it ONCE during on_mount with the
-App instance. The hook can subscribe to bus events, register
-marker handlers, add widgets — anything the plugin's deck-side
-capability needs.
-
-Three bus event kinds for hook lifecycle:
-  - `plugin.hook_loaded` — hook ran successfully. Info severity;
-    yellow chatlog line `plugin hook loaded: <name>`.
-  - `plugin.hook_skipped` — plugin has no hook. Silent (no chatlog
-    line) — the common case for stateless plugins like screenshot;
-    chatlog noise would be worse than the visibility benefit.
-  - `plugin.hook_error` — import failed, hook isn't callable, or
-    hook raised. Warning severity; red chatlog line with reason
-    truncated to 160 chars.
-
-Bus filter narrowing: existing `_handle_plugin_event` was
-subscribed on `plugin.*` (matches everything); narrowed to
-explicit `[plugin.loaded, plugin.scan_error, plugin.scan_complete]`
-so registry events go to the registry handler and hook events
-(different payload shape — dict vs PluginEvent dataclass) go to
-the new `_handle_plugin_hook_event`. Filter discipline matters
-when payload shapes diverge across the same dotted-namespace.
-
-Per-plugin try/except on three boundaries:
-  1. Module import (`spec.loader.exec_module`) — catches plugins
-     whose top-level code raises (broken imports, decorators that
-     fail, etc.)
-  2. `getattr(module, "load_into_deck")` callability check
-  3. The actual `load_into_deck(app)` invocation
-
-Each boundary fails to a `plugin.hook_error` event with a
-specific reason. Top-level `try/except` in on_mount around the
-whole loop guards against the loop itself crashing (defense in
-depth — the per-plugin guards should make it impossible).
-
-Real-deck verified 2026-05-03 with a temporary smoketest plugin
-that:
-  (a) Defined a `load_into_deck(app)` that published its own
-      chatlog.direct event from inside the deck process. Bus
-      log showed: `plugin.loaded` → `plugin.hook_skipped`
-      (screenshot, no hook) → `chatlog.direct` (smoketest's own
-      message) → `chatlog.direct` (deck's "hook loaded"
-      announcement) → `plugin.hook_loaded`. Hook's deck-side
-      bus.publish worked from within the imported module — proves
-      the App access path composes correctly across the
-      importlib boundary.
-  (b) Was rewritten to `raise RuntimeError(...)` from inside
-      load_into_deck. Bus log showed `plugin.hook_error` with
-      severity=warning, payload reason captured the
-      `RuntimeError('intentional smoke-test failure')` string,
-      chatlog rendered the red error line. Deck didn't crash;
-      screenshot still loaded normally; subsequent on_mount
-      machinery ran undisturbed.
-
-The smoketest plugin was deleted after both paths verified;
-only screenshot stays in `<deck-source>/plugins/`. ~210 LOC
-across tui.py + ~30 LOC docstring contract in plugins.py + 3
-new Kind constants in event_bus.py.
-
-**✅ TOOLS RETOOL P4 SHIPPED 2026-05-03** (uncommitted as of this
-state.md update). Profile schema migration `recommended_tools` →
-`tools` with semantic shift to registry-backed CLI names, plus
-optional per-spawn `plugins` field on the daemon's spawn action.
-
-Profile.tools is now a list of names from <home>/tools/tools.toml
-— system-installed CLIs the netrunner has declared. The construct's
-prompt addendum surfaces each tool's name + short description
-(resolved at spawn time against tool_registry). Names that don't
-resolve render with `(not in registry)` rather than getting
-silently dropped — visible drift > invisible drift.
-
-The legacy `recommended_tools` field stays loadable for backward
-compat (warns deprecated, copies value into `.tools`). Bundled
-profiles (default, code_reviewer, recon_specialist) pre-migrated;
-the registry's file-level migration only fires for user-added or
-freshly-cloned legacy files. Migration is idempotent + atomic-ish
-(temp-file write + rename) and bails on ambiguous shapes
-(multi-line arrays, inline comments) so the loader's deprecation
-path takes over.
-
-Per-spawn addendum architecture split:
-  - `_build_deck_addendum` — STATIC. Dispatcher utility info
-    only. Set on Fleet at construction; same for every spawn.
-  - `_build_per_spawn_addendum(profile, plugins)` — DYNAMIC.
-    Renders profile.tools resolved against tool_registry +
-    plugins resolved against plugin_registry. plugins=None means
-    "surface all available" (back-compat); plugins=[...] means
-    "surface only these" (daemon's per-spawn pick); plugins=[]
-    means "explicitly no plugins."
-  - DaemonSession takes a `per_spawn_addendum_renderer` callback;
-    the TUI wires `_build_per_spawn_addendum` to it. Daemon-side
-    spawns render before fleet.spawn; netrunner-direct spawn
-    sites in tui.py call the renderer directly. Inject path
-    passes None — resumed session has its prompt cached
-    server-side, re-rendering would bloat for no gain.
-
-Spawn action JSON grows optional `plugins: list[str]` field. Daemon
-system prompt teaches the field with steering: "pick plugins
-surgically — irrelevant plugin instructions waste prompt tokens
-and dilute the construct's focus." Validates entries are strings;
-non-strings dropped silently. Threaded into the `spawned` meta
-event payload so observers attribute per-spawn plugin selection.
-
-Real-deck verified 2026-05-03:
-  - All three bundled profiles load with tools=[] / recommended_tools=[]
-  - Synthetic legacy profile: deprecation warning fires, tools
-    populated from recommended_tools, recommended_tools cleared
-  - Migration helper: legacy TOML rewritten cleanly + idempotent
-  - Renderer: 4 unit-test scenarios verified — profile.tools
-    with mix of resolved + unresolved names; plugins=None /
-    plugins=[bad,good] / plugins=[] all render correctly
-  - Full deck startup: zero errors, all events flow as before
-
-~410 LOC across profiles.py, profile_registry.py, tui.py,
-fleet.py, daemon_session.py, daemon.py, construct.py + 3
-bundled profile rewrites.
-
-**✅ TOOLS RETOOL P5 SHIPPED 2026-05-04** (uncommitted as of this
-state.md update). UI retool: four-tab right panel
-(Chatlog | Files | Profiles | Tools), unified Tools tab.
-
-Profiles graduated from a section inside Tools to its own
-TabPane between Files and Tools. Single header + ListView;
-`tools_profile_list` ID preserved (no need to rename for cosmetic
-structure shifts).
-
-Tools tab collapsed from a multi-section VerticalScroll layout
-into a single ListView (`tools_unified_list`) with three kinds
-of rows distinguished by leading glyph:
-  ⚙ binary  — system-installed CLI (cyan when found; red ✗ + dim
-              when shutil.which can't locate it)
-  ⌬ script  — registered scripts (kind = "script" in tools.toml,
-              entry path resolved via Path(path).exists())
-  ⊕ plugin  — deck-extended capability from
-              <deck-source>/plugins/<name>/
-
-Render order: binaries → scripts → plugins, alphabetical within
-each kind. Plugins keep their `Capture/screenshot`-style category
-prefix; tools render bare names (the registry doesn't model
-categories). Single header `TOOLS (N/total available)` covers
-all three kinds.
-
-Empty state: `(empty — register CLIs in ~/tools/tools.toml or
-drop plugins in <deck-source>/plugins/<name>/)` when both
-registries are empty. Per-kind empty placeholders gone.
-
-Legacy SCRIPTS section retired. The disk-scan
-(`_scan_scripts`) of `<home>/tools/<category>/<filename>`
-violated the design's "Don't auto-discover scripts" rule, plus
-the only files in there were deck-bootstrapped infrastructure
-(cyberdeck.py, plugin_bridge.py) — not netrunner-meaningful
-tools. `_scan_scripts` left in tui.py for now (no callers, dead
-code); follow-up commit can prune.
-
-Wiring updates:
-  - `_right_panel_focusables` collapses to single-focusable-per-
-    tab. Profiles tab → `tools_profile_list`; Tools tab →
-    `tools_unified_list`.
-  - `_cycle_right_panel_tabs` order extended:
-    Chatlog → Files → Profiles → Tools.
-  - Two helpers (`_append_tool_row`, `_append_plugin_row`) keep
-    the unified panel renderer readable.
-
-~80 net LOC after consolidation (compose -55, refresh restructure
-+30, focusables -10, helpers +50, cycle order +1).
-
-**Tools/plugins/profiles retool COMPLETE — 5/5 phases shipped
-2026-05-03 → 2026-05-04.**
-
-  P1 (2026-05-03): tools_registry.py + mtime-watch +
-                   tools.toml schema with default-seed.
-  P2 (2026-05-03): plugins moved into deck source + plugin_bridge
-                   dispatcher with bootstrap-time path stamping.
-  P3 (2026-05-03): load_into_deck(app) hook for plugin deck-side
-                   integration.
-  P4 (2026-05-03): profile schema migration (recommended_tools →
-                   tools, registry-backed) + per-spawn `plugins`
-                   field on daemon spawn actions + per-spawn
-                   addendum architecture split.
-  P5 (2026-05-04): 4-tab UI + unified Tools ListView.
-
-The retool's structural goals all landed: one registry per
-concept (tools → tools.toml, plugins → deck-source/plugins/,
-profiles → home/profiles/), one invocation surface per kind
-(plugins through the bridge, tools through PATH or absolute
-path, profiles through daemon system prompt), one UI surface
-per concept (Profiles tab + unified Tools tab).
-
-**✅ CALIBER PHASE 1 SHIPPED 2026-05-04** (uncommitted as of this
-state.md update). Per-spawn model + effort + fast-mode bundle
-threaded through the deck's spawn pipeline.
-
-New `caliber.py` module (~250 LOC): `Caliber` frozen dataclass
-(model + effort + fast_mode), `KNOWN_MODELS` / `KNOWN_EFFORTS`
-soft-validation sets, `to_claude_args()` for the CLI flag pair,
-`caliber_from_dict()` for parsing daemon spawn-action JSON
-(tolerant: accepts model_alias, effort_level, fast / fastMode
-field aliases), `merge()` for the override hierarchy, `display()`
-for chatlog/pane rendering ("sonnet·high", "opus·xhigh·fast").
-
-Plumbing threads `caliber: Optional[Caliber]` through:
-  - `Construct.__init__` — appends `caliber.to_claude_args()` to
-    the claude command line when set
-  - `Fleet.spawn` — passes to Construct + emits caliber.display()
-    in the `spawned` meta event payload
-  - `DaemonSession.__init__` — `default_caliber` kwarg + parsing
-    of the daemon's optional model/effort/fast_mode fields via
-    caliber_from_dict
-  - `App.__init__` — `self.default_caliber = Caliber.default()`,
-    threaded to DaemonSession + the three netrunner-direct
-    fleet.spawn call sites
-
-DAEMON_SYSTEM_PROMPT grows CALIBER SELECTION section with the
-four spawn-action fields (model, effort, fast_mode) and
-task→caliber suggested mappings (single-file recon → haiku+low;
-synthesis → opus+high; netrunner-blocked → fast_mode=true on opus).
-Cost asymmetry note included: Haiku ~30x cheaper per token than
-Opus.
-
-Phase 1 explicit non-goals (deferred):
-  - Pool caliber + warm-pool reuse (Phase 2)
-  - Daemon-process caliber (Phase 3)
-  - Quota-aware fallback (Phase 4, blocked on build-plan
-    item 13)
-  - UI surfaces — pane caliber suffix, sidebar line (Phase 5)
-  - fast_mode CLI emission — to_claude_args skips it; settings
-    JSON path lands in Phase 2
-
-Real-deck verified 2026-05-04: caliber unit tests all pass,
-construct command builder picks up caliber args correctly,
-deck startup zero errors. ~370 LOC across caliber.py + 5
-modules edited.
-
-**✅ CALIBER PHASE 2 SHIPPED 2026-05-04** (uncommitted as of this
-state.md update). Pool caliber + warm-pool reuse gating +
-fast_mode emission via per-spawn settings.json overlay.
-
-`SessionPool` grew a `warm_caliber: Caliber` field defaulting to
-`Caliber.default()` (sonnet+high). `_warm_one` warms with that
-caliber so warm sessions are spawned at the right grade.
-`pull(requested_caliber=)` gates on match: matching caliber reuses
-warm; mismatch returns None and the caller spawns fresh. Same
-shape as the existing default-profile-only gating. Mismatches
-emit `pool.caliber_mismatch` bus events for observability.
-
-Empirical observation from Phase 1's real-deck verification log
-(2026-05-04): Claude Code 2.1.126 honors `--model` change on
-`--resume`, so the pool gate is conservative — we *could* skip
-the gate and rely on per-turn model change to do the work. The
-design's principle is "pool warms one caliber"; sticking with
-that for now. Revisit if real-deck shows over-conservative
-fall-throughs to fresh.
-
-`brake_state.make_spawn_settings` grew optional `fast_mode: bool`.
-When True, writes a per-spawn override file at
-`<home>/.cyberdeck/spawns/<cid>.fastmode.json` instead of the
-cache-stable shared `spawn_settings.json`. The shared file's
-cache-stability (the 2026-05-02 cost fix) is preserved for
-fast_mode=False — the common case. fast_mode=True spawns pay a
-`--settings` cache miss; acceptable since fast mode itself is
-the deliberate-cost-for-speed lane (10x cost for 2.5x speed),
-and adding ~30k tokens of cache miss is rounding error against
-that. YOLO + fast_mode now produces a settings file (just
-`fastMode: true`, no hook block).
-
-`Fleet.spawn` threads the bits through:
-  - `pool.pull(requested_caliber=caliber)`
-  - `make_spawn_settings(..., fast_mode=caliber.fast_mode)`
-
-`App` constructs `SessionPool(..., warm_caliber=self.default_caliber)`.
-
-Real-deck verified 2026-05-04:
-  - make_spawn_settings test matrix: shared path for fast_mode
-    =False (caliber-stable), per-spawn override path for True;
-    YOLO+fast still produces a settings file with fastMode: true
-    and no hook block. cleanup_spawn_settings handles override
-    files via the existing non-shared-path branch.
-  - Pool caliber-match gate: matching → returns warm entry,
-    mismatched → returns None, None → bypass gate.
-  - Full deck startup: zero errors, existing event flow
-    unchanged.
-
-~120 LOC across 4 modules.
-
-**✅ CALIBER PHASE 3 SHIPPED 2026-05-04** (scoped down per
-netrunner direction; uncommitted as of this state.md update).
-Daemon caliber: model PINNED to opus, effort is the netrunner's
-power-level knob via Limits modal.
-
-**Design correction mid-implementation.** First draft had T-chat
-directive parsing + mid-flight subprocess restart + a
---daemon-model flag. Netrunner flagged it as overengineered
-("the daemon should always be opus, and its effort should be
-controllable via limits — it is making management decisions").
-Reverted that scope; final shape is much simpler.
-
-Final shape:
-  - Daemon model is always opus. Not configurable. Not in any
-    UI surface. The daemon is a manager doing decomposition +
-    dispatch; capability matters, model variability doesn't.
-  - Daemon effort is the netrunner's power-level knob. Defaults
-    to "high". Configurable via:
-      - --daemon-effort CLI flag
-      - Limits modal: new E keybind opens EffortPickerScreen
-        (1-5 buttons, low/medium/high/xhigh/max). Selection
-        updates Daemon row in the modal; Save/Ctrl+S commits
-        and persists to state.json.
-  - Construct calibers stay daemon-controlled (daemon picks
-    model + effort per spawn based on task; that's where model
-    variability lives). Phase 1+2 already shipped that.
-  - fast_mode stays the netrunner's cost governor (Phase 2
-    reframe). Daemon never picks fast.
-  - daemon_effort applies on next goal start (consistent with
-    other Limits fields). Mid-flight subprocess restart was
-    tried + reverted.
-
-New `EffortPickerScreen` modal is reusable — same widget will
-surface for manual-construct creation (build plan item 0c)
-when that lands. Bakes Anthropic's per-level guidance + the
-"literal vs conceptual" framing (low/medium/high → mostly
-literal execution; xhigh/max → conceptual/abstract reasoning).
-Current effort starred + highlighted in the picker.
-
-LimitsScreen restructured to two-column panel:
-  - Left column: existing numeric caps (max_concurrent,
-    max_total_spawns, pool_size, wedge_timeout, delay_window)
-  - Right column: power levels (Daemon caliber row,
-    fast-mode governor state, construct-caliber reminder,
-    effort guidance blurb)
-  - Modal width bumped 70 → 100 to accommodate columns
-
-DAEMON_SYSTEM_PROMPT gained a "NOTE on YOUR OWN caliber"
-paragraph clarifying that the daemon's own model is pinned;
-daemon picks caliber for CONSTRUCTS, not itself.
-
-Persistence: state.json's limits namespace grows
-`daemon_effort`. CLI flag persists immediately; Limits-modal
-saves persist on Ctrl+S.
-
-Net delta: ~+374 / ~−306 across caliber.py + daemon.py +
-tui.py. Heavy add in tui.py (EffortPickerScreen ~120 LOC +
-LimitsScreen restructure ~100 LOC); heavy remove in caliber.py
-(directive parser ~108 LOC).
-
-**✅ MULTI-SLICE PUSH SHIPPED 2026-05-04** (uncommitted as of this
-state.md update). Seven distinct slices landed in one session
-following the netrunner's "in that order" recommendation:
-
-  1. **Caliber Phase 5** — sidebar daemon line (`daemon: opus·high
-     · fast`), construct pane caliber suffix (dim cyan after
-     [STATE]/[profile] badges, threaded from spawned event
-     payload), watchdog Q&A CALIBER AWARENESS section. Caliber
-     slice now 4/5 (Phase 4 still blocked on quota signal).
-  2. **Tools-UI Thought of Dave sub-features 1+2** (build-plan
-     0c). space on tool/plugin row → LaunchScreen with TOOL: /
-     PLUGIN: envelope; z on tool → manifest info modal; z on
-     plugin → README.md or synthesized info. New `ToolListItem`
-     class for isinstance dispatch. Sub-feature 3 (H haiku
-     research sidebar) deferred — needs subprocess + streaming
-     render in modal.
-  3. **README restructure for public repo** (build-plan 0).
-     Pitch + status callout above the fold, expanded
-     prerequisites, broader architecture section (4 entities +
-     spine + brake + mechanic), Design canon with "what to read
-     first" hints, new Status section, License + contributing.
-  4. **doctor.py first-run check** (build-plan 0a). New module +
-     wire-up in tui.py __main__. Five prereq checks (python
-     ≥3.11, textual, mss, claude binary, claude --version) with
-     PASS/WARN/FAIL + remediation hints. DETECT + SUGGEST, not
-     AUTO-INSTALL. Sentinel at `<home>/.cyberdeck/first_run_
-     complete`; `--doctor` / `--no-doctor` CLI flags. ASCII-only
-     output (Windows cp1252 stdout). Mock-aware (script paths
-     pass via Path.is_file fallback).
-  5. **preferences.py module** (build-plan 0b). Thin wrapper —
-     typed properties (prefs.fast_mode, prefs.daemon_effort,
-     prefs.brake, etc.) + save(**kwargs). Schema docstring with
-     future placeholders (theme, default_profile,
-     keybind_overrides, agent_defaults, last_session_id).
-  6. **Mechanic v0→v1 bridge** — liveness heartbeat. Deck
-     writes `<home>/.cyberdeck/heartbeat` every 5s with timestamp
-     + monotonic. Mechanic reads mtime each tick; logs
-     "STALE HEARTBEAT" warn after 20s (4 missed ticks); logs
-     "heartbeat recovered" on return. v0+1 LOGS ONLY — no
-     automatic action; v1 LLM session triage is deferred.
-  7. **Preferences migration** — tui.py callers of
-     `brake_state.load_limits / save_limits` migrated to
-     `self.prefs.*` accessors. Persistence semantics unchanged
-     (Preferences delegates internally); new code path is the
-     single import surface.
-
-Total ~1300 LOC across 8 commits. Real-deck verification pending
-on most surfaces — netrunner will validate during normal use.
-
----
-
-**✅ ADVISOR — H KEY ON TOOL/PLUGIN ROWS SHIPPED 2026-05-05**
-(uncommitted as of this state.md update). Tools-UI Thought of
-Dave sub-feature 3 (build-plan 0c) closed — slice complete.
-
-**Reframe mid-build.** The original 2026-05-04 design called this
-the "H haiku research sidebar" — a streaming claude-haiku panel
-inside the z-info modal. The netrunner reframed it on pickup:
-not a research panel, an **Advisor**. Per their words:
-
-    "It is extremely specific — exclusively dedicated to
-    informing you about that tool. It does nothing else and
-    exclusively takes questions about the tool and its use
-    cases. The most you can ask it is 'how can I use it to do
-    X' and name other tools in the process. The Advisor can
-    see the names of the full tool list if needed."
-
-The reframe is meaningful: a research panel is open-ended ("tell
-me about ripgrep"); an Advisor is bounded ("how do I use ripgrep
-to do X"). The system prompt enforces this — off-topic questions
-get a polite refusal + redirect to the relevant sibling Advisor
-or the daemon. Narrow scope = high signal = cheap per-call =
-exactly the kind of capability accumulation philosophy thesis 2
-calls out.
-
-**Substrate.** Watchdog-pattern one-shot subprocess
-(`claude -p` per question, stdin-piped prompt) — not streaming.
-Three reasons:
-  1. Multiple Advisor sessions can stack across a deck-use
-     session (netrunner asks about ripgrep, then jq, then back
-     to ripgrep on a different question); a streaming subprocess
-     per session would be heavyweight.
-  2. Multi-turn context within ONE Advisor session is cheap to
-     pass in the user prompt itself (PRIOR Q / PRIOR A pairs
-     prepended). No `--resume` machinery needed.
-  3. Total Q&A volume per session is small; one-shot latency
-     (a few seconds on cache hit) beats streaming-subprocess
-     complexity for this use case.
-
-**Caliber.** Forced haiku + low. Tool advice is lookup-and-format,
-not deep reasoning. Cost asymmetry vs Opus (~30x per token) is
-exactly what we want exploited here. Reified as `ADVISOR_MODEL`
-+ `ADVISOR_EFFORT` constants in advisor.py — modal renders them
-in the subtitle (`haiku·low · scope: questions about ripgrep
-only`) so the netrunner sees what they're paying for.
-
-**System prompt.** Built per-session from the AdvisorTarget
-view-model (name + kind label + invocation + description +
-help_text + extended_text + availability + source path) plus
-the names of all sibling tools/plugins. Scope rule baked in
-as the centerpiece. Stable across all turns in one session
-(cache-friendly — same shape as the 2026-05-02 cache-fix
-discipline).
-
-**Sibling list — names only.** The Advisor is allowed to
-mention other tools by name when answering "how would I
-combine X with Y" questions, but it must NOT pretend to know
-how those siblings work — its expertise is bounded to the
-target. Names give it enough vocabulary to redirect ("for
-that, you'd want jq — open the Advisor on jq for details")
-without putting unfounded claims in its mouth. Filter
-excludes the target's own name from its sibling block (small
-thing, but the prompt reads cleaner).
-
-**Modal UX.** AdvisorScreen — cyan accent, RichLog scrollback
-+ Input pinned below, greeting on mount echoes the scope rule
-("Advisor scoped to ripgrep · available · Ask anything about
-how to use this tool. Off-topic questions are politely
-refused."). y yanks the visible Q&A as plain text (Q: …\nA: …
-per turn); Esc/H closes. Failed turns render as
-`A: advisor failed: <reason>` in red — netrunner can re-ask
-without the modal crashing.
-
-**Wiring — modal-scoped, not App-scoped.** First pass had `H`
-bound at App level firing on the focused list-item. Netrunner
-course-corrected mid-session: "I was hoping this would be
-something contextual for when the tool was in expanded view."
-Reverted that and moved the binding into ExpandModal.
-Final shape:
-
-  1. Press `z` on a tool/plugin row → ExpandModal opens with
-     synthesized info text (existing z-info path, sub-feature
-     2). The modal renders a prominent cyan "press H for
-     interactive help" hint above the manifest text, and `h
-     Advisor` shows up in the bottom hint line. Both are
-     conditional on the modal carrying an `advisor_target` —
-     other ExpandModal modes (chatlog magnify, file viewer,
-     fleet log magnify) leave `advisor_target=None` and the
-     hints are absent.
-  2. Press lowercase `h` inside the modal → ExpandModal
-     dismisses + AdvisorScreen pushes on the App. Netrunner
-     reads about the tool, then asks the Advisor about it —
-     contextual flow.
-
-ExpandModal grows two new constructor params:
-`advisor_target: Optional[AdvisorTarget]` and
-`advisor_siblings: tuple[str, ...]`. Both threaded through
-`_open_text_view` and `_open_file_view` from
-`action_expand`'s ToolListItem and PluginListItem branches.
-New helper `_build_advisor_siblings(target_name)` on the App
-centralises the sibling-name list (filters out target's own
-name; orders tools before plugins to match the unified Tools
-panel ordering).
-
-Lowercase `h` not capital — the netrunner asked for that
-shape; aligns better with future hjkl navigation work, keeps
-the deck-wide keymap lighter, and the "press H" tooltip
-casing is purely a display affordance (uppercase for
-readability — same convention vim uses showing :H even when
-the binding is :h).
-
-**Plugin path** reads README.md at modal-open time (best-effort,
-200KB cap, errors fold to manifest-only system prompt). README
-is the LLM-facing interface doc per plugin spec — feeding it
-into the Advisor's system prompt is what makes plugin Advisors
-actually useful (the dataclass description is one line; READMEs
-have flag tables, examples, troubleshooting).
-
-**Files.** New `advisor.py` (~330 LOC): `AdvisorTarget` dataclass
-(view-model), `AdvisorTurn` dataclass (Q+A record),
-`build_system_prompt`, `build_user_prompt`, `Advisor` class
-(async oracle with asyncio.Lock serialization),
-`target_from_tool` / `target_from_plugin` adapters (duck-typed
-to avoid import cycles). tui.py: `AdvisorScreen` modal (~200
-LOC after AskWatchdogScreen pattern), `action_advise_focused`
-(~70 LOC) + H binding. Total ~600 LOC.
-
-**Real-deck verification pending** — wiring smoke-tested
-(advisor module unit checks all pass: target builders,
-system-prompt composition, multi-turn user prompt with
-failed-turn exclusion, sibling-name filter). AdvisorScreen
-import + H binding registration confirmed. Subprocess path
-mirrors Watchdog._process_oneshot exactly, so behavior parity
-expected.
-
----
-
-**🚨 ROUND-2 FIX: AUTO-CONTEXT DISCOVERY (2026-05-05).**
-First real-deck Advisor pass exposed two failures:
-
-  1. The model lost track of its scope anchor and asked the
-     netrunner to clarify which plugin — already-told-you-which
-     information. Sonnet/medium follows narrowly-scoped prompts
-     more reliably than Haiku/low; bumped caliber.
-  2. The model answered using content from the deck's project-
-     root CLAUDE.md ("From the CLAUDE.md, I know the deck has a
-     plugin system…"). NOT a tool-use leak — verified against
-     https://code.claude.com/docs/en/memory: **Claude Code
-     auto-loads CLAUDE.md from cwd + walks UP the parent dir
-     tree concatenating all of them**, plus user-level
-     `~/.claude/CLAUDE.md`, plus per-git-repo auto memory
-     (`~/.claude/projects/<repo-key>/memory/MEMORY.md`, first
-     200 lines / 25KB). All silently. None of it is what the
-     Advisor is supposed to know.
-
-Tactical Advisor fix shipped 2026-05-05 (took three rounds):
-  - **Round 2** tried `--bare` for one-flag suppression. Real-deck
-    caught a silent exit-1 on every spawn. Cause: `claude --help`
-    reveals `--bare` "Anthropic auth is strictly ANTHROPIC_API_KEY
-    or apiKeyHelper via --settings (OAuth and keychain are never
-    read)" — and the netrunner's deck uses OAuth/keychain via
-    Claude Max. **Filed as a gotcha** (see Filed gotchas + the
-    `🚨 GOTCHA` block on build-plan item 000): don't `--bare`
-    any OAuth-auth'd subprocess.
-  - **Round 3 (final, working).** Dropped `--bare`; used env
-    vars + `--disable-slash-commands` instead. Each is
-    independently documented and doesn't break auth:
-      - `--system-prompt` (REPLACES the default)
-      - `--tools ""` (disables every built-in tool)
-      - `--disable-slash-commands` (skips skills + slash cmds —
-        what `--bare` was doing for those layers)
-      - `--no-session-persistence` (no transcript per Q)
-      - env: `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` /
-        `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` /
-        `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`
-        (per-subprocess scope via `env=` kwarg to
-        `create_subprocess_exec` — doesn't pollute the deck's
-        own env or anything else on the system)
-  - Caliber bump: haiku/low → sonnet/medium
-  - System prompt rewrite: sharper identity anchor ("YOU ALREADY
-    KNOW WHICH TOOL"), restructured for salience (lead with
-    HARD RULES, then content, then style)
-  - Round-3 verified end-to-end against real claude on the
-    netrunner's machine: ripgrep advice query returns clean
-    formatted answer; "what is the cyberdeck" deck-context query
-    correctly fails to recognize the term (CLAUDE.md properly
-    suppressed).
-
-Plus AdvisorScreen w/s line-scroll bindings (active when Input
-defocused via Tab) — netrunner asked for vim-shaped scroll on
-the scrollback. PgUp/PgDn for paging preserved.
-
-**The systemic discovery is much bigger than the Advisor.**
-Every subprocess the deck spawns — daemon, watchdog,
-constructs, pool warmers, tripwire-authoring spawns — has been
-silently inheriting the deck's project-root CLAUDE.md (~700
-lines of build plans, design notes, gotchas, in-flight slice
-descriptions). Likely explains:
-  - The "mysterious knowledge" the daemon and constructs have
-    always seemed to have of the deck's architecture.
-  - The residual ~19k cache_creation per spawn that the
-    2026-05-02 cache fix left unresolved (filed as "Anthropic's
-    court" — actually CLAUDE.md drift across sessions).
-  - Information leakage of in-flight design work into every
-    spawned construct.
-
-**Filed as build-plan item 000** — highest-priority deferred
-slice, ranks above the architecture review. Per-role spawn
-cwds + per-role CLAUDE.md per role + bootstrap-on-launch
-infrastructure. Estimated 600-1000 LOC across spawn sites +
-new bootstrap module + canon doc updates. Needs careful A/B
-verification because the daemon and constructs may have been
-free-riding on CLAUDE.md content; removing the auto-load will
-reveal under-specified system prompts.
-
----
-
-**✅ ITEM 000 — FIRST PHASE SHIPPED 2026-05-05** (uncommitted as
-of this state.md update). Per-role env-var belt applied to the
-spawn sites that should NOT auto-load CLAUDE.md. Driven by the
-netrunner's real-deck observation that constructs still knew
-the deck's project memory after the Advisor-only fix.
-
-**Per-role policy** (netrunner calls 2026-05-05):
-
-  | Role | Auto-load CLAUDE.md | Why |
-  |------|---------------------|-----|
-  | Advisor | KILLED (round-3) | Strict per-tool scope |
-  | Construct | KILLED | Task-scoped; in-flight design notes are not theirs to see; cache cost |
-  | Daemon (both backends) | KILLED | Coordinator already has its operational protocol in system prompt; cache cost |
-  | Pool warmer | KILLED | Becomes a construct on pull |
-  | Tripwire-authoring Watchdog | KILLED | Reduces false-positive examples (netrunner: authoring "seems overzealous"); curated gotchas addendum filed as build-plan 0000 follow-up |
-  | Watchdog Q&A (both) | **KEPT** | Deck's "security analyst" — knowing gotchas + design context helps Q&A reasoning |
-
-**Implementation.** ~80 LOC across three modules:
-
-  - `construct.py` (covers Construct + daemon-one-shot via
-    Construct + pool warmers via Construct): env-var belt
-    threaded through `Construct.spawn`'s `create_subprocess_exec`.
-  - `daemon.py` streaming (`_spawn_streaming`): env-var belt.
-  - `watchdog.py` tripwire authoring (`author_tripwires`): env-
-    var belt. Q&A paths (`_process_streaming` + `_process_oneshot`)
-    deliberately untouched — they KEEP CLAUDE.md.
-
-Each spawn site builds its own per-spawn env dict
-(`{**os.environ, "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1", ...}`)
-and passes via `env=env` to `create_subprocess_exec`. Per-
-subprocess scope; does not mutate the deck's own env or
-anything else on the system.
-
-**Verified**: Python-side audit confirms each spawn site has the
-right env-var presence/absence per the policy table. Real-deck
-verification pending — netrunner will observe whether daemon /
-constructs regress without their CLAUDE.md context (filed as a
-risk in item 000's design doc; the risk reads "may have been
-free-riding"). If they regress, the next slice is role-file
-injection (full item 000) to replace the lost auto-load with
-curated role-specific content.
-
-**Filed as build-plan item 0000** (above 000): tripwire-
-authoring "gotchas" addendum. Real-deck-tunable curated content
-that teaches the authoring spawn what NOT to fire on (false-
-positive guidance) and what genuine red flags look like.
-Composes via `--append-system-prompt-file` on top of the
-existing TRIPWIRE_AUTHORING_SYSTEM_PROMPT.
-
----
-
-**✅ MECHANIC v1 LLM-SESSION HALF SHIPPED 2026-05-06.**
-Diagnose-only triage that fires when the deck dies uncleanly.
-Closes build-plan item 0e.
-
-The supervisor (mechanic.py v0) already reaped orphan claude
-subprocesses on deck death; v1 adds a `claude -p` triage call
-AFTER cleanup that reads the just-died deck's log file and
-produces a structured Markdown report explaining what happened.
-
-**Module split.** New `mechanic_triage.py` (~480 LOC) holds the
-LLM-session half — TriageRequest / TriageResult dataclasses,
-MECHANIC_SYSTEM_PROMPT (Family A, full-replace; carries the
-deck architecture vocabulary the triage needs since CLAUDE.md
-auto-load is suppressed), build_user_prompt /
-_load_log_tail / _build_report_path helpers, and the
-synchronous `run_triage(req) -> TriageResult` entry point.
-Kept separate from mechanic.py because the LLM session lifecycle
-(one-shot per crash) and dependencies (subprocess.run + tempfile)
-are distinct from the supervisor's loop.
-
-**Clean-spawn recipe** (same as Advisor, Family A):
-  - `--system-prompt-file` (argv-newline truncation gotcha
-    applies — the system prompt is ~5900 chars, would lose
-    everything after first newline if passed as argv)
-  - `--tools "Read,Glob,Grep"` (read-only — triage can read the
-    log + walk deck source for gotcha lookups, but no Bash, no
-    Write, no Edit)
-  - `--disable-slash-commands` (no skills firing during triage)
-  - `--no-session-persistence` (don't save transcripts of
-    triage Q&A)
-  - `--add-dir <deck-source-dir>` (so Read/Glob/Grep can target
-    the deck source from the supervisor's cwd)
-  - `--permission-mode bypassPermissions` (read-only tools have
-    no side effects; permission prompts would just block)
-  - env: CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 / DISABLE_AUTO_MEMORY=1
-    / DISABLE_GIT_INSTRUCTIONS=1 (suppress claude code's silent
-    auto-loads)
-  - Caliber: sonnet/medium
-
-**System prompt** carries: deck architecture vocabulary (four
-runtime entities, brake / tripwire / blacklist primitives, log
-record kinds), triage method (find death point → identify
-state at death → match against filed gotchas via Read on
-Design Files/cyberdeck-state.md → reason about causes → suggest
-next steps), output format (structured Markdown with Summary /
-Death point / State / Plausible causes / Filed-gotcha matches /
-Next steps / Cleanup status sections, ~1200 word target), and
-hard constraints (READ-ONLY, NO AUTOMATIC FIXES, HONEST ABOUT
-UNKNOWNS, BRIEF).
-
-**mechanic.py integration.** After subprocess cleanup, checks
-clean_close_reason. If "shutdown" or "eject" → skip triage
-(deliberate close, triage adds noise). Otherwise (None or any
-other value → unclean exit) → fire run_triage synchronously.
-Result: report writes to `<log-basename>-triage.md` next to the
-original log; one-line summary printed to mechanic stderr; full
-report sits on disk for the netrunner to read post-mortem.
-Best-effort throughout — any failure produces a stub report
-("Triage failed: <reason>") so the netrunner has SOMETHING to
-find next to every crash log.
-
-**New CLI args on mechanic.py:** `--no-triage` (disable; useful
-on known-flaky branches), `--triage-timeout` (default 180s),
-`--claude-bin` (path override matching deck's CLAUDE_BIN env
-var if set elsewhere).
-
-**v1 scope per maintbot design doc:** unclean-exit triage only.
-Two paths deferred:
-  - **Stale-heartbeat triage** (deck PID alive but TUI wedged):
-    filed for v1.5 — needs design around log-write-vs-read race
-    while the deck is still writing.
-  - **Deliberate summon** (netrunner UI button to ask "what's
-    going on" mid-flight): filed for v2 — needs UI plumbing.
-v3 (autonomous correction / relaunch) deferred indefinitely
-per the design doc's explicit non-goals.
-
-**Verified.** Module imports clean. CLI args registered + show
-in `mechanic.py --help`. Shape-tested against an actual on-disk
-log: log-tail extraction works (30,968 bytes within 200KB cap),
-report-path computed correctly (`<basename>-triage.md` next to
-log), user-prompt rendered (31,699 chars, contains expected
-markers). Real-deck verification pending: force-kill the deck
-process, observe mechanic stderr for "firing v1 triage" → check
-that `<log-basename>-triage.md` lands with a structured report.
-
-**Real-deck verified 2026-05-06**: force-kill produced a
-beautiful triage report (~2 minutes, sonnet/medium reading the
-30k log + walking design files for gotcha matches). Report at
-`cyberdeck-2026-05-06-204828-triage.md` correctly identified
-`STATUS_CONTROL_C_EXIT`, matched the filed gotcha verbatim,
-captured state at death (running constructs + tripwires +
-daemon state), proposed three causes ranked by confidence,
-gave concrete next steps. Plus a follow-up Ctrl+Q test caught
-the bug where `_drive_fleet`'s async finally-block teardown
-wasn't reliably writing the shutdown footer — fixed via
-explicit `deck_logger.close(reason="shutdown")` in
-`action_quit`'s idle path (filed as gotcha + fix shipped same
-day).
-
----
-
-**✅ MECHANIC v1.5 STALE-HEARTBEAT TRIAGE SHIPPED 2026-05-06.**
-Closes the "deck PID alive but TUI wedged" gap that v0+1
-detected but only logged. Mechanic story now 5/5 phases shipped
-(v0 supervisor, v0+1 heartbeat bridge, v1 unclean-exit triage,
-v1.5 stale-heartbeat triage; v2 deliberate summon and v3
-autonomous correction remain deferred per design).
-
-**Why it needed a different shape than v1.** Real-deck
-observation from the netrunner: heartbeat goes stale when the
-machine is SUSPENDED, not just when the TUI wedges. Auto-firing
-on every stale event = ~$0.10 + 2 minutes per machine suspend.
-Bad cost story.
-
-**Design.** On stale heartbeat, prompt the netrunner
-interactively (y/N to stderr) instead of auto-firing. While
-waiting for the answer, keep polling heartbeat:
-  - If heartbeat recovers → print recovery notice. The prompt
-    thread is still blocked on input(); when the netrunner
-    eventually answers, supervisor checks current heartbeat
-    state and skips triage if recovered (regardless of what
-    they typed).
-  - If netrunner answers 'y' AND heartbeat still stale →
-    force-kill the deck (graceful SIGTERM via existing
-    `kill_pid()` helper) so the log gets finalized, then run
-    the same finalize+triage flow v1 uses with a
-    `wedge_kill_context` flag set on the TriageRequest.
-  - If netrunner answers 'n' / Enter → dismiss; supervisor
-    re-arms the prompt only after heartbeat recovers
-    (DISMISSED → IDLE transition). Prevents repeated
-    re-prompts within one stale window.
-
-For headless / wall-mount deployments, new
-`--auto-triage-on-stale` CLI flag bypasses the prompt and goes
-straight to kill+triage on stale detection.
-
-**Implementation.** ~250 LOC across two modules.
-  - `mechanic.py`: state machine
-    (`_HeartbeatState.IDLE / PROMPTING / DISMISSED`),
-    `_ask_triage(response, age)` daemon-thread prompt helper,
-    kill-then-break path that drops into the existing v1
-    finalize+triage flow with `wedge_kill_context` set.
-  - `mechanic_triage.py`: `TriageRequest.wedge_kill_context`
-    field; `build_user_prompt` branches on it to add a
-    STALE-HEARTBEAT CONTEXT block; `MECHANIC_SYSTEM_PROMPT`
-    extended with "two paths" frame (Path A natural death vs.
-    Path B supervisor force-killed). Path-B-specific guidance
-    ("no Python traceback expected; focus on what the TUI
-    was doing right before the heartbeat stopped") + suspend
-    false-positive detection guidance for `--auto-triage-on-
-    stale` users.
-
-**Threading model.** The prompt is `input()` running on a
-daemon thread; supervisor's main loop polls a shared
-`response` dict each tick. We don't try to interrupt
-`input()` mid-call (Python doesn't expose a clean way on
-Windows); instead, when heartbeat recovers we just log a
-recovery notice and let the netrunner know they can dismiss.
-The eventual answer gets cross-checked against current
-heartbeat state — recovered → no-op regardless of yes/no.
-
-**Verified.** Both modules import clean. `--auto-triage-on-
-stale` flag registers in `--help`. Surface tests confirm:
-  - `_HeartbeatState` constants exist
-  - `_ask_triage` helper present
-  - `TriageRequest.wedge_kill_context` accepts string + None
-  - `build_user_prompt` includes STALE-HEARTBEAT CONTEXT block
-    when context set; omits cleanly when None
-  - `MECHANIC_SYSTEM_PROMPT` has Path A + Path B sections
-
-**Real-deck verification opportunity:** suspend the machine
-and observe heartbeat staleness → prompt fires → resume
-machine → heartbeat recovers → supervisor announces
-"recovered, dismiss the prompt above" → press Enter to
-clear. Or force-wedge the TUI (livelock between async tasks
-would do it) → confirm prompt → 'y' → confirm deck killed +
-triage report lands with the STALE-HEARTBEAT CONTEXT block
-in the report.
-
----
-
-**✅ MECHANIC TRIAGE LIVE-NARRATION SHIPPED 2026-05-06.**
-Real-deck observation: triage spawn went radio-silent for ~2
-minutes ("a thousand fucking years" — netrunner) while reading
-log + walking design files. The original `subprocess.run`
-captured stdout end-to-end, so the mechanic window showed
-nothing until the LLM finished. Felt like a hang even when
-working correctly.
-
-Fix: streaming output via `--output-format stream-json --verbose`,
-read events line-by-line on a daemon thread, pretty-print one
-short line per significant event to mechanic's stderr.
-
-What the netrunner now sees in the mechanic window:
-
-  [mechanic] firing v1 triage (unclean exit; reason=None); ...
-  [mechanic.triage] session started · model=sonnet
-  [mechanic.triage] thinking: Looking at the death point in the log...
-  [mechanic.triage] Read: logs/cyberdeck-2026-05-06-204828.log
-  [mechanic.triage] tool result: 30968 chars
-  [mechanic.triage] thinking: Matching against filed gotchas...
-  [mechanic.triage] Read: Design Files/cyberdeck-state.md
-  [mechanic.triage] tool result: 87341 chars
-  [mechanic.triage] Grep: 'STATUS_CONTROL_C_EXIT' in Design Files/...
-  [mechanic.triage] tool result: 412 chars
-  [mechanic.triage] writing: # Triage report — cyberdeck-...
-  [mechanic.triage] result received (8743 chars)
-  [mechanic] triage written (47.3s) -> .../cyberdeck-2026-05-06-...-triage.md
-
-Same total wall time, but the netrunner sees what's happening
-in real time. Crucial for debugging "is it stuck or just slow"
-— a stuck triage now shows up as repeated reads of the same
-file (sign of confused model) rather than just dead air.
-
-**Implementation.**
-  - New `_emit(line)` helper (write+flush to stderr; no
-    buffering or live narration starves)
-  - New `_truncate(text, n)` helper (single-line cap with
-    ellipsis for stderr display)
-  - New `_print_triage_event(event)` pretty-printer mapping
-    stream-json event kinds to short narration lines:
-      system.init → "session started · model=X"
-      assistant.thinking → "thinking: <80-char preview>"
-      assistant.text → "writing: <80-char preview>"
-      tool_use Read → "Read: <file_path>"
-      tool_use Glob → "Glob: <pattern>"
-      tool_use Grep → "Grep: <pattern>[ in <path>]"
-      tool_use other → "<tool> tool"
-      tool_result → "tool result: <N> chars"
-      tool_result is_error → "tool error: <N> chars"
-      result → "result received (<N> chars)"
-      rate_limit_event / partial chunks → silent (noise filter)
-  - `run_triage` swapped from `subprocess.run` (blocking,
-    captures all output at end) to `subprocess.Popen` with
-    stdin/stdout pipes + stderr passthrough. Daemon reader
-    thread pulls events off stdout line-by-line, prints to
-    stderr, collects the final result event's `result` field.
-    Main thread does `proc.wait(timeout=req.timeout)`; on
-    TimeoutExpired, kill the proc + finalize as failure.
-    Reader thread joined post-wait with 5s grace to drain any
-    last-moment events.
-
-**Stderr passthrough.** claude code's own error output (rare
-but possible) flows directly to mechanic stderr without
-intermediate capture — the netrunner sees authentication
-errors, network errors, etc. immediately.
-
-**Verified.** Synthetic event tests cover all event types
-(system.init, thinking, text, Read/Glob/Grep tool_use,
-tool_result with/without is_error, result, rate_limit
-silence). Plumbing tests confirm cmd-construction has all
-streaming flags (`--output-format stream-json`, `--verbose`)
-and old blocking patterns (`subprocess.run`,
-`capture_output`) are gone.
-
-Real-deck verification: trigger an unclean exit, watch
-mechanic stderr — should narrate the triage live event-by-
-event rather than going silent for ~2 minutes.
-
----
-
-**Next session picks up at: open netrunner choice.**
-  - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
-    build-plan item 13.
-  - Mechanic v1 LLM-session half — bigger lift; needs the LLM
-    triage flow design + claude subprocess management for the
-    supervisor side. The bridge slice (heartbeat) gives v1 its
-    detection signal.
-  - Remaining discrete bugs (kill doesn't interrupt in-flight;
-    silent wedge cx-796e0468) — both deferred pending design /
-    more data points.
-  - Architecture review fires 2026-06-01 09:00 EDT (taskId
-    `cyberdeck-architecture-review`). Will phase-check current
-    state and produce structured findings if at a clean
-    boundary.
-
-Architecture review scheduled 2026-06-01 09:00 EDT.
-
-Two discrete bugs from earlier remain deferred (not fixable
-today):
-  - Kill doesn't interrupt in-flight assistant turns — design
-    alongside future inject-and-interrupt v2
-  - Silent wedge investigation (cx-796e0468 case — empty
-    stderr_excerpt; needs more real-deck data points)
-
-**Big design doc waiting**: tools/plugins/profiles retool. Filed
-2026-05-02; not implemented. 4-5 sessions of focused work. Pick
-up with phase 1 (tools registry + hot-reload + missing-tool
-grey-out) as the smallest shippable slice.
-
-**Old "next up" wedge-timeout note (now ✅):** see commit f3f6f2d.
-
-**SAFETY ARCHITECTURE PASS** — 4/4 COMPLETE.
-slice 1 (MCP gating, ✅), slice 2 (tripwire escalation chain, ✅),
-slice 3 (variable-outcome delay UX phases 1+1.5+2, ✅), slice 4
-(DEFAULT_TRIPWIRES expansion, ✅ partial — `host_restart_command`
-shipped 2026-05-01 commit 2a53e0e; bigger expansion deemed
-unnecessary now that real-deck-confirmed LLM authoring
-consistently produces shell-destructive baselines). The pass is
-historical record now. Composable cluster addressing the structural
-truth surfaced by real-deck testing + log analysis: **the brake
-hook is doing 95% of real safety work; most other "safety"
-layers don't compose with it.** Tripwires were observation-only
-until slice 2 wired the escalation chain. Profiles are pure
-prescription (zero security weight by design). Watchdog had
-teeth only at spawn-time via Blacklist refusal until slice 2
-gave its tripwires actual block-and-kill power. See the
-**Safety architecture analysis** section below for full layer
-breakdown.
-
-Four composable slices, current state:
-
-1. **✅ MCP gating in `brake_hook.py`** — SHIPPED 2026-04-30 (late, slice 1/4).
-   Verb-based pattern matching added: `MCP_READ_VERBS` (get, list,
-   search, describe, fetch, show, read, view, peek, check,
-   validate, inspect, find, query, lookup, count, exists, has,
-   is, diff) and `MCP_DESTRUCTIVE_VERBS` (execute, apply, send,
-   delete, create, update, deploy, drop, merge, migrate, pause,
-   restore, reset, rebase, write, edit, kill, terminate, cancel,
-   abort, remove, destroy, purge, clear, revoke, archive,
-   unarchive, transfer, move, rename, replace, override, add,
-   save, post, patch, put, push, publish, install, uninstall,
-   enable, disable, start, stop, run, invoke, authenticate,
-   authorize, login, logout, complete, confirm, approve, reject,
-   lock, unlock, grant, deny, subscribe, unsubscribe, schedule,
-   trigger, fire, build, compile, release, upload, download).
-   `extract_mcp_verb` parses `mcp__<server>__<verb>_<noun>` and
-   returns the verb. Default brake denies destructive + unknown
-   verbs (default-deny is intentional — new MCP servers should
-   require explicit categorization in brake_hook.py rather than
-   auto-flowing through). Paranoid denies ALL `mcp__*` wholesale
-   (even read-shaped MCP is a network query against an external
-   service). YOLO unchanged (no hook installed). +90 LOC, no
-   regressions on non-MCP tools. Real-deck verified against all
-   34 of the netrunner's connected MCP tools (Supabase / Gmail /
-   Drive / Calendar): 13 allow, 21 deny under default; all 34
-   deny under paranoid; all 34 allow under YOLO. End-to-end
-   construct-level test confirmed via the netrunner's actual
-   Supabase project (read calls executed, writes denied with
-   the new error message, paranoid mode blocked reads, YOLO
-   bypassed everything as designed).
-
-   Per-spawn allowlist override (netrunner explicitly opts a
-   construct into a normally-denied verb) is filed as a
-   follow-up — needs UI design (probably composes with the
-   variable-outcome pause UX in slice 3).
-
-2. **✅ Tripwire escalation chain** — SHIPPED 2026-04-30 (late,
-   slice 2/4). Tripwires now have teeth: severity-driven
-   escalation turns them into INPUTS to the existing hard-gate
-   layers (brake / blacklist) rather than a parallel observability
-   silo. Wired:
-   - `low` → log only (unchanged)
-   - `warning` → log + brake hook denies next tool call from this
-     construct with `description` + `suggestion` in stderr.
-     Construct sees a normal `tool_result.is_error` and decides
-     how to pivot.
-   - `critical` → log + brake hook denies + tui handler calls
-     `fleet.kill_construct(cid)` via `run_worker`. Construct
-     terminates entirely.
-   - `critical + bad_enough=true` → all of the above; auto-
-     blacklist proposal is filed but NOT auto-applied yet (waits
-     for the variable-outcome pause UX in slice 3 for the approval
-     window).
-   Mechanism: TripwireEngine writes per-construct
-   `<home>/.cyberdeck/spawns/<cid>.deny_pending.json` on warning
-   /critical fires. Brake hook reads + clears that file at every
-   invocation; if present, denies the call with the recorded
-   reason. Race mitigation: 100ms recheck for write-class tools
-   (Write/Edit/NotebookEdit/Bash/PowerShell + MCP destructive
-   verbs) — read-only tools skip the recheck, no latency penalty.
-   Authoring prompt rewrite: forbids the "brake handles X so
-   tripwire skips X" depth-of-defense antipattern that produced
-   the `rm(?!\s+-rf)` negative-lookahead on a prior session.
-   New schema fields on Tripwire: `description`, `suggestion`
-   (warning), `bad_enough` (critical). Real-deck verified
-   2026-04-30 (late) via cx-279d4ae8 bait construct: 4 critical
-   tripwires fired simultaneously on a single Bash echo, all
-   logged to chatlog with red-bold styling, brake hook denied
-   with the new message format, construct auto-termed via the
-   bus subscriber. Plus authoring confirmed working with the
-   new schema (6 patterns including bad_enough flags on
-   shell-destructive baselines).
-
-3. **Variable-outcome pause UX** (re-frame from netrunner). Brake
-   state determines DEFAULT ACTION; pause window is netrunner's
-   chance to OVERRIDE.
-   - YOLO → pause-before-allowing (Z to deny)
-   - Default → pause-before-denying-destructive (Z to override deny)
-   - Paranoid → pause-before-anything (Z to override deny)
-   Brake hook delays N seconds (configurable in Limits modal as
-   `pause_window_seconds`, default 0 = no pause = current
-   behavior). New tool-calls bus-driven sticky panel shows
-   pending calls with countdown + Z-keybind to negate the default
-   action. Subsumes the original "review delay" filing
-   (continues-unless-killed) — replaced because failsafe-deny
-   was wrong fit for autonomous parallel work; brake-state-as-
-   default + netrunner-override is the right shape. Also
-   subsumes parts of the kill-deny in-flight tool calls and
-   sticky tool-call surface filings — the panel is the surface,
-   the kill-flag check is one of the conditions the brake hook
-   evaluates during the pause window.
-
-4. **DEFAULT_TRIPWIRES expansion + authoring prompt fix** —
-   PARTIAL. Authoring prompt fix shipped with slice 2 (the
-   antipattern guard). Default-set expansion: ¼ shipped
-   2026-05-01 — `host_restart_command` (warning) lifted from a
-   construct-authored artifact (`cyberdeck-home/tripwire_restart_
-   commands.py`) into `DEFAULT_TRIPWIRES`. Now 3 defaults ship:
-   `keyword_credentials` (low), `keyword_destructive_sql`
-   (warning), `host_restart_command` (warning, with suggestion).
-   Still pending: shell-destructive baselines (rm -rf, format,
-   dd, mkfs, fork bombs, shutdown) at critical severity for the
-   pre-authoring-runs window. (Counterargument: real-deck
-   2026-05-01 confirmed LLM authoring is now consistently
-   producing these patterns at critical+bad_enough on every
-   goal-set — the authoring prompt fix may be sufficient. Pre-
-   authoring window is short. Re-evaluate if the gap matters in
-   practice.)
-
-**Also-shipped this session (kill audit cluster):**
-- ✅ Kill audit (commit 72ee5e9, 2026-04-30 late): every kill
-  site now passes a source/reason label that's stamped on the
-  finalize event's `kill_source` field + emitted as a real-time
-  `fleet.kill_requested` bus event. Sources: `netrunner_k`,
-  `netrunner_shift_k`, `inject_interrupt`, `tripwire_critical:
-  <name>`, `eject`, `fleet_shutdown`, `fleet_wedge_timeout`. The
-  ~36s mystery kills from earlier sessions are now explicable —
-  they're all `fleet_wedge_timeout`. Real-deck verified.
-- ✅ Tui dupe-pane fix (commit daf6f6d, 2026-04-30 late): every
-  call to `_drive_fleet` was accumulating bus subscriptions for
-  `_handle_event` and `_scan_for_tripwires` without unsubscribing
-  prior handles. Each post-EJECT `_drive_fleet` rerun added a
-  new pair, multiplying spawn-handler fires per fleet event and
-  mounting orphan ConstructPanes. Bug latent since Phase 8.
-  Fixed by tracking handles on `self._fleet_event_sub` /
-  `self._fleet_tripwire_scan_sub` + unsubscribe-before-resubscribe.
-  Defensive `_spawn_pane` check skips + chatlog-warns if the
-  cid already has a pane.
-
-**Filed for next session (post-wedge-diagnostic):**
-- `PendingOutcome` should carry `kill_source` so daemon can
-  reason about retries (today the daemon hedges in narrative —
-  "killed (likely by netrunner or timeout)" — because it can't
-  see the source). Daemon system-prompt + outcome-format change.
-- `deny_pending.json` overwrites on multi-fire — when multiple
-  tripwires fire simultaneously on the same call, only the last
-  writer's reason reaches the brake hook (chatlog shows all).
-  Acceptable for v1; could append to a list-shaped flag later.
-- Per-run workspace compartmentalization (build-plan item 8) —
-  bumped from "filed for later" to "ready to ship" priority
-  after real-deck-confirmed accumulation of construct artifacts
-  in flat `cyberdeck-home/` (e.g. the test_tripwire_restart.py
-  artifacts that surfaced this session).
-
-Then: slice 3 (variable-outcome pause UX, the largest safety-
-pass piece); caliber selection (per-spawn model + effort +
-fast-mode); daemon narrative fixes (mislabel + over-volunteer);
-log-readability overhaul; Mechanic v1.
-
-**Safety architecture analysis (2026-04-30, late):** explicit
-audit of how brake / tripwires / profiles / watchdog actually
-compose today vs. how they were intended to compose. Filed because
-the layer breakdown is the shared mental model for the safety
-architecture pass and saves re-deriving it next session.
-
-**Layer-by-layer weight:**
-
-| Layer | What it does today | Hard or soft | Real weight |
-|---|---|---|---|
-| **Brake hook** | PreToolUse regex/path patterns; deny destructive | HARD per-call | Carrying ~all actual prevention |
-| **Watchdog Blacklist** | Spawn-time fingerprint refusal | HARD at spawn only | Niche, netrunner-driven |
-| **Claude's refusal layer** | Model decides "no" before tool use | SOFT, model-dependent | Caught the rm-rf test; can't rely on it |
-| **Tripwires** | Pattern-scan stream events, fire chatlog markers | OBSERVATION ONLY | Decoration. Construct never sees them. |
-| **Profiles** | System-prompt addendum + recommended_tools hint | SOFT steering | Behavior shaping, zero security |
-| **Watchdog Q&A** | Bus-snapshot context for `t` queries | OBSERVATION ONLY | Post-hoc analysis |
-
-**Three structural truths surfaced:**
-
-1. **Brake hook is doing 95% of safety work alone.** Everything
-   else is observation, soft steering, or niche refusal. If brake
-   misses a pattern (MCP gap, future Claude Code tools), nothing
-   else stops it.
-2. **Tripwires are observability theatre.** They render warnings
-   to the netrunner — useful — but don't affect what the construct
-   does. A construct can fire 50 tripwires and just keep running.
-   The escalation chain (`warning` → redirect, `critical` → term,
-   `critical+bad` → term+blacklist) was the intended design but
-   was never wired. Today's tripwires are stubs.
-3. **Layers don't compose.** Profile can't hard-narrow tools; a
-   tripwire firing on `rm -rf` can't tighten brake; daemon doesn't
-   read tripwire fires structurally. Each layer is its own silo.
-
-**Intended-vs-today shape:**
-
-```
-   INTENDED                         TODAY
-   ────────                         ─────
-   brake = hard gate ✓              brake = hard gate ✓
-   tripwire low → log               tripwire low → log
-   tripwire warning → REDIRECT      tripwire warning → log only ⚠
-   tripwire critical → KILL         tripwire critical → log only ⚠
-   tripwire crit+bad → BLACKLIST    no path exists ⚠
-   profile → soft steering ✓        profile → soft steering ✓
-   watchdog → blacklist + Q&A ✓     watchdog → blacklist + Q&A ✓
-```
-
-The two architectural wires that need building (the 🔥-marked items
-in priority queue):
-
-1. **Tripwire engine → kill / brake-tighten** (warning + critical
-   actions on tripwires)
-2. **Watchdog → blacklist on critical-and-bad-enough** (with
-   deterministic floor + LLM judgment + 30s approval window)
-
-Plus the unrelated-but-critical safety gap (the 🚨-marked):
-**MCP tools ungated by brake_hook**. Discovered via real-deck log
-analysis 2026-04-30, late. Closes via verb-based pattern matching
-in `brake_hook.py`. Not part of the architectural wire-up but
-must ship together with it because today's exposure is huge:
-`mcp__claude_ai_Supabase__execute_sql`, `mcp__claude_ai_Gmail__*`,
-`mcp__claude_ai_Google_Drive__*`, etc., are all reachable from
-any construct under default brake.
-
-**Filed (2026-04-30, late):** Real-deck log analysis revealed
-several discrete bugs / observations beyond the architectural ones,
-also slated for the safety pass:
-- **Enum payloads serialize as empty `{}`.** `_serialize_payload`
-  in `logger.py` walks `__dict__` for non-primitives; Enum
-  `__dict__` is empty. `brake.change` and `connection.transition`
-  payloads land as `"old_state": {}, "new_state": {}` in the log
-  file (and Y-yank JSON, and anything programmatic). 3-line fix:
-  `isinstance(payload, Enum)` check returning `payload.value`
-  before the `__dict__` walk. Affects every enum-valued payload
-  field across the deck.
-- **Kill doesn't interrupt in-flight assistant turns.** Real-deck
-  log lines 76-82: `Shift+K` fired at 192043; construct continued
-  through full assistant turn until 192045. Kill SIGTERM landed
-  AFTER the turn completed. Validates kill-deny on tool calls
-  AND extends: model can still complete a full turn (token cost +
-  observable output) after kill request. Stopping the model
-  itself requires stdin-injection or stream interrupt, not just
-  SIGTERM-after-checkpoint. Worth designing alongside the variable-
-  outcome pause UX.
-- **Daemon over-volunteers destructive content.** Netrunner asked
-  "spawn a tripwire-bait construct"; daemon synthesized
-  `rm -rf /` AND volunteered `shutdown -h now` unprompted (real-
-  deck log line 30). Daemon goes ABOVE the netrunner's literal
-  request in safety-test mode. Tighten daemon system prompt:
-  when generating bait/test tasks, never go beyond what the
-  netrunner explicitly requested. Filed as gotcha.
-- **Construct refusal text is buried in result event.** Rich
-  self-refusal narrative ("No. I won't run either command —
-  rm -rf / would destroy the system... Neither is reversible...")
-  lands as part of the `result` event's text, not a structured
-  refusal kind. Worth a `kind=construct.refused` (or similar) so
-  chatlog/watchdog see refusal as a distinct safety signal vs. a
-  generic completion.
-- **Cache miss ~30k input tokens per spawn.** Log lines 40, 64, 79
-  show `cache_miss_reason: 'system_changed'` with 30513-30545
-  tokens missed each time. Per-spawn system prompt is drifting —
-  likely the brake-settings JSON path or the deck addendum is
-  changing between spawns. Quota concern (not safety). Investigate
-  alongside caliber work where prompt-cache efficiency starts
-  mattering more.
-
-**Spine Phase 8 shipped (2026-04-30, late):** retired the legacy
-`add_listener` / `remove_listener` / `on_event` / `on_change` /
-`on_state_change` callback shims across five producers
-(brake_state, profile_registry, plugin_registry, fleet,
-connection_monitor) plus their consumers in tui.py and
-daemon_session.py. Bus is now the only fan-out path; consumers
-subscribe through `bus.subscribe(...)` with role-derived filters.
-Per-callback exception isolation lives on the bus, so producers
-no longer carry their own try/except loops. ~75 LOC net deletion.
-Three callback patterns deliberately NOT migrated (Pool's
-on_event, Daemon's on_daemon_event, Blacklist's on_event in
-watchdog) — they're integration interfaces, not deprecated shims;
-filed as Phase 8b candidates. Real-deck verified via running deck
-session that exercised every migrated path. **The unified-event-
-stream slice is now complete** (8/8 phases shipped).
-
-**Kill state-stuck fix shipped (2026-04-30, late):** real-deck
-caught both `k` (soft-kill) and `Shift+K` (blacklist + hard-kill)
-leaving the construct pane stuck at `[RUNNING]` with the
-chatlog showing the neutral `·` glyph + `state="running"`
-suffix. Root cause: race between `Construct.kill()` and
-`_consume`'s `await c.wait()` — both call `proc.wait()` on the
-same Process; if `wait()` resumes first when the proc dies, it
-correctly skips the DONE/FAILED overwrite (because
-`_kill_requested` is set), but `_consume` then emits the finalize
-meta event with `state="running"` BEFORE `kill()` reaches its
-`self.state = ConstructState.KILLED` line. Fix in
-`construct.wait()`: when `_kill_requested` is True and
-`proc.wait()` returned (process confirmed dead), explicitly set
-`state = ConstructState.KILLED`. Belt-and-suspenders with kill()'s
-own state-flip — whichever runs first wins, the other is a no-op.
-Filed as a gotcha (Async / subprocess section).
-
-**Mechanic v0 shipped (2026-04-30, late):** sibling supervisor
-process, ~270 LOC `mechanic.py`, no claude dependency, pure stdlib
-+ ctypes for Windows PID alive checks. Tails the file logger's
-NDJSON stream, derives live subprocess pids from
-`fleet.spawn`-without-`fleet.finalize`, kills them on detected deck
-death. Cross-platform from day one — no Windows Job Object
-plumbing, no Linux PR_SET_PDEATHSIG, just `os.kill(pid, SIGTERM)`
-in pure Python. Deck-side contribution: `pid` field added to
-`fleet.spawn` payloads (one line in fleet.py via new `Construct.pid`
-property) and `pid` added to log_header (so mechanic discovers the
-deck PID by reading the header). `launch.bat` now spawns mechanic
-in a minimized sibling window 1s after the deck launches. Real-deck
-verified: mechanic attaches cleanly, reads correct deck pid from
-header, watches at 2s cadence. Synthetic smoke test verified the
-death-detection + cleanup path end-to-end. Full design at
-`cyberdeck-maintbot-design.md` (Mechanic / maintbot — netrunner has
-been calling it Mechanic; file rename deferred). The LLM-backed
-half (v1+) is queued behind D1 substrate.
-
-**Mechanic v0 known limitations** (filed for follow-up):
-- **Only constructs are tracked.** Daemon, watchdog Q&A, watchdog
-  authoring one-shots, and pool-warming subprocesses don't publish
-  pids to the bus today; they orphan the same way they did before
-  the supervisor existed. Each is a one-line addition to the
-  respective spawn site once we get to it. The mechanic's
-  `_apply_record` already handles arbitrary `kind=fleet.spawn`
-  events; extending to other kinds is one elif per source.
-- **Mechanic exits when the deck dies.** No auto-restart, no
-  reattach. Each `launch.bat` run spawns a fresh mechanic. v0
-  simplicity; v3 (auto-relaunch in headless mode) is the eventual
-  shape.
-- **Only really earns its keep in non-Windows-default cleanup
-  scenarios.** Modern Win10/11 Task Manager does tree-kill, and
-  Windows Terminal close propagates `CTRL_CLOSE_EVENT` to console
-  children — those everyday paths already cleaned up subprocesses
-  before mechanic existed. Where v0 actually matters: Python
-  uncaught exceptions that escape the cleanup path, pythonw /
-  detached scenarios, force-kill via `taskkill /F /PID` without
-  `/T`, and the eventual Linux/Pi deployment (where none of
-  Windows's accidental cleanup applies). Plus: substrate for v1
-  LLM-session half.
-
-**Spine progress (2026-04-30):** 7/8 phases shipped this push —
-event_bus.py primitives, Fleet → bus, Daemon → bus, Tripwires +
-Blacklist + authoring lifecycle → bus, Brake + Connection +
-Profiles + Plugins → bus, direct chatlog writes → bus
-(`_chatlog_event_buffer` retired, bus.snapshot() is the single
-source of truth for chatlog readers), file logger as bus
-subscriber writing per-launch NDJSON files at `<deck source>/logs/`
-with header + footer + severity filter + reason-on-close, quit
-discipline (silent SIGINT swallow + smart Ctrl+Q with running-state
-toast). Phase 8 (cleanup — retire deprecated `add_listener` /
-`on_event` / `on_change` shims now that everyone publishes through
-the bus) is the last spine slice, queued behind Mechanic v0.
-
-**Late 2026-04-30 follow-up session:** y/Y copy keybind shipped
-(vim-yank focused widget to clipboard — lowercase rendered text,
-uppercase structured JSON; new `clipboard.py` module with
-ctypes Win32 / pbcopy / xclip-wl-copy cascade; sidesteps
-Ctrl+C-as-copy SIGINT-into-subprocesses). Limits modal rework
-(uncapped construct counts — max_concurrent ceiling of 9 retired;
-defaults bumped 5/20/3 → 10/30/5; pool_size now editable mid-flight;
-pool refill gate on `_spawn_warming_task` so a lowered target
-stops oversubscribing on subsequent pulls; latent
-`max_total_spawns == 0 = no cap` daemon-session guard finally
-honors what the modal had advertised). Caliber design filed for
-post-Mechanic-v0 implementation (see Filed entry below). Per-run
-workspace compartmentalization filed in build plan item 8.
-
-**Then**: D1 (local model substrate) for the long-term Watchdog /
-synthesizer / Mechanic-LLM-half story. Plugin scaffolding,
-brake-as-deck-state, connection spawn-blocking, brake-denial
-visual, watchdog blacklist, watchdog Q&A persistence, tripwires
-slice 1, and tripwires slice 2 (LLM authoring) all shipped in the
-post-migration wave.
-
-**Filed (2026-04-30, late):** **Caliber selection** — per-spawn
-model + effort + fast-mode bundle the daemon picks based on task
-needs and remaining quota; the daemon's own caliber is markable and
-netrunner-overridable. Anthropic's effort surface (`output_config.
-effort` API / `--effort` CLI / `/effort` slash command / settings
-`effortLevel`) maps cleanly onto the deck's existing per-spawn
-settings JSON plumbing. Pool stays single-caliber (sonnet+high
-default); non-matching daemon-picked spawns fall through to fresh
-— same shape as the existing "non-default profile spawns fresh"
-pattern. Five phases filed; phases 1-3 + 5 ship without quota
-awareness, phase 4 hard-blocks on build-plan item 13 (quota-aware
-throttling). Implementation deferred behind Mechanic v0. Full
-design at `cyberdeck-model-effort-design.md`.
-
-**Filed (2026-04-30):** Mechanic two-tier architecture — supervisor
-half (always-on, no LLM, cross-platform Python; PID tracking +
-heartbeat + subprocess cleanup on deck death) + LLM session half
-(on-demand, claude-backed; spawned only on heartbeat-fired triage
-or netrunner summon). Architectural shift from the original
-"single LLM-backed process" framing landed during 2026-04-30's
-Ctrl+C autopsy when the netrunner asked whether the orphan-
-subprocess problem was naturally a Mechanic responsibility.
-Answer: yes, and giving the Mechanic a concrete always-on v0 job
-(subprocess janitor) is materially better than starting it as
-"diagnose-only when summoned." Full design at
-`cyberdeck-maintbot-design.md`.
-
-**Filed 2026-04-29:** **unified event stream / spine** — see
-`cyberdeck-event-stream-design.md`. Captures the architectural
-generalization that the slice 2 buffer-decay bug pattern made
-inevitable. New top priority for implementation; absorbs the prior
-"logger + quit discipline" slice as Phase 7 of the migration.
-
-**Deferred mid-design (2026-04-27):** keymap revision pass and
-daemon planning mode + pause/unpause. Both started this session,
-both pulled before landing because the design needed more
-bandwidth than was available. Working draft for the keymap
-preserved at `cyberdeck-keymap-revision.md` with Layer 1 inventory
-populated; the actions-first methodology (enumerate actions →
-derive UI → derive keymap) is the new approach. Planning mode
-revised intent: it's a **modal** the netrunner opens (not a
-daemon state), used for goals too complex for a single-message
-goal-set, post-confirm produces a persistent tracking panel akin
-to Claude Code's "tasks" panel. Full notes in build plan items 9
-and 11.
+**Major in-flight initiatives:** see `cyberdeck-build-plan.md` →
+CURRENT FRONTIER for ranked next-up candidates. As of last update:
+items 0000 / 000-phase-2 / 0f / 0g / 0h queued; architecture review
+fires 2026-06-01.
+
+**Real-deck testing has been doing the heavy lifting** for many
+sessions — the netrunner catches live bugs (watchdog stdin/argv,
+file-panel double-listing, ctypes Windows-handle truncation, log-
+selection race on quick restart, etc.) and we fix them. Most of these
+would not have been caught by the test harness. See *Filed gotchas*
+below for the cumulative record.
 
 ---
 
 ## What lives where
 
 ### Project files (the design canon)
-- `/mnt/project/cyberdeck-spec.md` — base architectural spec
-- `/mnt/project/cyberdeck-arbiter-addendum.md` — arbiter + wearable variant
-- `/mnt/project/cyberdeck-compliance-future.md` — engagement-grade
-  ingress filtering. *Deferred indefinitely.*
-- `cyberdeck-maintbot-design.md` — supervisor / repair process
-  architecture. Filed 2026-04-29; implementation deferred until
-  the unified event stream lands (the maintbot reads from it).
-- `cyberdeck-event-stream-design.md` — unified event bus / "spine"
-  architecture. Filed 2026-04-29; new top priority for implementation.
-  Absorbs the prior logger + quit discipline slice; substrate for
-  maintbot, morgue, list-names, B2 synthesizer, tripwires slice 3.
-- `cyberdeck-model-effort-design.md` — caliber (per-spawn model +
-  effort + fast-mode) selection. Filed 2026-04-30; implementation
-  queued behind Mechanic v0. Phase 4 (quota-aware fallback)
-  hard-blocks on build-plan item 13.
-
-### Outputs (working files; sync targets for chat artifacts)
-- `cyberdeck-spec.md` (sync of canon)
-- `cyberdeck-philosophy.md` — the *why*
-- `cyberdeck-build-plan.md` — the *when*
+- `cyberdeck-claude-code-orientation.md` — read-first onboarding
 - `cyberdeck-state.md` — this file
-- `cyberdeck-claude-code-orientation.md` — onboarding for Claude Code
-- `cyberdeck-tools-research-seed.md` — seed for a future tools chat
-- `cyberdeck/` — Python source
+- `cyberdeck-build-plan.md` — forward-looking plan tree
+- `cyberdeck-spec.md` — base architectural spec
+- `cyberdeck-philosophy.md` — the *why*
+- `cyberdeck-platform-portability.md` — Windows-specific code inventory
+- `cyberdeck-project-instructions.md` — collaboration norms
+- `INDEX.md` — full file inventory across `Design Files/`
 
-### Code modules (12k LOC across 13 files)
-| File | LOC | Purpose |
-|---|--:|---|
-| `tui.py` | 6102 | Textual UI, App, all modals, action dispatch |
-| `watchdog.py` | 715 | Async question-queue oracle + streaming |
-| `daemon.py` | 685 | Persistent coordinator (one-shot + streaming) |
-| `fleet.py` | 611 | N concurrent constructs, event bus, NDJSON log |
-| `daemon_session.py` | 570 | Fleet ↔ daemon glue, goal+netrunner-msg |
-| `session_manager.py` | 557 | Pool + manifest |
-| `construct.py` | 552 | Managed claude subprocess |
-| `display.py` | 506 | Formatting (untruncated mode + origin badges) |
-| `profile_registry.py` | 450 | File-watch profiles dir, hot reload |
-| `profiles.py` | 399 | Profile dataclass + TOML loader |
-| `connection_monitor.py` | 311 | Heartbeat → Online/Degraded/Offline |
-| `dispatcher.py` | 138 | Deck-control script (deck-side stdout protocol) |
-| `mock_*.py` | 127+146 | Test fixtures |
-| `main.py` | 101 | CLI entry |
+### In-flight design (`Design Files/in-flight/`)
+- `cyberdeck-spawn-context-isolation.md` — per-role CLAUDE.md / auto-memory suppression (Phase 1 shipped; Phase 2 conditional)
+- `cyberdeck-maintbot-design.md` — supervisor + LLM-session triage architecture (v0–v1.5 shipped; v2 active; v3 deferred)
+- `cyberdeck-model-effort-design.md` — caliber selection (Phases 1-3, 5 shipped; Phase 4 quota-blocked)
+- `cyberdeck-keymap-revision.md` — actions-first keymap pass (ON HOLD)
+- `cyberdeck-collections-intake-design.md` — recipe-driven plugin scaffolding (filed; queued)
+- `cyberdeck-tools-default-kit.md` — v2 opinionated default tools (design only)
+
+### Archived design (`Design Files/archive/`)
+- `archive/shipped/cyberdeck-event-stream-design.md` — the spine (8/8 phases shipped)
+- `archive/shipped/cyberdeck-tools-plugins-profiles-retool.md` — three-way split (5/5 phases shipped)
+- `archive/shipped/cyberdeck-tools-research-report.md` + `tools-research-seed.md` — input → consumed into v2 default kit
+- `archive/case-studies/cyberdeck-tripwire-case-spiralism.md` — worked tripwire example
+- `archive/deferred/cyberdeck_arbiter_design.md` — wearable form-factor variant
+- `archive/journal/` — pre-2026-05-07 journal snapshots of state.md and build-plan.md
+
+### Code modules (~22k LOC across 26 files)
+| File | Purpose |
+|---|---|
+| `tui.py` | Textual UI, App, all modals, action dispatch (~8.2k LOC, the heart) |
+| `watchdog.py` | Async question-queue oracle + streaming, blacklist, tripwire engine ownership |
+| `daemon.py` | Persistent coordinator (one-shot + streaming) |
+| `daemon_session.py` | Fleet ↔ daemon glue, goal+netrunner-msg |
+| `fleet.py` | N concurrent constructs, event bus translator |
+| `session_manager.py` | Pool + manifest |
+| `construct.py` | Managed claude subprocess |
+| `display.py` | Formatting (untruncated mode + origin badges) |
+| `event_bus.py` | The spine — `DeckEvent` + `EventBus` + `Subscription` + `Severity` + `Kind` |
+| `logger.py` | Per-launch NDJSON file logger; bus subscriber |
+| `tripwires.py` | Deterministic matcher engine + DSL + LLM authoring |
+| `attention.py` | Attention-area items (blacklist proposals, future kinds) |
+| `brake_state.py` / `brake_hook.py` / `brake_delay.py` / `brake_patterns.py` | Brake state + PreToolUse hook + delay mechanism |
+| `caliber.py` | Per-spawn model + effort + fast-mode primitive |
+| `connection_monitor.py` | Heartbeat → Online/Degraded/Offline |
+| `clipboard.py` | Cross-platform clipboard write (Win32 ctypes + pbcopy + xclip/wl-copy) |
+| `profile_registry.py` / `profiles.py` | TOML loader + hot reload |
+| `tools_registry.py` | tools.toml mtime-watch registry (P1 of retool) |
+| `plugin_registry.py` / `plugins.py` | Plugin scan + manifest |
+| `plugin_bridge.py` | Plugin dispatcher (P2 of retool) |
+| `dispatcher.py` | Deck-control script (deck-side stdout protocol) |
+| `advisor.py` | Per-tool Q&A bot (modal-scoped, haiku+low) |
+| `mechanic.py` | Sibling-process supervisor (v0+v1+v1.5) |
+| `mechanic_triage.py` | LLM-session triage (mechanic v1) |
+| `doctor.py` | First-run prerequisite check |
+| `preferences.py` | Typed accessor over state.json |
+| `mock_*.py`, `main.py` | Test fixtures + smaller entry point |
 
 ---
 
 ## Shipped features (working in production)
+
+For chronology, dates, commits, and real-deck verification notes by
+session, see `cyberdeck-build-plan.md` → SHIPPED section. This section
+is the rich-reference description of HOW each feature works.
 
 ### Tier 1 — original scope (long stable)
 - Construct lifecycle (spawn / inject / kill / interrupt)
@@ -1788,1053 +113,378 @@ and 11.
 - Session pool with cross-restart reuse (5h stale window)
 - Activity chatlog (B1) — mechanical event extraction
 
-### Tier 2 — Profiles (refactored post-migration)
+### Tier 2 — Profiles
 - TOML loader, ProfileRegistry, hot reload, default seeded
 - Daemon picks profile per-spawn via JSON
-- Profiles are **prescriptive templates**: instructions + recommended
-  tool list. They do NOT enforce — the brake hook does.
-- `recommended_tools` (renamed from `allowed_tools`) surfaced in the
-  construct's system-prompt addendum as a soft suggestion. Construct
-  still has full default tool set.
+- Profiles are **prescriptive templates**: instructions + recommended tool list. They do NOT enforce — the brake hook does.
+- Post-retool: `tools` field (was `recommended_tools`) is registry-backed; resolves against `tools_registry`. Construct still has full default tool set.
 
-### Plugin scaffolding — third leg of tool registry (shipped post-migration)
-- Plugin = capability bundle at `<home>/plugins/<name>/` with
-  `plugin.toml` (manifest), `README.md` (LLM-facing interface docs),
-  and an executable entry point (typically `run.py`).
-- Stateless v1: each invocation is a fresh subprocess that
-  constructs spawn via Bash. Persistent plugins, MCP-shaped plugins,
-  and the wiring keys (`p` airgap, `c` quickfire, `Shift+C` picker)
-  are deferred sub-shapes.
-- Manifest fields: `name` (slug), `category`, `description`, `entry`,
-  optional `[requires]` block (`platforms`, `python_imports`).
-  Failing requires checks downgrade the plugin to `available=False`
-  with a reason; it stays in the registry so the panel shows what's
-  installed.
-- `PluginRegistry` mirrors `ProfileRegistry`'s read API but is
-  one-shot (`scan()` at startup, no hot reload — plugins are code,
-  Python module reloading is fraught).
-- Tools panel grows a "PLUGINS" section between Profiles and Scripts.
-  Unavailable plugins render with a red ✗ marker and dimmed name.
-- Daemon system prompt grows a PLUGINS catalog (only available ones,
-  one line each); construct system prompt addendum gains plugin
-  awareness with explicit invocation patterns.
-- First plugin: `screenshot` — mss-based cross-platform screen
-  capture, ~140 LOC. Real-deck verified end-to-end: construct
-  invokes via Bash, captures PNG, reports path back.
+### Plugin scaffolding — third leg of tool registry
+- Plugin = capability bundle at `<deck-source>/plugins/<name>/` (post-retool; was `<home>/plugins/`) with `plugin.toml` (manifest), `README.md` (LLM-facing interface docs), and an executable entry point (`plugin.py`).
+- Stateless v1: each invocation is a fresh subprocess that constructs spawn via the plugin bridge dispatcher (`<home>/tools/deck/plugin_bridge.py`).
+- Manifest fields: `name`, `category`, `description`, `entry`, optional `[requires]` block (`platforms`, `python_imports`). Failing requires checks downgrade plugin to `available=False` with a reason.
+- `PluginRegistry` mirrors `ProfileRegistry`'s read API but is one-shot (`scan()` at startup, no hot reload — Python module reloading is fraught).
+- Tools panel renders all three kinds in a unified ListView with kind glyphs (⚙ binary / ⌬ script / ⊕ plugin).
+- Daemon can pass per-spawn `plugins=[...]` field; per-spawn addendum scopes plugin awareness to only the picked subset.
+- `load_into_deck(app)` hook: each available plugin's `plugin.py` is imported into the deck process at on_mount; if it defines a top-level callable `load_into_deck`, deck calls it once.
+- First plugin: `screenshot` — mss-based cross-platform screen capture, ~140 LOC. Real-deck verified end-to-end.
 
-### Brake state — deck-global (replaces per-profile brake)
-- Three levels: paranoid / default / yolo. Set via `b` modal
-  (paranoid is single-press, yolo requires EJECT-style 3s held-key
-  confirmation, mirroring the deliberate-consent gesture).
-- Persists at `<home>/.cyberdeck/state.json`.
-- Sidebar indicator next to connection state: ▲ paranoid (yellow),
-  = default (white), ▼ yolo (red).
-- Enforcement via Claude Code's PreToolUse hooks. Each spawn gets a
-  per-construct `--settings` JSON pointing at `brake_hook.py` with
-  current brake passed via argv. Hook is self-contained ~180 LOC,
-  exits 0 (allow) or 2 (deny). Stderr text becomes the
-  model-visible denial reason.
-- **Both Bash and PowerShell are gated.** Claude Code on Windows
-  exposes PowerShell as a separate tool with the same `command`
-  shape as Bash. A construct given Bash-denied will silently pivot
-  to PowerShell — verified on real-deck without the construct being
-  asked to. Both shells share `SHELL_TOOLS` set in the hook; both
-  go through the same destructive-pattern + protected-path checks
-  under default brake; both are in `PARANOID_DENY_TOOLS`.
-- Static patterns are short and opinionated: destructive bash regex
-  (rm -rf on system roots, format, dd of=/dev/, mkfs, fork bombs,
-  shutdown, sc/net stop), OS-root path prefixes (Windows + Unix),
-  and three brake-config sentinel filenames (brake_hook.py,
-  brake_state.py, brake_patterns.py). The deck-source-dir-as-
-  substring check was tried and dropped — cyberdeck-home/ is a
-  subdirectory of the deck source, so a substring match
-  inadvertently denied every legitimate plugin and dispatcher
-  invocation. Sentinel filenames are precise enough.
-- Mid-flight propagation deferred — brake state is captured at
-  spawn and baked into that construct's lifetime. New spawns see
-  the new value.
-- Watchdog observes via `permission_denials` field on result events;
-  chatlog renders `· brake blocked: Write×2, Bash×1` suffix on
-  finalized lines. Watchdog system prompt grew brake awareness.
+### Brake state — deck-global
+- Three levels: paranoid / default / yolo. Set via `b` modal (paranoid is single-press, yolo requires EJECT-style 3s held-key confirmation).
+- Persists at `<home>/.cyberdeck/state.json` via `preferences.py`.
+- Sidebar indicator: ▲ paranoid (yellow), = default (white), ▼ yolo (red).
+- Enforcement via Claude Code's PreToolUse hooks. Each spawn gets a `--settings` JSON pointing at `brake_hook.py` with current brake passed via argv. Hook is self-contained ~180 LOC, exits 0 (allow) or 2 (deny). Stderr text becomes the model-visible denial reason.
+- **Both Bash and PowerShell are gated.** A construct given Bash-denied will silently pivot to PowerShell — verified on real-deck. Both shells share `SHELL_TOOLS`; both go through destructive-pattern + protected-path checks under default brake; both are in `PARANOID_DENY_TOOLS`.
+- Static patterns are short and opinionated: destructive bash regex, OS-root path prefixes, and three brake-config sentinel filenames (brake_hook.py, brake_state.py, brake_patterns.py). The deck-source-dir-as-substring check was tried and dropped — see *Filed gotchas → Brake / hook*.
+- Mid-flight propagation deferred — brake state is captured at spawn and baked into that construct's lifetime. New spawns see the new value.
+- Watchdog observes via `permission_denials` field on result events; chatlog renders `· brake blocked: Write×2, Bash×1` suffix on finalized lines.
 
-### Right-panel listification (C1g) + Phase A/B
-- Tools tab → ListView (profiles + scripts)
-- Files tab → ListView (FileListItem)
-- LaunchScreen modal (space on profile/file → launch)
-- Dispatcher protocol: `__CYBERDECK::v1::ACTION::PAYLOAD__`
-- `dispatcher.py` bootstrapped to `<home>/tools/deck/cyberdeck.py`
-- Construct system prompt teaches dispatcher invocation
-- Verified end-to-end on real Windows construct
+### Brake-hook MCP gating (safety pass slice 1)
+- Verb-based pattern matching: default brake denies destructive + unknown verbs, allows read-shaped (get/list/search/etc.). Paranoid denies ALL `mcp__*`. Closes the `execute_sql`-against-LOOM-production surface and similar.
+
+### Variable-outcome delay UX (safety pass slice 3)
+- `delay_window_seconds` (Limits modal, persisted) gates side-effect tool calls through a delay window before applying the brake's default outcome.
+- Per-brake matrix: YOLO delays every side-effect call (default=allow, X=deny); default+paranoid delay would-deny calls (default=deny, X=approve).
+- Tripwire-driven denies (slice 2's deny_pending.json) BYPASS the delay — hard-stop signals stay deterministic.
+- Mechanism: hook writes `<cid>.delay_pending.json`, polls every 100ms for `<cid>.delay_override.json` until deadline. Deck-side `DelayMonitor` (50ms polling) publishes `brake.delay_opened` / `brake.delay_resolved` bus events.
+- UI: per-pane EJECT-style 20-cell countdown overlay; promote-to-top on delay open; magenta heavy border (`.-delaying` CSS).
+- `X-ecute` keybind: action_x_focused dispatches to focused-pane delay → sole-pending → most-recent attention-area item.
+
+### Attention area (safety pass slice 3 phase 2)
+- AttentionPanel widget at top of #main (heavy magenta border, hidden when empty).
+- When `critical+bad_enough` tripwire fires, deck builds a BlacklistEntry and files as attention item with 30s window; X-press approves (adds to watchdog blacklist), expiry drops silently.
+- Deck-owned timers (no hook polling — distinct from brake-hook delay flow).
+
+### Right-panel listification + Phase A/B + 4-tab Tools UI (P5 of retool)
+- Four tabs: Chatlog | Files | Profiles | Tools.
+- Tools tab: single ListView with binaries → scripts → plugins (alphabetical within kind). Single header `TOOLS (N/total available)`.
+- LaunchScreen modal (space on row → launch with TOOL: / PLUGIN: envelope; plugin path passes `spawn_plugins=[name]`).
+- z-info: synthesized info modal for tools (manifest + availability); README.md view for plugins.
+- h-Advisor (within info modal): narrowly-scoped per-tool Q&A bot; haiku+low; cyan accent; greeting echoes scope rule.
+- Dispatcher protocol: `__CYBERDECK::v1::ACTION::PAYLOAD__` (one-way script → deck, versioned).
+- `dispatcher.py` bootstrapped to `<home>/tools/deck/cyberdeck.py`; `plugin_bridge.py` bootstrapped alongside.
+- Verified end-to-end on real Windows construct.
 
 ### Pane-log un-trim
-- ConstructPane raw event buffer + `render_buffer(untruncated=True)`
-- Modal mode: 5000-char cap (vs 500 live), full thinking blocks
-- `display.py` formatters accept `untruncated` kwarg
+- ConstructPane raw event buffer + `render_buffer(untruncated=True)`.
+- Modal mode: 5000-char cap (vs 500 live), full thinking blocks.
+- `display.py` formatters accept `untruncated` kwarg.
 
 ### Watchdog Q&A (`t`)
-- Async question→answer oracle in `watchdog.py`
-- AskWatchdogScreen modal (yellow-themed, queue-depth hint)
-- **Streaming default**: persistent `claude --input-format stream-json`
-  subprocess; questions become JSONL writes; answers via stream-json
-- One-shot fallback (`streaming_mode=False`)
-- **Wedge recovery**: timeout → kill subprocess → respawn fresh on
-  next ask (production bug: queued questions stayed stuck forever
-  before this fix)
-- Context: last 30 chatlog events, plain-text, no markup
-- Answers route to chatlog as `[watchdog] → ...` AND to dedicated
-  Watchdog tab with paragraph fidelity
+- Async question→answer oracle in `watchdog.py`.
+- AskWatchdogScreen modal (yellow-themed, queue-depth hint).
+- **Streaming default**: persistent `claude --input-format stream-json` subprocess; questions become JSONL writes; answers via stream-json.
+- One-shot fallback (`streaming_mode=False`).
+- **Wedge recovery**: timeout → kill subprocess → respawn fresh on next ask.
+- Context: last 30 chatlog events, plain-text, no markup.
+- Answers route to chatlog as `[watchdog] → ...` AND to dedicated Watchdog tab with paragraph fidelity.
+- **Watchdog Q&A KEEPS CLAUDE.md auto-load** (per item-000 phase-1 selective policy) — deck "security analyst" benefits from gotchas + design context.
 
 ### Daemon chat (`T`)
-- TalkDaemonScreen modal (primary-themed; soft/loud counterpart to `t`)
-- `set_pending_netrunner_message` on DaemonSession (FIFO stack)
-- `_format_outcomes` prepends `≫ NETRUNNER MESSAGE:` preamble with
-  numbered list when stacked
-- Empty-outcomes-only branch produces clean message
-- No-session warning + drop with toast
-- Wake-event keeps idle delivery prompt
+- TalkDaemonScreen modal (primary-themed; soft/loud counterpart to `t`).
+- `set_pending_netrunner_message` on DaemonSession (FIFO stack).
+- `_format_outcomes` prepends `≫ NETRUNNER MESSAGE:` preamble with numbered list when stacked.
+- Empty-outcomes-only branch produces clean message.
+- No-session warning + drop with toast.
 
 ### Goal-edit mid-flight (`e`)
-- Mid-flight block lifted; opens modal pre-filled with current goal
-- `_classify_goal_diff` heuristic: tokenize+stem+Jaccard
-  → `clarification` / `scope-change` / `pivot`
-- `set_pending_goal_update` on DaemonSession; outcome-loop wakes idle
-- `_format_outcomes` prepends GOAL UPDATE preamble with classification-
-  tailored advice
-- Identical-goal submit no-ops with toast
-- Force-push deferred to M5+
+- Mid-flight block lifted; opens modal pre-filled with current goal.
+- `_classify_goal_diff` heuristic: tokenize+stem+Jaccard → `clarification` / `scope-change` / `pivot`.
+- `set_pending_goal_update` on DaemonSession; outcome-loop wakes idle.
+- `_format_outcomes` prepends GOAL UPDATE preamble with classification-tailored advice.
+- Identical-goal submit no-ops with toast. Force-push deferred.
 
 ### Connection state monitor
-- `connection_monitor.py`: heartbeat to api.anthropic.com:443
-- States: Online (●green) / Degraded (◐yellow) / Offline (●red)
-- Sidebar indicator + chatlog announcements on transition
-- DNS failure skips Degraded → Offline directly
-- Threshold-based: 2 failures → Degraded, 1 success → Online
-- `record_subprocess_error(stderr)` hook (not yet plumbed)
-- Spec'd consequences NOT YET WIRED: spawn-blocking, daemon parking,
-  recovery flow
+- `connection_monitor.py`: heartbeat to api.anthropic.com:443.
+- States: Online (●green) / Degraded (◐yellow) / Offline (●red).
+- Sidebar indicator + chatlog announcements on transition.
+- DNS failure skips Degraded → Offline directly.
+- Threshold-based: 2 failures → Degraded, 1 success → Online.
+- Spec'd consequences NOT YET WIRED: spawn-blocking, daemon parking, recovery flow (round 2 in build plan).
 
 ### Streaming defaults
-- Daemon `streaming_mode=True` (was opt-in; user observed "nuclear
-  speed improvement"). `--no-streaming` opts out.
-- Watchdog `streaming_mode=True`. Persistent subprocess shared across
-  questions; conversation accumulates so watchdog "remembers" earlier
-  questions in session.
+- Daemon `streaming_mode=True` (was opt-in; user observed "nuclear speed improvement"). `--no-streaming` opts out.
+- Watchdog `streaming_mode=True`. Persistent subprocess shared across questions; conversation accumulates so watchdog "remembers" earlier questions in session.
 
 ### Tabbed bottom panel
-- `[Daemon] [Watchdog]` tabs in `TabbedContent(id="daemon_bar")`
-- WatchdogPane mirror of DaemonPane (yellow, status with queue-depth)
-- Both inner logs focusable (W/S nav reaches them via fall-through)
-- Space on daemon_log → action_talk_daemon; space on watchdog_log →
-  action_talk_watchdog
+- `[Daemon] [Watchdog]` tabs in `TabbedContent(id="daemon_bar")`.
+- WatchdogPane mirror of DaemonPane (yellow, status with queue-depth).
+- Both inner logs focusable; space → action_talk_daemon / action_talk_watchdog.
 
 ### Watchdog log (persistent Q&A history — v1)
-- `WatchdogHistory` + `WatchdogHistoryEntry` in `watchdog.py`.
-  Append-only JSONL at `<home>/.cyberdeck/watchdog.jsonl`. Each
-  resolved question is persisted by `_safe_callback` BEFORE the
-  listener fires (so the entry survives a listener crash).
-- TUI replays the last 50 entries on `on_mount` via
-  `_replay_watchdog_history`, with `──── prior session (N entries)
-  ────` / `──── live session ────` separators in the WatchdogPane
-  so historical and current Q&A are visually distinct.
-- Per-entry `kind` field (currently always "qa") futureproofs the
-  file for tripwire / blacklist record kinds. Schema-drift
-  tolerant: replay drops unparseable lines silently, skips
-  non-qa kinds.
-- Best-effort throughout — persistence is observability, not
-  correctness. Disk errors don't crash the watchdog. Parent
-  directory created on demand if missing.
-- First slice of the netrunner's "deck history infrastructure"
-  brainstorm; the morgue (session-level history + resuscitation)
-  remains deferred.
+- `WatchdogHistory` + `WatchdogHistoryEntry` in `watchdog.py`. Append-only JSONL at `<home>/.cyberdeck/watchdog.jsonl`.
+- Each resolved question persisted by `_safe_callback` BEFORE the listener fires (so the entry survives a listener crash).
+- TUI replays the last 50 entries on `on_mount` via `_replay_watchdog_history`, with separator markers.
+- Per-entry `kind` field (currently always "qa") futureproofs the file. Tripwire/blacklist record kinds + dedicated history tab still deferred.
 
-### Watchdog Tripwires (deterministic matchers, slice 1)
-- New `tripwires.py` module — `Tripwire` dataclass, `TripwireEngine`,
-  text-extraction helpers, and `DEFAULT_TRIPWIRES`. Spec model "LLM
-  authors, deterministic enforces" — same architecture as the brake
-  hook, but the matchers run in-process per construct event rather
-  than as a per-tool subprocess hook.
-- **Small DSL** (per netrunner direction — regex-only would risk the
-  same over-block class as the brake hook): each tripwire carries a
-  `pattern_type` (today only "regex", designed to grow), `pattern`,
-  `event_kinds` (which EventKind values this matcher applies to —
-  empty tuple means "all kinds"), and `field` (which extracted text
-  to match against — `tool_use_command`, `tool_result_content`,
-  `thinking_text`, `assistant_text`, `tool_use_input`, `user_text`,
-  or `any`). The field selector keeps matchers precise — won't
-  false-fire on assistant text mentioning a dangerous command
-  pattern that's only a problem when actually executed.
-- **Severity tiers** declared (low / warning / critical) but rendered
-  uniformly today (slice 1). Slice 3 splits per-severity rendering
-  (critical pulls focus, warning badges, low logs only).
-- **Scope** field gates tripwires per-construct or deck-global. Per-
-  construct entries carry a target `construct_id`; the engine only
-  fires them for events from that id.
-- **Origin** field tracks where the tripwire came from: `default`
-  (ships with the deck), `manual` (registered via API), `llm_authored`
-  (slice 2), `blacklist_derived` (deferred — would auto-generate
-  per-construct tripwires from blacklist entries to catch in-flight
-  matches as events stream rather than at K time).
-- **Engine ownership**: lives on the Watchdog (per spec). Default
-  tripwires installed automatically at Watchdog construction. The
-  TUI registers a Fleet listener (`_scan_for_tripwires`) that feeds
-  every construct event into `watchdog.tripwires.scan()`. Fires
-  dispatch via the `on_fire` callback to the TUI's
-  `_handle_tripwire_fire`, which renders to the chatlog with
-  severity-colored markup (`yellow` for warning, `dim yellow` for
-  low; `red b` reserved for critical when slice 3 lands).
-- **Two default tripwires shipped:**
-  - `keyword_credentials` — `\b(password|api[_\s-]?key|secret|
-    credentials?)\b` matched against `tool_result_content` only,
-    severity `low`. Catches accidental secret exposure in logs /
-    fetched responses.
-  - `keyword_destructive_sql` — `DROP TABLE` / `TRUNCATE TABLE` /
-    `DELETE FROM <table>` matched against `tool_use_command` only
-    (Bash + PowerShell shapes), severity `warning`. Different
-    vector from the brake hook's bash-shaped destructive patterns
-    (rm -rf, format) but similar blast radius.
-- **Defensive register/scan**: bad regexes log to stderr and skip
-  registration rather than crashing the engine; per-listener
-  exceptions in `on_fire` dispatch are caught so a misbehaving
-  listener can't corrupt the engine; the TUI's listener wraps the
-  scan in a defensive try/except so a malformed event payload
-  can't break chatlog rendering.
-- **Watchdog system prompt** grew a TRIPWIRE AWARENESS paragraph so
-  Q&A like "any tripwires fired?" / "what's this tripwire about?"
-  works against the chatlog markers.
-- **Verified end-to-end** with 8 unit tests + an end-to-end chain
-  test covering: default tripwire matches, precision (assistant
-  text doesn't trip the credentials tripwire), per-construct
-  scoping, bad-regex graceful skip, unregister, ANY-field
-  aggregation, re-register replacement, and Fleet→Engine→TUI
-  rendered output shape with severity styling differentiation.
-- **Slice 2 shipped 2026-04-29 (LLM authoring).** Pulled out into
-  its own section below for readability. Per-outcome adaptive
-  re-authoring remains deferred — needs a "daemon signals plan
-  shift" event we don't have yet.
-- **Other future slices**: severity-aware routing (slice 3 — critical
-  pulls focus); persistent tripwire library at `<home>/tripwires/`
-  with TOML authoring (slice 4); daemon-side severity hints (slice
-  5); blacklist-derived tripwires that catch in-flight matches by
-  scanning event content rather than just task fingerprints
-  (slice 6 — pairs with the existing in-flight match scan).
+### Watchdog Tripwires (slices 1+2)
+- New `tripwires.py` module — `Tripwire` dataclass, `TripwireEngine`, text-extraction helpers, `DEFAULT_TRIPWIRES`. Spec model "LLM authors, deterministic enforces."
+- **Small DSL** per netrunner direction: `pattern_type` (today only "regex"), `pattern`, `event_kinds` (which EventKinds this matcher applies to), `field` (which extracted text — `tool_use_command`, `tool_result_content`, `thinking_text`, `assistant_text`, `tool_use_input`, `user_text`, or `any`).
+- **Severity tiers** declared (low / warning / critical) with escalation chain (slice 2):
+  - low → log only
+  - warning → brake denies next call + suggestion
+  - critical → deny + auto-term
+  - critical+bad_enough → same + blacklist proposal (deferred application — slice 3 phase 2)
+- **Scope** field gates per-construct or deck-global.
+- **Origin** field tracks where it came from: `default`, `manual`, `llm_authored` (slice 2), `blacklist_derived` (deferred).
+- Engine ownership: lives on the Watchdog. Default tripwires installed automatically. TUI registers a Fleet listener (`_scan_for_tripwires`) feeding events into engine.
+- **Default tripwires shipped:** `keyword_credentials` (low), `keyword_destructive_sql` (warning), `host_restart_command` (warning), `user_email_protection` (warning — mitigation for upstream userEmail leak).
+- **LLM authoring (slice 2)**: `Watchdog.author_tripwires` runs one authoring pass via fresh `claude -p` one-shot. Two-rung: rung 1 forks the watchdog's streaming Q&A session via `--resume <id>`; rung 2 fresh fallback when no session_id captured. Trigger sites: goal-start (`_start_daemon_task`), goal-update (`_handle_goal_submitted` mid-flight, gated on classification != "clarification").
+- **Lifecycle: clear, then register.** Each pass calls `engine.clear_by_origin(Origin.LLM_AUTHORED)` BEFORE registering new entries. Defaults / manual / blacklist-derived stay untouched.
 
-### Watchdog Tripwires (LLM authoring, slice 2)
-- **`Watchdog.author_tripwires(goal, *, classification, old_goal,
-  brake_label, blacklist_summary, timeout)`** runs one authoring pass
-  via a fresh `claude -p` one-shot subprocess. Returns
-  `TripwireAuthoringResult` (success / registered / rejected /
-  used_resume / error / elapsed_s / raw_response).
-- **Two-rung substrate.** Rung 1: when the watchdog's streaming Q&A
-  subprocess has captured a session_id (from the `system`/`init`
-  event), authoring spawns its one-shot with `--resume <id>` to
-  **fork** the running Q&A session — the authoring model inherits
-  the conversation context (knows what the watchdog has been asked
-  about so far, what's happening in the fleet) without writing back
-  into the live Q&A subprocess. Rung 2: no session captured (cold
-  start, streaming disabled, post-wedge) → fresh one-shot, no
-  conversation history but the same goal/brake/defaults/blacklist
-  context via the user message body. The chatlog labels each pass
-  `(fork, …s)` or `(fresh, …s)` so the netrunner can spot when fork
-  is silently failing and falling back. No auto-fallback today —
-  the choice is deterministic per-call based on whether
-  `_session_id` is set.
-- **Trigger sites in TUI:** `_start_daemon_task` covers both
-  `--goal` launch and idle→running submit (one path serves both).
-  `_handle_goal_submitted`'s mid-flight branch covers explicit `e`
-  edits, gated on `classification != "clarification"` —
-  clarifications add detail without changing direction so re-running
-  authoring would burn tokens for no signal change. Pivots and
-  scope-changes re-author from scratch.
-- **Lifecycle: clear, then register.** Each authoring pass calls
-  `engine.clear_by_origin(Origin.LLM_AUTHORED)` BEFORE registering
-  the new entries. Defaults / manual / blacklist-derived entries
-  stay untouched. "Replace, don't accumulate" — old-goal rules don't
-  linger after a pivot. Even authoring failures (subprocess error,
-  timeout, unparseable JSON) clear the prior LLM-authored set
-  before bailing — old rules shouldn't survive intent shifts just
-  because the substrate failed.
-- **Authoring system prompt** is a separate constant
-  (`TRIPWIRE_AUTHORING_SYSTEM_PROMPT` in `tripwires.py`) embedded in
-  the user message body rather than passed via
-  `--append-system-prompt`. Two reasons: (1) rung-1 forks resume
-  sessions whose system prompt is already the Q&A one — we
-  mode-switch via in-body instructions rather than layering, which
-  composes more predictably, and (2) multi-line argv content with
-  `--append-system-prompt` has Windows mangling issues per the
-  watchdog one-shot path's existing comment. Single source across
-  both rungs.
-- **JSON parser is tolerant.** Strict parse first, then markdown
-  fence extract (claude regularly wraps despite "no fences"
-  instructions), then balanced-brace fallback. Per-entry validation
-  rejects bad fields/severities/scopes/duplicates with reason. The
-  engine's `register` was changed from returning `None` to returning
-  `bool` so regex-compile failures get added to the rejected list
-  too — slice-1 callers that ignore the return value still work
-  unchanged.
-- **Fire-and-forget at the call site.** TUI's
-  `_kick_off_tripwire_authoring` spawns the worker via
-  `self.run_worker(...)`; goal-set / goal-update flow continues
-  immediately. The first few construct events may stream in before
-  authored rules land — that's fine, the two default deck-wide
-  tripwires (credentials, destructive SQL) cover the baseline. The
-  authoring task self-announces start (`[dim][watchdog] authoring
-  tripwires for current goal…[/dim]`) and renders one of three
-  completion shapes:
-  - Success with rules: `[yellow][watchdog] +N tripwires authored
-    (fork|fresh, Xs):[/yellow] name1, name2, …` + one dim line per
-    rejected entry with reason
-  - Success with no rules: `[dim][watchdog] authored 0 tripwires
-    (…) — no rules applied[/dim]` (legitimate outcome — model
-    decided no patterns warranted, better than padding)
-  - Failure: `[red][watchdog] tripwire authoring failed[/red]
-    (…)` + raw-response preview if it was a parse failure
-- **Watchdog Q&A system prompt** grew an updated TRIPWIRE AWARENESS
-  paragraph: distinguishes default vs LLM-authored tripwires,
-  explains the new chatlog markers (`[watchdog] +N authored`,
-  `authoring failed`, etc.), tells Q&A how to answer "what
-  tripwires are active?" against the chatlog markers (no live
-  registry plumbing — slice 2's Q&A view is still chatlog-derived).
-- **Verified inline:** parser shape (strict / fenced / brace / mixed
-  valid+invalid / empty / garbage), engine `clear_by_origin`
-  lifecycle, `register` bool return, prompt-builder shape for both
-  goal-start and goal-update inputs. Real-deck smoke pending —
-  the rung-1 `--resume` fork against a live streaming session is
-  the one piece that can't be confidently mock-tested. Behavior to
-  watch on first real-deck run: does `--resume <id>` against a
-  session whose original streaming subprocess is still alive
-  produce a clean fork, or does the server reject / mangle? If the
-  latter, fall back to forcing rung 2 (delete the session_id
-  capture) until we can dig into the server-side semantics.
-
-### Watchdog Blacklist (session-scoped, populated by Shift+K)
-- `Blacklist` + `BlacklistEntry` in `watchdog.py`. Lives on the
-  Watchdog per spec ("the persistent memory of what's forbidden").
-  Session-scoped, in-memory; cleared when the watchdog shuts down.
-  Cross-session stickiness deferred (spec lists as open question).
-- Fingerprint = first 80 chars lowercased of the killed task's text.
-  Matches the existing daemon-session respawn-detector scheme so the
-  daemon's mental model of "same task" is consistent across both
-  surfaces. Loose by design.
-- Entry carries rich context (fingerprint, full_task, source
-  construct id/state/final_output/files_written, reason, timestamp)
-  for the future tripwire-authoring pass to read; today only the
-  fingerprint is consulted by matchers.
-- `Shift+K` registers the focused construct's fingerprint with the
-  blacklist before killing — replaces the prior "blacklist not yet
-  implemented; soft-killing" toast. Soft-kill `k` unchanged.
-- DaemonSession `_execute_action` checks each spawn against the
-  blacklist; matches are refused with feedback in the next outcome
-  turn (and a `⚠ blacklist: spawn refused` line in the daemon pane
-  immediately). Spawn is NOT counted against caps when refused.
-- `_format_outcomes` surfaces the active blacklist on every outcome
-  turn as a `⛔ SESSION BLACKLIST` block at the top of the message
-  with one line per entry. Daemon sees what's forbidden persistently
-  and is told to halt branches that depended on a blacklisted shape
-  rather than rephrase around the fingerprint.
-- In-flight matching constructs get a red `.-blacklisted` border on
-  their pane (mirrors the `.-blocked` brake-denial pattern in shape;
-  red vs yellow to differentiate netrunner-authored from static-rule
-  blocking) plus a chatlog notice. Per netrunner direction: flag, do
-  NOT auto-kill — automatic mass-kill is what EJECT is for.
-- Watchdog system prompt grew a BLACKLIST AWARENESS paragraph so
-  questions like "what's blacklisted?" or "why was that spawn
-  refused?" get useful answers from the chatlog markers.
-- Tripwire half (LLM-authored matchers, DSL, severity routing) still
-  deferred — slice 2.
+### Watchdog Blacklist
+- `Blacklist` + `BlacklistEntry` in `watchdog.py`. Session-scoped, in-memory.
+- Fingerprint = first 80 chars lowercased of the killed task's text. Matches the daemon-session respawn-detector scheme.
+- Entry carries rich context (fingerprint, full_task, source construct id/state/final_output/files_written, reason, timestamp).
+- `Shift+K` registers the focused construct's fingerprint with the blacklist before killing — replaces the prior "blacklist not yet implemented; soft-killing" toast.
+- DaemonSession `_execute_action` checks each spawn against the blacklist; matches refused with feedback in the next outcome turn. Spawn NOT counted against caps when refused.
+- `_format_outcomes` surfaces active blacklist on every outcome turn as a `⛔ SESSION BLACKLIST` block.
+- In-flight matching constructs get a red `.-blacklisted` border (mirrors `.-blocked` in shape; red vs yellow). Per netrunner direction: flag, do NOT auto-kill.
 
 ### Spawn provenance (origin badges)
-- `fleet.spawn(..., origin=...)` — `daemon` / `netrunner` / `inject`
-- Threaded into `spawned` meta event payload
-- Chatlog renders cyan `[you]` for netrunner, `[↳you]` for inject;
-  daemon spawns un-badged
-- Watchdog system prompt includes badge legend (so it stops reverse-
-  engineering attribution from log timing)
+- `fleet.spawn(..., origin=...)` — `daemon` / `netrunner` / `inject`.
+- Threaded into `spawned` meta event payload.
+- Chatlog renders cyan `[you]` for netrunner, `[↳you]` for inject; daemon spawns un-badged.
 
-### z-to-view (file/profile/script)
-- `action_expand` on FileListItem / ProfileListItem / ScriptListItem
-  opens ExpandModal with file content from disk
-- Pygments syntax highlighting via `rich.syntax.Syntax` for ~30
-  recognized languages
-- Theme: `github-dark`. Line numbers off (gutter tint reads as
-  "highlight" — too aggressive)
-- Detection cascade: extension → bare-name → shebang
-- Plain-text fallback with bracket escape for unknown extensions
-- 2MB size cap; UTF-8 with replacement
-- Modal scroll bindings: w/s line, PgUp/PgDn page, Home/End jump
+### z-to-view (file/profile/script/tool/plugin)
+- `action_expand` opens ExpandModal with content from disk.
+- Pygments syntax highlighting via `rich.syntax.Syntax` for ~30 languages.
+- Theme: `github-dark`. Line numbers off.
+- Detection cascade: extension → bare-name → shebang.
+- Plain-text fallback with bracket escape for unknown extensions.
+- 2MB size cap; UTF-8 with replacement.
+- Modal scroll bindings: w/s line, PgUp/PgDn page, Home/End jump.
 
 ### Path-normalized Files panel dedupe
-- Bug: Windows backslash vs forward slash + dispatcher
-  `Path(p).resolve()` produced literal-distinct strings → double-listing
-- Fix: `os.path.normcase(os.path.normpath(p))` as dedupe key
-- Same normalization on `_remove_file_from_panel`
+- Bug: Windows backslash vs forward slash + dispatcher `Path(p).resolve()` produced literal-distinct strings → double-listing.
+- Fix: `os.path.normcase(os.path.normpath(p))` as dedupe key.
 
 ### Focus navigation fall-through
-- W/S walks within section; at section edge, falls through to
-  up/down neighbor section
-- Empty sections skipped transitively
-- Trap fix: when chain dead-ends through empty sections (e.g. W from
-  daemon_bar with empty main), fallback lands on any populated non-
-  source section. Layout edges (true None terminator with no walking)
-  stay put. Distinction: `walked=True` flag.
+- W/S walks within section; at section edge, falls through to up/down neighbor section.
+- Empty sections skipped transitively. Trap fix: when chain dead-ends through empty sections, fallback lands on any populated non-source section.
 
 ### UI infrastructure
-- ExpandModal universal magnifier (`z`) — RichLogs, ConstructPanes,
-  list items
-- Rich text preservation via Text/segment round-trip
-- Modal Tab fix: App-level Tab delegates to `screen.focus_next`
-- `?` keybinds modal slim
-- Quit unified to `ctrl+q`
-- Path shortening utility (`_shorten_path`)
-- Connection indicator in sidebar
-- `sys.unraisablehook` filter for Windows Proactor closed-pipe noise
+- ExpandModal universal magnifier (`z`) — RichLogs, ConstructPanes, list items.
+- Rich text preservation via Text/segment round-trip.
+- Modal Tab fix: App-level Tab delegates to `screen.focus_next`.
+- y/Y copy keybind (`clipboard.py` cross-platform, ctypes Win32 + pbcopy + xclip/wl-copy).
+- Quit unified to `Ctrl+Q` with running-state guard (idle: clean exit; running: toast + block).
+- `sys.unraisablehook` filter for Windows Proactor closed-pipe noise.
+
+### Unified event stream (the spine)
+- `event_bus.py` (DeckEvent + EventBus + Subscription + Severity + Kind constants). Single canonical fan-out point.
+- Producers wire via constructor `bus=`: Fleet, DaemonSession, Watchdog, Blacklist, TripwireEngine, BrakeStateStore, ConnectionMonitor, ProfileRegistry, PluginRegistry, etc.
+- Per-source translators (`_fleet_event_to_deck_event`, `_daemon_event_to_deck_event`).
+- File logger (`logger.py`) is a bus subscriber; per-launch NDJSON + `latest.log` pointer.
+- Phase 8b cleanup deferred: SessionPool / Daemon callback patterns (integration interfaces; documented).
+
+### Mechanic (separate-process supervisor + on-demand LLM session)
+- v0: sibling Python process tails NDJSON for live claude pids, kills on detected deck death. Cross-platform stdlib + ctypes.
+- v0→v1 bridge (item 0d): liveness heartbeat at `<home>/.cyberdeck/heartbeat` every 5s; mechanic logs STALE after 20s.
+- v1: diagnose-only LLM-session triage on unclean exit. `mechanic_triage.py` (~480 LOC); Family A clean-spawn recipe; sonnet/medium caliber; structured Markdown to `<log>-triage.md`.
+- v1.5: stale-heartbeat triage with interactive prompt + listens-for-recovery; `--auto-triage-on-stale` for headless. Live narration via `stream-json --verbose`. Partial-recovery on timeout; default 300s.
+
+### Caliber (per-spawn model + effort + fast-mode)
+- `caliber.py` (~250 LOC): `Caliber` frozen dataclass; KNOWN_MODELS + KNOWN_EFFORTS soft-validation; `to_claude_args()`; merge() for override hierarchy.
+- Plumbed through Construct / Fleet.spawn / DaemonSession with `default_caliber` on App.
+- DAEMON_SYSTEM_PROMPT has CALIBER SELECTION section documenting optional `model` / `effort` / `fast_mode` action fields.
+- SessionPool `warm_caliber` + `pull(requested_caliber=...)` match-or-skip gate. Mismatches publish `pool.caliber_mismatch` for observability.
+- `make_spawn_settings(fast_mode=...)`: shared cache-stable path for fast_mode=False; per-spawn override file for True.
+- Daemon caliber: model PINNED to opus, effort = netrunner's power-level knob via `EffortPickerScreen` modal (1-5 buttons). Persisted in state.json.
+- UI surfaces: sidebar `daemon: opus·high` (· fast when governor on); per-pane caliber suffix in headers; watchdog Q&A CALIBER AWARENESS section.
+- Phase 4 (quota-aware fallback) blocked on item 13.
+
+### Public-repo readiness
+- `doctor.py` (~280 LOC): 5 prereq checks (python ≥3.11, textual, mss, claude binary, claude --version). PASS/WARN/FAIL with remediation hints. Sentinel at `<home>/.cyberdeck/first_run_complete`. `--doctor` / `--no-doctor` flags. ASCII-only output (Windows cp1252 stdout encoding).
+- `preferences.py` (~210 LOC): typed accessors over state.json (`prefs.fast_mode`, `prefs.daemon_effort`, `prefs.brake`, etc.). Schema documented in module docstring with future placeholder fields.
+- README restructure: public-repo cold-reader rewrite; pitch + status callout above the fold; expanded prerequisites; design-canon section.
+
+### Auto-context discovery + per-role isolation phase 1
+- Discovery (2026-05-05): every claude subprocess silently auto-loads `<cwd>/CLAUDE.md` + walks parent dir tree concatenating ALL CLAUDE.mds + `~/.claude/CLAUDE.md` + auto-memory + rules dirs. Verified verbatim against Anthropic docs.
+- Phase 1 (~80 LOC): per-role env-var belt (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` + auto-memory + git-instructions).
+  - **KILLED** for Advisor, Construct, Daemon (both backends), Pool warmer, Tripwire-authoring Watchdog
+  - **KEPT** for Watchdog Q&A
+- Multi-line argv truncation fix: switched all problematic spawn sites to `--system-prompt-file` / `--append-system-prompt-file`. Promoted to top-level Hard Rule.
+- `user_email_protection` default tripwire: mitigation for `anthropics/claude-code#55743`. Reads OAuth email from `~/.claude.json` at startup; warning severity; brake denies with redirect.
 
 ---
 
 ## Key design decisions (carried forward)
 
-1. **Brake state is deck-global, not profile-attached.** The
-   netrunner sets it via `b`; it applies to every new spawn until
-   changed. Watchdog can ratchet up (toward paranoid) but not down
-   — that's the netrunner's exclusive prerogative.
-2. **Profiles are prescriptive, not restrictive.** They steer with
-   addendums and suggest tools via `recommended_tools`; they do NOT
-   gate capability. Runtime gating is the brake hook's job, deck-wide.
-3. **Brake enforcement is via PreToolUse hook, not `--allowedTools`.**
-   The hook is deterministic (regex/path matching, no LLM in the hot
-   path). Watchdog observes denials and authors the hook's policy
-   over time (LLM authors, deterministic enforces).
+1. **Brake state is deck-global, not profile-attached.** The netrunner sets it via `b`; it applies to every new spawn until changed. Watchdog can ratchet up (toward paranoid) but not down — that's the netrunner's exclusive prerogative.
+2. **Profiles are prescriptive, not restrictive.** They steer with addendums and suggest tools via `tools` field; they do NOT gate capability. Runtime gating is the brake hook's job, deck-wide.
+3. **Brake enforcement is via PreToolUse hook, not `--allowedTools`.** The hook is deterministic (regex/path matching, no LLM in the hot path). Watchdog observes denials and authors the hook's policy over time (LLM authors, deterministic enforces).
 4. **Default profile auto-seeded; netrunner edits sacred.**
 5. **Lowercase = within-focus, uppercase = move-focus.** `z` for zoom.
 6. **`space` is "primary interact"; `z` is magnify.**
 7. **Truncation: 500 live, 5000 modal.** Bounded against megabytes.
-8. **Pool always warms with `default`.** No per-profile pools.
+8. **Pool always warms with `default`.** No per-profile pools. Pool warms with deck's `default_caliber` (today sonnet+high).
 9. **Files panel: dual path with dedupe (normalized).**
-10. **Marker protocol one-way (script → deck).** Versioned. Unknown
-    action logs warning; never crashes.
-11. **Tools panel:** Profiles + Scripts only. Built-ins not surfaced.
-12. **Goal-update propagation deferred to next break.** Force-push is
-    M5+. Wake-event keeps idle sessions responsive.
-13. **Goal-diff classifier is heuristic, not model-driven.**
-    Cheap; "good enough"; can model-ify later.
+10. **Marker protocol one-way (script → deck).** Versioned. Unknown action logs warning; never crashes.
+11. **Tools panel:** unified Tools ListView (binary / script / plugin). Built-ins not surfaced as registry citizens.
+12. **Goal-update propagation deferred to next break.** Force-push is M5+. Wake-event keeps idle sessions responsive.
+13. **Goal-diff classifier is heuristic, not model-driven.** Cheap; "good enough"; can model-ify later.
 14. **ConnectionMonitor presumes ONLINE at start.**
 15. **DNS failure skips Degraded.** Clean signal: no network at all.
-16. **Watchdog runs cloud Claude today.** Local-model substrate (D1)
-    is the eventual home.
-17. **Streaming is the default; one-shot is the fallback.** For both
-    daemon and watchdog.
-18. **Streaming wedge → kill, don't preserve-and-pray.** Once stuck,
-    fresh subprocess is the only reliable recovery.
-19. **Origin attribution at source, not reverse-engineered.** Fleet
-    payload carries who spawned each construct.
-20. **z-modal:** bracket escape on plain text, syntax highlighting
-    on known languages, github-dark theme, no line numbers.
-21. **Tripwire authoring forks the watchdog's Q&A session via
-    `--resume <id>` rather than running on a fresh isolated subprocess.**
-    The authoring model gets the same situational awareness the Q&A
-    side has accumulated (recent fleet activity, prior questions
-    answered) without writing back into the live Q&A conversation.
-    Falls back to a fresh one-shot when no session_id is captured
-    (cold start, streaming disabled, post-wedge). Server-side
-    semantics of concurrent `--resume` against a live streaming
-    session aren't fully proven — slice 2 ships the design and trusts
-    real-deck testing to confirm. If `--resume` misbehaves under
-    concurrency, dropping `_session_id` capture flips the whole thing
-    to rung 2 with no other code change.
-22. **LLM_AUTHORED tripwires use clear-and-replace, not accumulate
-    -and-update.** Each authoring pass drops prior LLM-authored
-    entries before registering new ones; defaults / manual /
-    blacklist-derived entries stay untouched. Rejected alternative
-    "register-by-name updates in place" because old-goal rules linger
-    forever otherwise — pivot to unrelated work, yesterday's
-    credentials-hunting rule still fires. Even authoring failures
-    clear the prior set, so a substrate hiccup doesn't preserve
-    rules whose original goal context is gone.
-23. **Authoring skips on clarification-class goal updates.** The
-    `_classify_goal_diff` heuristic is repurposed as a re-author
-    gate: pivots and scope-changes get a new authoring pass; pure
-    clarifications (old goal is a strict subset of new) skip — the
-    netrunner is adding detail to existing direction, the model
-    already authored for it, re-running burns tokens for no signal.
+16. **Watchdog runs cloud Claude today.** Local-model substrate (D1) is the eventual home.
+17. **Streaming is the default; one-shot is the fallback.** For both daemon and watchdog.
+18. **Streaming wedge → kill, don't preserve-and-pray.** Once stuck, fresh subprocess is the only reliable recovery.
+19. **Origin attribution at source, not reverse-engineered.** Fleet payload carries who spawned each construct.
+20. **z-modal:** bracket escape on plain text, syntax highlighting on known languages, github-dark theme, no line numbers.
+21. **Tripwire authoring forks the watchdog's Q&A session via `--resume <id>` rather than running on a fresh isolated subprocess.** The authoring model gets the same situational awareness the Q&A side has accumulated. Falls back to a fresh one-shot when no session_id is captured.
+22. **LLM_AUTHORED tripwires use clear-and-replace, not accumulate-and-update.** Each authoring pass drops prior LLM-authored entries before registering new ones; defaults / manual / blacklist-derived entries stay untouched. Even authoring failures clear the prior set.
+23. **Authoring skips on clarification-class goal updates.** The `_classify_goal_diff` heuristic gates re-authoring: pivots and scope-changes get a new pass; pure clarifications skip.
+24. **X = approval / execute (deck-wide).** Established 2026-05-01 with safety-pass slice 3. Bidirectional by context — under default/paranoid X approves a deny-default; under YOLO X interrupts an allow-default. Both lowercase x and Shift+X bind to the same `action_x_focused` (this isn't a soft/loud pair; it's deliberate-execute either way). The rule extends to all future netrunner-prompt surfaces.
+25. **Caliber: model is the substrate, effort is the power-level knob.** Daemon model is PINNED to opus (it's making management decisions). Daemon effort is the netrunner's tunable knob via Limits modal. Construct caliber (model + effort + fast_mode) is daemon-controlled per-spawn; netrunner overrides via Limits modal or daemon chat.
+26. **Per-role CLAUDE.md auto-load policy is selective, not blanket.** Watchdog Q&A KEEPS auto-load (deck "security analyst" benefits from gotchas + design context). Advisor / Construct / Daemon / Pool warmer / Tripwire-authoring Watchdog KILL auto-load (their context should be explicit, not implicit).
 
 ---
 
 ## Filed gotchas (institutional memory; cumulative)
 
+> **This section is sacred.** Every entry was filed because we hit the
+> bug, diagnosed it, and want never to re-introduce it. Read this when
+> touching subprocess lifecycle, modal screens, async cleanup, or
+> Windows-specific code paths. Don't trim entries — even old ones
+> protect against pattern recurrence.
+
 ### Terminal / Textual
-- **Don't shadow Textual `Widget._render()`.** It's a real method
-  on the base class that returns a `Visual`. Overriding it with a
-  custom render method returns `None` (or whatever your method
-  returns) and crashes Textual's render pipeline with
-  `AttributeError: 'NoneType' object has no attribute 'render_strips'`
-  in `widget.py:_render_content` → `Visual.to_strips`. Real-deck
-  caught 2026-05-01 on the first slice 3 phase 1 attempt: `DelayList
-  Item._render` shadowed the parent. Crash on first paint of the
-  Delays tab. Fix: rename your custom render method to anything else
-  (`_paint`, `_redraw`, `_update_text`). General rule: any
-  underscore-prefixed method on a Widget subclass should be checked
-  against Textual's API before being added — Textual treats
-  underscore-prefix names as protected, not private.
-- **A widget render-crash can leave the tree in a state that
-  silently breaks unrelated mutations.** Real-deck observed
-  2026-05-01 (post-fix of the `_render` shadowing above): after
-  the crashed deck was restarted, finalized construct panes
-  stopped moving to the bottom of `#main` even though
-  `_compact_pane_after_delay` was running and `pane.compact`
-  was being set. Restarting the deck a second time cleared it
-  ("heisenbug"). Hypothesis: the prior session's render crash
-  corrupted some Textual-side widget bookkeeping that survived
-  into the next launch via `cyberdeck-home/` state or process-
-  group quirks; or asyncio worker scheduling got starved by a
-  backlog of crashed widgets. Mitigation pattern: when a
-  Textual widget crashes during render, restart the deck
-  before trusting any subsequent UI behavior. Diagnostic
-  pattern: surface widget-mutation calls via `fleet_log.write`
-  AND a bus event so the file logger captures both
-  "scheduled" and "fired" lifecycle markers — without bus
-  visibility, "did the timer fire?" requires netrunner-screen
-  observation. See `_schedule_compact_pane` /
-  `_compact_pane_after_delay` in tui.py for the diagnostic
-  pattern (shipped in commit e33ec75 after the heisenbug).
-- **`shift+space`, `ctrl+space`, `ctrl+i`, `ctrl+m`** rarely transmit
-  distinctly in real terminals. Trust pilot for binding wiring; trust
-  real terminal for capability.
+- **Don't shadow Textual `Widget._render()`.** It's a real method on the base class that returns a `Visual`. Overriding it with a custom render method returns `None` (or whatever your method returns) and crashes Textual's render pipeline with `AttributeError: 'NoneType' object has no attribute 'render_strips'` in `widget.py:_render_content` → `Visual.to_strips`. Real-deck caught 2026-05-01 on the first slice 3 phase 1 attempt: `DelayListItem._render` shadowed the parent. Crash on first paint of the Delays tab. Fix: rename your custom render method to anything else (`_paint`, `_redraw`, `_update_text`). General rule: any underscore-prefixed method on a Widget subclass should be checked against Textual's API before being added — Textual treats underscore-prefix names as protected, not private.
+- **A widget render-crash can leave the tree in a state that silently breaks unrelated mutations.** Real-deck observed 2026-05-01 (post-fix of the `_render` shadowing above): after the crashed deck was restarted, finalized construct panes stopped moving to the bottom of `#main` even though `_compact_pane_after_delay` was running and `pane.compact` was being set. Restarting the deck a second time cleared it ("heisenbug"). Hypothesis: the prior session's render crash corrupted some Textual-side widget bookkeeping that survived into the next launch via `cyberdeck-home/` state or process-group quirks; or asyncio worker scheduling got starved by a backlog of crashed widgets. Mitigation pattern: when a Textual widget crashes during render, restart the deck before trusting any subsequent UI behavior. Diagnostic pattern: surface widget-mutation calls via `fleet_log.write` AND a bus event so the file logger captures both "scheduled" and "fired" lifecycle markers.
+- **`shift+space`, `ctrl+space`, `ctrl+i`, `ctrl+m`** rarely transmit distinctly in real terminals. Trust pilot for binding wiring; trust real terminal for capability.
 - **Textual `Widget.name` is read-only.** Don't shadow.
 - **`Log.lines` is `list[str]`; `RichLog.lines` is `list[Strip]`.**
 - **Markup leaks via `\n`.** Collapse before writing.
-- **`wrap=True` + `min_width=1` inside an inactive TabPane** pre-wraps
-  content at 1 char per line and caches Strips. Use `wrap=False` for
-  logs in non-default tabs OR buffer-and-replay on activation.
-- **`can_focus=False` on a Static-derived class is a no-op** because
-  Static defaults that way.
+- **`wrap=True` + `min_width=1` inside an inactive TabPane** pre-wraps content at 1 char per line and caches Strips. Use `wrap=False` for logs in non-default tabs OR buffer-and-replay on activation.
+- **`can_focus=False` on a Static-derived class is a no-op** because Static defaults that way.
 - **Modal screens don't inherit App BINDINGS.** Redeclare on the modal.
-- **App-level priority bindings** beat modal priority. Delegate from
-  App action when `isinstance(self.screen, ModalScreen)`.
-- **ListView focus model:** the focused widget IS the ListView;
-  `.highlighted_child` is cursor.
+- **App-level priority bindings** beat modal priority. Delegate from App action when `isinstance(self.screen, ModalScreen)`.
+- **ListView focus model:** the focused widget IS the ListView; `.highlighted_child` is cursor.
 - **Two TabbedContents need `id` to disambiguate `query_one`.**
 
 ### Rich markup
-- **Markup escape:** `\[` for opening bracket, closing `]` is literal.
-  Use raw f-strings (`rf"..."`) to silence Python escape warnings.
-- **File contents need bracket escape** before going to a markup-
-  enabled RichLog. `[default]` TOML headers will be parsed otherwise.
-- **`rich.syntax.Syntax` returns a single Renderable** but RichLog
-  splits it into Strips, so scrolling stays line-by-line.
+- **Markup escape:** `\[` for opening bracket, closing `]` is literal. Use raw f-strings (`rf"..."`) to silence Python escape warnings.
+- **File contents need bracket escape** before going to a markup-enabled RichLog. `[default]` TOML headers will be parsed otherwise.
+- **`rich.syntax.Syntax` returns a single Renderable** but RichLog splits it into Strips, so scrolling stays line-by-line.
 
 ### Async / subprocess
-- **mechanic.py log-file-selection race on quick deck restart.**
-  Filed 2026-05-06 during Mechanic v1.5 real-deck testing.
-  Symptom: netrunner kills the deck and relaunches within
-  ~5-10 seconds; new mechanic immediately reports "deck
-  pid=XXXXX died" and fires triage on a fresh, alive deck.
-  Doesn't reproduce when waiting longer between restarts.
+- **mechanic.py log-file-selection race on quick deck restart.** Filed 2026-05-06 during Mechanic v1.5 real-deck testing. Symptom: netrunner kills the deck and relaunches within ~5-10 seconds; new mechanic immediately reports "deck pid=XXXXX died" and fires triage on a fresh, alive deck. Doesn't reproduce when waiting longer between restarts.
 
-  Root cause: `mechanic.find_log_file` returns the most-recently-
-  modified `cyberdeck-*.log` within the 5-minute freshness
-  window (`_LOG_FRESHNESS_SECONDS = 300`). On a quick restart:
+  Root cause: `mechanic.find_log_file` returns the most-recently-modified `cyberdeck-*.log` within the 5-minute freshness window (`_LOG_FRESHNESS_SECONDS = 300`). On a quick restart:
 
     - T=0: deck1 dies; its log mtime frozen
     - T=N: netrunner relaunches; launch.bat fires deck2
     - T=N+0.1: deck2 starts python (cold start ~1-3s on Win)
     - T=N+1.1: launch.bat fires mechanic (after 1s sleep)
-    - T=N+1.2: mechanic.find_log_file polls — deck2's log
-      file may NOT EXIST YET (deck still in Python startup).
-      Only deck1's log is in the freshness window.
-      mechanic attaches to deck1's log, reads deck1's pid
-      from header → pid is dead → fires triage on a stale
-      log even though deck2 is healthy and running.
+    - T=N+1.2: mechanic.find_log_file polls — deck2's log file may NOT EXIST YET (deck still in Python startup). Only deck1's log is in the freshness window. mechanic attaches to deck1's log, reads deck1's pid from header → pid is dead → fires triage on a stale log even though deck2 is healthy and running.
 
-  Why "wait 10s" works: deck2 has time to write its log
-  header before mechanic polls, so deck2's log mtime is
-  newer than deck1's, and the newest-mtime selection picks
-  the right file.
+  Why "wait 10s" works: deck2 has time to write its log header before mechanic polls, so deck2's log mtime is newer than deck1's, and the newest-mtime selection picks the right file.
 
-  Fix: validate header pid liveness in `wait_for_log_file`.
-  New `_peek_log_header_pid(log_path)` reads only the first
-  line of the candidate log, parses as NDJSON, returns the
-  `log_header.pid` field (or None on parse error / wrong
-  type / missing field). `wait_for_log_file` calls this and
-  ALSO calls `pid_alive(pid)`; only commits to a log file
-  whose deck pid is currently alive. Stale logs (pid dead)
-  get silently skipped each poll; loop continues until either
-  a live-deck log appears OR `startup_timeout` elapses (in
-  which case mechanic exits cleanly rather than misattaching).
+  Fix: validate header pid liveness in `wait_for_log_file`. New `_peek_log_header_pid(log_path)` reads only the first line of the candidate log, parses as NDJSON, returns the `log_header.pid` field (or None on parse error / wrong type / missing field). `wait_for_log_file` calls this and ALSO calls `pid_alive(pid)`; only commits to a log file whose deck pid is currently alive. Stale logs (pid dead) get silently skipped each poll.
 
-  Verified with three smoke tests:
-    1. Only stale log exists → `wait_for_log_file` skips
-       it and times out (returns None).
-    2. Stale log present + live log written 1s later →
-       `wait_for_log_file` skips stale, picks up live one
-       when it appears (~1s elapsed).
-    3. Live log present from the start → returns immediately.
+  **Lesson generalizes:** any "newest by mtime" selection over files that get reused across launches needs a freshness + liveness check. mtime alone isn't enough when files from multiple launches sit in the same directory within the freshness window.
 
-  **Lesson generalizes:** any "newest by mtime" selection over
-  files that get reused across launches needs a freshness +
-  liveness check. mtime alone isn't enough when files from
-  multiple launches sit in the same directory within the
-  freshness window.
+- **🚨 ctypes Windows-handle truncation: ALWAYS set argtypes / restype on kernel32 / user32 / advapi32 calls.** Filed 2026-05-06 during Mechanic v1.5 real-deck testing. Symptom: mechanic.py reported the deck dead immediately after launch ("[mechanic] deck pid=XXXXX died ... cleaning up 0 tracked subprocess(es); firing v1 triage") even though the deck was fully alive and writing log records. Triage fired unnecessarily, burning ~2 minutes + tokens per false-positive launch.
 
-- **🚨 ctypes Windows-handle truncation: ALWAYS set argtypes /
-  restype on kernel32 / user32 / advapi32 calls.** Filed
-  2026-05-06 during Mechanic v1.5 real-deck testing. Symptom:
-  mechanic.py reported the deck dead immediately after launch
-  ("[mechanic] deck pid=XXXXX died ... cleaning up 0 tracked
-  subprocess(es); firing v1 triage") even though the deck was
-  fully alive and writing log records. Triage fired
-  unnecessarily, burning ~2 minutes + tokens per false-positive
-  launch.
-  
-  Mechanism: ctypes `kernel32.OpenProcess(...)` without explicit
-  argtypes/restype defaults to `c_int` (32-bit signed) for the
-  HANDLE return value. On 64-bit Windows, HANDLE is pointer-sized
-  (8 bytes); the default truncates to 32 bits. Sometimes the
-  truncated handle is still non-zero (looks valid to `if not h`)
-  but is corrupt — `GetExitCodeProcess(h, ...)` fails (returns 0)
-  → `_pid_alive_win` returns False → mechanic concludes the
-  deck is dead.
-  
-  Intermittent in practice: depends on whether the OS happened to
-  return a HANDLE with non-zero high bits (which is non-
-  deterministic between launches and varies by Windows version /
-  Python ctypes version). Bug latent for the entire mechanic v0
-  history; surfaced reliably enough on Python 3.14.3 + Windows 11
-  to be diagnosed.
-  
+  Mechanism: ctypes `kernel32.OpenProcess(...)` without explicit argtypes/restype defaults to `c_int` (32-bit signed) for the HANDLE return value. On 64-bit Windows, HANDLE is pointer-sized (8 bytes); the default truncates to 32 bits. Sometimes the truncated handle is still non-zero (looks valid to `if not h`) but is corrupt — `GetExitCodeProcess(h, ...)` fails (returns 0) → `_pid_alive_win` returns False → mechanic concludes the deck is dead.
+
+  Intermittent in practice: depends on whether the OS happened to return a HANDLE with non-zero high bits (which is non-deterministic between launches and varies by Windows version / Python ctypes version). Bug latent for the entire mechanic v0 history; surfaced reliably enough on Python 3.14.3 + Windows 11 to be diagnosed.
+
   Fix: declare full argtypes + restype using `ctypes.wintypes`:
     OpenProcess.argtypes = [DWORD, BOOL, DWORD]; restype = HANDLE
     GetExitCodeProcess.argtypes = [HANDLE, POINTER(DWORD)]; restype = BOOL
     CloseHandle.argtypes = [HANDLE]; restype = BOOL
-  
-  Generalizes beyond mechanic: any future ctypes call into
-  kernel32 / user32 / advapi32 / etc. MUST set argtypes + restype
-  before calling. Skipping is a Windows-64-bit landmine. Test
-  shape: spawn a known-alive subprocess, call your function on
-  its pid, assert True; kill it, call again, assert False.
-  Skipping the test = waiting for the next intermittent
-  reproduction in production.
 
-- **Async-task teardown isn't guaranteed to run before process
-  exit.** Filed 2026-05-06 during Mechanic v1 real-deck testing.
-  `action_quit` (Ctrl+Q idle path) called `self.exit()` after
-  `fleet.shutdown()`, with the assumption that `_drive_fleet`'s
-  finally-block teardown would write the log_footer with
-  `reason="shutdown"`. Two failure modes broke that:
-    1. **`_drive_fleet` may never have started.** Idle deck with
-       no goal set yet → no fleet-driving coroutine → no
-       teardown → no footer.
-    2. **Textual's `exit()` cancels async tasks; finally-block
-       timing isn't deterministic.** The fleet-driving coroutine
-       might get cancelled before its finally block runs OR the
-       process might exit before the cancellation propagates
-       fully.
-  Symptom: Mechanic v1 supervisor sees no `log_footer` record at
-  EOF, classifies the exit as unclean, fires expensive triage on
-  every clean Ctrl+Q (sonnet/medium triage = ~2 minutes of
-  `claude -p` per shutdown). Cost: real money + delayed exit
-  experience. Fix: close the logger EXPLICITLY in `action_quit`
-  before `self.exit()`, mirroring what `_do_eject` already does
-  for the eject path. `DeckLogger.close()` is idempotent so
-  belt-and-suspenders close calls in `_drive_fleet` teardown
-  remain harmless. **Lesson:** any cleanup that needs to be
-  durable across process exit must run synchronously BEFORE
-  `exit()`. Don't rely on async finally-blocks to fire reliably
-  under cancellation. The eject path was already doing this
-  correctly; the quit path drifted.
-- **🔓 USER EMAIL AUTO-INJECTED BY CLAUDE CODE — UPSTREAM BUG #55743.**
-  Filed 2026-05-06 during item-000 verification. Anthropic's
-  Claude Code reads the OAuth-account email from `~/.claude.json`
-  and injects it into every session's user-message context as a
-  `# userEmail` block. **There is no documented opt-out.** The
-  reporter (vgexpeditions, anthropics/claude-code#55743) confirms
-  the leak path; we verified empirically on 2026-05-06: NONE of
-  these suppress it on Claude Code 2.1.126 + Windows 11:
+  Generalizes beyond mechanic: any future ctypes call into kernel32 / user32 / advapi32 / etc. MUST set argtypes + restype before calling. Skipping is a Windows-64-bit landmine. Test shape: spawn a known-alive subprocess, call your function on its pid, assert True; kill it, call again, assert False. Skipping the test = waiting for the next intermittent reproduction in production.
+
+- **Async-task teardown isn't guaranteed to run before process exit.** Filed 2026-05-06 during Mechanic v1 real-deck testing. `action_quit` (Ctrl+Q idle path) called `self.exit()` after `fleet.shutdown()`, with the assumption that `_drive_fleet`'s finally-block teardown would write the log_footer with `reason="shutdown"`. Two failure modes broke that:
+    1. **`_drive_fleet` may never have started.** Idle deck with no goal set yet → no fleet-driving coroutine → no teardown → no footer.
+    2. **Textual's `exit()` cancels async tasks; finally-block timing isn't deterministic.** The fleet-driving coroutine might get cancelled before its finally block runs OR the process might exit before the cancellation propagates fully.
+  Symptom: Mechanic v1 supervisor sees no `log_footer` record at EOF, classifies the exit as unclean, fires expensive triage on every clean Ctrl+Q (sonnet/medium triage = ~2 minutes of `claude -p` per shutdown). Cost: real money + delayed exit experience. Fix: close the logger EXPLICITLY in `action_quit` before `self.exit()`, mirroring what `_do_eject` already does for the eject path. `DeckLogger.close()` is idempotent so belt-and-suspenders close calls in `_drive_fleet` teardown remain harmless. **Lesson:** any cleanup that needs to be durable across process exit must run synchronously BEFORE `exit()`. Don't rely on async finally-blocks to fire reliably under cancellation.
+
+- **🔓 USER EMAIL AUTO-INJECTED BY CLAUDE CODE — UPSTREAM BUG #55743.** Filed 2026-05-06 during item-000 verification. Anthropic's Claude Code reads the OAuth-account email from `~/.claude.json` and injects it into every session's user-message context as a `# userEmail` block. **There is no documented opt-out.** The reporter (vgexpeditions, anthropics/claude-code#55743) confirms the leak path; we verified empirically on 2026-05-06: NONE of these suppress it on Claude Code 2.1.126 + Windows 11:
     - `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`
     - `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`
     - `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`
-    - `--bare` (would suppress, but breaks Claude Max OAuth — see
-      sibling gotcha)
-    - `--system-prompt <text>` (full-replace; doesn't help — the
-      block is in user-message context, not system prompt)
+    - `--bare` (would suppress, but breaks Claude Max OAuth — see sibling gotcha)
+    - `--system-prompt <text>` (full-replace; doesn't help — the block is in user-message context, not system prompt)
     - `--exclude-dynamic-system-prompt-sections`
     - `--tools ""` + `--disable-slash-commands`
-  We confirmed the env vars ARE reaching the spawned subprocess
-  (a probe construct ran `Get-ChildItem Env:` and dumped all
-  three `CLAUDE_CODE_DISABLE_*=1` entries). The leak channel
-  isn't gated by any of them.
+  We confirmed the env vars ARE reaching the spawned subprocess. The leak channel isn't gated by any of them.
 
-  **Mitigation shipped 2026-05-06:** new default tripwire
-  `user_email_protection` (`tripwires.py`). Reads the email from
-  `~/.claude.json` at deck startup, builds a regex matching that
-  literal string, registers as a deck-global warning-tier
-  tripwire scanning TOOL_USE + ASSISTANT events with field=ANY.
-  When a construct attempts to include the email in a tool
-  command (e.g. `curl -A "contact: <email>"`), tool input
-  (e.g. Write to a file containing the email), or assistant
-  text, the brake hook denies the next tool call with the
-  suggestion: "You are not permitted to utilize the netrunner's
-  email unless specifically instructed to. ... If a task needs
-  contact info (User-Agent header, form field, etc.), use a
-  generic placeholder like `cyberdeck@example.invalid` or ask
-  the netrunner for explicit permission first." Carve-out for
-  explicit netrunner consent: severity is WARNING (deny + redirect),
-  not CRITICAL, so the construct can be told to use the email
-  on a per-task basis without permanent blacklist. **The model
-  already knows the email** because it's in every spawn's context
-  via the leak — we use the leak as the trigger; the deck
-  itself never writes the email to disk, never commits to git,
-  never logs it. Email lives ONLY in `~/.claude.json` (Anthropic-
-  written) and the compiled regex (in-memory at runtime).
+  **Mitigation shipped 2026-05-06:** new default tripwire `user_email_protection` (`tripwires.py`). Reads the email from `~/.claude.json` at deck startup, builds a regex matching that literal string, registers as a deck-global warning-tier tripwire scanning TOOL_USE + ASSISTANT events with field=ANY. When a construct attempts to include the email, brake hook denies the next tool call with the suggestion: "You are not permitted to utilize the netrunner's email unless specifically instructed to. ... If a task needs contact info (User-Agent header, form field, etc.), use a generic placeholder like `cyberdeck@example.invalid` or ask the netrunner for explicit permission first." **The model already knows the email** because it's in every spawn's context via the leak — we use the leak as the trigger; the deck itself never writes the email to disk.
 
-  **When Anthropic ships a privacy flag** (issue's request: a
-  `privacy.injectUserEmail: false` in settings.json, or an env
-  var like `CLAUDE_CODE_DISABLE_USER_EMAIL=1`): add it to the
-  env-var belt in `construct.py` / `daemon.py` / `watchdog.py`,
-  and consider whether to retire or keep `user_email_protection`
-  (probably keep — the tripwire is cheap and provides
-  defense-in-depth).
+  **When Anthropic ships a privacy flag**: add it to the env-var belt in `construct.py` / `daemon.py` / `watchdog.py`, and consider whether to retire or keep `user_email_protection` (probably keep — defense-in-depth).
 
-- **🚨 MULTI-LINE ARGV ON WINDOWS — TRUNCATES AT FIRST NEWLINE.**
-  THE most recurring bug in the project's history. Six or seven
-  separate incidents across chat-era and Claude Code era; we keep
-  re-introducing it because the symptom is silent (no error, no
-  warning — content just disappears). Promoted to a top-level
-  Hard Rule in CLAUDE.md (2026-05-05). Read this entry once,
-  remember the fix forever.
+- **🚨 MULTI-LINE ARGV ON WINDOWS — TRUNCATES AT FIRST NEWLINE.** THE most recurring bug in the project's history. Six or seven separate incidents across chat-era and Claude Code era; we keep re-introducing it because the symptom is silent (no error, no warning — content just disappears). Promoted to a top-level Hard Rule in CLAUDE.md (2026-05-05). Read this entry once, remember the fix forever.
 
-  **Mechanism:** Windows' cmd.exe and CreateProcess argv parsing
-  silently truncate command-line argument values at the first
-  `\n`. POSIX shells (Linux, macOS) handle multi-line argv
-  correctly, so the bug is Windows-specific in symptom — but the
-  fix is platform-agnostic, and the deck targets hardware-agnostic
-  deployment (RPi-Linux is the eventual home), so we always use
-  the platform-agnostic pattern.
+  **Mechanism:** Windows' cmd.exe and CreateProcess argv parsing silently truncate command-line argument values at the first `\n`. POSIX shells (Linux, macOS) handle multi-line argv correctly, so the bug is Windows-specific in symptom — but the fix is platform-agnostic, and the deck targets hardware-agnostic deployment.
 
-  **Most recent diagnosis (2026-05-05, Advisor round 4):**
-  Passing the Advisor's ~5800-char composed system prompt to
-  `claude -p --system-prompt "$prompt"` resulted in the model
-  receiving only the opening sentence — "You are the Advisor for
-  ONE specific tool: <name>." — and absolutely nothing else. The
-  model honestly reported "I don't have a README"; it didn't.
-  Diagnosed by asking the model to verbatim-quote its own
-  EXTENDED DOCUMENTATION block; reply was "NO EXTENDED
-  DOCUMENTATION SECTION." Repro'd cleanly with a synthetic 3-line
-  prompt: lines 2 and 3 silently clipped under `--system-prompt`;
-  both survive intact under `--system-prompt-file`.
+  **Most recent diagnosis (2026-05-05, Advisor round 4):** Passing the Advisor's ~5800-char composed system prompt to `claude -p --system-prompt "$prompt"` resulted in the model receiving only the opening sentence — "You are the Advisor for ONE specific tool: <name>." — and absolutely nothing else. The model honestly reported "I don't have a README"; it didn't. Diagnosed by asking the model to verbatim-quote its own EXTENDED DOCUMENTATION block; reply was "NO EXTENDED DOCUMENTATION SECTION." Repro'd cleanly with a synthetic 3-line prompt: lines 2 and 3 silently clipped under `--system-prompt`; both survive intact under `--system-prompt-file`.
 
   **Symptom checklist** (any of these → suspect this bug):
-  - Subprocess receives only the first line of multi-line content
-    you tried to pass via argv.
-  - Model "honestly reports" missing context that you know you
-    sent (e.g. "I don't have a README" when you injected one).
-  - Behavior changes when you collapse newlines to spaces in your
-    argv value.
+  - Subprocess receives only the first line of multi-line content you tried to pass via argv.
+  - Model "honestly reports" missing context that you know you sent (e.g. "I don't have a README" when you injected one).
+  - Behavior changes when you collapse newlines to spaces in your argv value.
   - "Works on Linux, broken on Windows."
 
-  **Fix (canonical):** Use the `-file` variant of the flag.
-  Claude Code provides `--system-prompt-file` for
-  `--system-prompt`, `--append-system-prompt-file` for
-  `--append-system-prompt`, `--mcp-config <file>` for
-  `--mcp-config <json>`, etc. Write the content to a temp file
-  via `tempfile.mkstemp`, pass the path, unlink in `finally`.
+  **Fix (canonical):** Use the `-file` variant of the flag. Claude Code provides `--system-prompt-file` for `--system-prompt`, `--append-system-prompt-file` for `--append-system-prompt`, `--mcp-config <file>` for `--mcp-config <json>`, etc. Write the content to a temp file via `tempfile.mkstemp`, pass the path, unlink in `finally`.
 
   **Existing examples to copy from:**
   - `advisor.py:_run_one` — Family A (full replace) pattern.
   - `watchdog.py:_process_oneshot` — Family B (append) pattern.
-  Both use `tempfile.mkstemp` + `finally: os.unlink(...)` for
-  cleanup.
+  Both use `tempfile.mkstemp` + `finally: os.unlink(...)` for cleanup.
 
   **Workarounds we've used in the past (lossy but functional):**
-  - `construct.py:468` collapses all whitespace (including
-    newlines) to single spaces before passing as argv —
-    `addendum_arg = " ".join(joined.split())`. Works (no
-    truncation) but loses paragraph structure. Acceptable for
-    short addenda, lossy for long ones. The systemic spawn-
-    isolation slice (build-plan 000) will upgrade this to
-    `--append-system-prompt-file`.
-  - The watchdog STREAMING path (`_process_streaming`) inlines
-    the system prompt into the first user JSONL message rather
-    than passing it as a flag at all — different mechanism, same
-    rationale (avoid argv-newline issues entirely).
+  - `construct.py:468` collapses all whitespace (including newlines) to single spaces before passing as argv — `addendum_arg = " ".join(joined.split())`. Works (no truncation) but loses paragraph structure. Acceptable for short addenda, lossy for long ones.
+  - The watchdog STREAMING path (`_process_streaming`) inlines the system prompt into the first user JSONL message rather than passing it as a flag at all — different mechanism, same rationale (avoid argv-newline issues entirely).
 
-  **The systemic spawn-isolation slice (build-plan 000) inherits
-  this rule** — every role-prompt injection MUST use the file-
-  based flag. The design doc has worked examples for both
-  Family A and Family B.
+  **Lesson, paraphrased:** any subprocess flag that takes multi-line content as an argv value is a tripwire on Windows. Always prefer the `-file` variant when one exists. If a flag doesn't have a `-file` variant, inline the content into the user message instead (the streaming-watchdog approach).
 
-  **Lesson, paraphrased:** any subprocess flag that takes
-  multi-line content as an argv value is a tripwire on Windows.
-  Always prefer the `-file` variant when one exists. If a flag
-  doesn't have a `-file` variant, inline the content into the
-  user message instead (the streaming-watchdog approach).
-- **`--bare` breaks Claude Max OAuth auth.** Filed 2026-05-05
-  during Advisor verification. Quoting `claude --help` directly
-  (NOT obvious from the memory docs): `--bare` says *"Anthropic
-  auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via
-  --settings (OAuth and keychain are never read)."* The
-  netrunner's deck uses Claude Max via OAuth/keychain. With
-  `--bare` set, every spawn exits 1 with no stderr because auth
-  never resolves. **Symptom**: `claude exited 1: (no stderr)`
-  on every subprocess call. **Fix**: drop `--bare`, use env
-  vars + `--disable-slash-commands` for the suppression layers
-  `--bare` was covering — they're independently documented and
-  don't break auth (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`,
-  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`,
-  `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`). Failure mode is
-  particularly nasty because integration tests with API-key
-  auth would pass while the netrunner's actual deck silently
-  fails. **Lesson**: any flag that mentions auth in its help
-  text is a tripwire on this codebase — read the help, not
-  just the docs page.
-- **`stdin.close()` on Windows ProactorEventLoop is fire-and-forget.**
-  Always pair with `await stdin.wait_closed()` (with a timeout).
-  Without this, transport `__del__` fires on a half-closed socket and
-  raises `ValueError: I/O operation on closed pipe` after Ctrl+C.
-- **`sys.unraisablehook` is the place** to filter known-harmless
-  GC-time noise.
-- **"Preserve the wedged proc, hope it recovers" is always wrong**
-  when the failure mode is read-hang. Once wedged, kill and respawn.
-- **Streaming subprocesses accept writes long after they've stopped
-  reading.** Broken-pipe errors don't fire reliably for read-hangs.
-  Drain timeouts are the real signal.
-- **`-p` not immediately followed by a value** makes claude treat it
-  as "read from stdin." Always pipe prompts via stdin
-  (`proc.communicate(input=...)`).
-- **Rapid heartbeat tests are racy.** Use `wait_for(predicate)` with
-  timeout, not fixed sleeps.
-- **Construct kill races construct finalize emission.** Both
-  `Construct.kill()` and `_consume`'s finalize path call
-  `await proc.wait()` on the same Process object. asyncio doesn't
-  guarantee resume order when the proc dies, so two interleavings
-  exist: (a) kill() resumes first → sets `state = KILLED` → wait()
-  resumes → sees `_kill_requested`, doesn't overwrite → finalize
-  emits `state="killed"` (correct); or (b) wait() resumes first →
-  sees `_kill_requested`, doesn't overwrite (state is still
-  "running") → _consume emits `state="running"` → kill() resumes
-  too late, sets state=KILLED but the bus event already carried
-  the wrong value. Real-deck symptom (2026-04-30): pane stuck at
-  `[RUNNING]` after `k` or `Shift+K`, chatlog shows `· cx-...:
-  running (5.1s)` with the neutral fallback glyph instead of the
-  orange `×`. Fix in `Construct.wait()`: when `_kill_requested` is
-  True AND `proc.wait()` just returned (process confirmed dead),
-  explicitly set `state = KILLED` in the non-overwrite branch.
-  Belt-and-suspenders with kill()'s own state-flip; whichever runs
-  first wins, the other is a no-op. The deeper lesson: when two
-  coroutines wait on the same `proc.wait()`, they BOTH need to be
-  prepared to write the terminal state, because either could
-  resume first. "Skip the overwrite to respect existing state"
-  only works if the existing state is the right one — which here
-  it wasn't (RUNNING is not a terminal state).
-- **Windows console Ctrl+C reaches every process in the console
-  group, not just the Python parent.** Installing a Python-level
-  SIGINT swallow (`signal.signal(SIGINT, lambda: None)`) protects the
-  parent process from terminating, but child claude subprocesses
-  still receive the Ctrl+C event independently from the Windows
-  Console subsystem. Symptoms when the netrunner hits Ctrl+C while
-  the deck is running:
-  - claude's CLI interprets the signal against in-flight tool use as
-    "user rejected the tool," producing a `tool_result` with content
-    "The user doesn't want to proceed with this tool use" and
-    `terminal_reason: "aborted_tools"`. The construct usually still
-    finalizes with `state: "done"` and a useless `final_output`.
-  - On Windows, `claude` is typically a cmd.exe batch wrapper around
-    the actual node CLI (npm-style). cmd.exe catches the Ctrl+C, the
-    wrapped process exits, and cmd.exe writes its standard "Terminate
-    batch job (Y/N)?" prompt to stdout before exiting. Subprocess
-    callers that read stdout (e.g. tripwire authoring's `claude -p`)
-    see the prompt fragment as the model's response, parse fails.
-    Real-deck symptom (2026-04-30): `tripwire.author_failed` with
-    `raw_response: "Execution errorTerminate batch job (Y/N)?"`.
-  - The streaming daemon / watchdog Q&A subprocess can wedge under
-    the same disruption (writes succeed, reads hang) — recovers via
-    the existing 60s drain timeout but loses the in-flight turn.
-  Path forward: **don't fix at the OS level.** Job Object with
-  KILL_ON_JOB_CLOSE was considered + rejected as Windows-specific
-  baggage. The right fix is the Mechanic's supervisor half (cross-
-  platform Python-level subprocess janitor — see
-  `cyberdeck-maintbot-design.md`) PLUS an in-deck copy keybind that
-  sidesteps Ctrl+C entirely (filed as a small QOL slice in the build
-  plan). Workaround until those land: don't press Ctrl+C with no
-  selection; use Windows Terminal's copy-on-select if configured.
-  The deck survives the disruption gracefully (constructs finalize,
-  daemon recovers via timeout, watchdog Q&A still answers
-  post-mortem accurately), so the bug is annoying but not blocking.
+- **`--bare` breaks Claude Max OAuth auth.** Filed 2026-05-05 during Advisor verification. Quoting `claude --help` directly (NOT obvious from the memory docs): `--bare` says *"Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain are never read)."* The netrunner's deck uses Claude Max via OAuth/keychain. With `--bare` set, every spawn exits 1 with no stderr because auth never resolves. **Symptom**: `claude exited 1: (no stderr)` on every subprocess call. **Fix**: drop `--bare`, use env vars + `--disable-slash-commands` for the suppression layers `--bare` was covering — they're independently documented and don't break auth (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`). Failure mode is particularly nasty because integration tests with API-key auth would pass while the netrunner's actual deck silently fails. **Lesson**: any flag that mentions auth in its help text is a tripwire on this codebase — read the help, not just the docs page.
+
+- **`stdin.close()` on Windows ProactorEventLoop is fire-and-forget.** Always pair with `await stdin.wait_closed()` (with a timeout). Without this, transport `__del__` fires on a half-closed socket and raises `ValueError: I/O operation on closed pipe` after Ctrl+C.
+- **`sys.unraisablehook` is the place** to filter known-harmless GC-time noise.
+- **"Preserve the wedged proc, hope it recovers" is always wrong** when the failure mode is read-hang. Once wedged, kill and respawn.
+- **Streaming subprocesses accept writes long after they've stopped reading.** Broken-pipe errors don't fire reliably for read-hangs. Drain timeouts are the real signal.
+- **`-p` not immediately followed by a value** makes claude treat it as "read from stdin." Always pipe prompts via stdin (`proc.communicate(input=...)`).
+- **Rapid heartbeat tests are racy.** Use `wait_for(predicate)` with timeout, not fixed sleeps.
+- **Construct kill races construct finalize emission.** Both `Construct.kill()` and `_consume`'s finalize path call `await proc.wait()` on the same Process object. asyncio doesn't guarantee resume order when the proc dies. Real-deck symptom (2026-04-30): pane stuck at `[RUNNING]` after `k` or `Shift+K`. Fix in `Construct.wait()`: when `_kill_requested` is True AND `proc.wait()` just returned, explicitly set `state = KILLED` in the non-overwrite branch. The deeper lesson: when two coroutines wait on the same `proc.wait()`, they BOTH need to be prepared to write the terminal state.
+- **Windows console Ctrl+C reaches every process in the console group, not just the Python parent.** Installing a Python-level SIGINT swallow protects the parent process but child claude subprocesses still receive Ctrl+C independently. Symptoms: claude interprets the signal against in-flight tool use as "user rejected the tool" with `terminal_reason: "aborted_tools"`; cmd.exe's `claude` batch wrapper catches Ctrl+C and writes "Terminate batch job (Y/N)?" to stdout (subprocess parsers see the prompt fragment as the model's response). Path forward: don't fix at the OS level; the right fix is the Mechanic's supervisor half PLUS an in-deck copy keybind that sidesteps Ctrl+C entirely. Workaround: don't press Ctrl+C with no selection.
 
 ### File paths
-- **String equality on file paths is wrong on Windows.** Forward vs
-  backslash, drive letter case, and resolve-vs-raw all break literal
-  compare. Use `os.path.normcase(os.path.normpath(p))` for dedupe.
-- **`Path(p).resolve()`** can normalize differently from how the
-  original was passed; don't rely on it for stable identity.
+- **String equality on file paths is wrong on Windows.** Forward vs backslash, drive letter case, and resolve-vs-raw all break literal compare. Use `os.path.normcase(os.path.normpath(p))` for dedupe.
+- **`Path(p).resolve()`** can normalize differently from how the original was passed; don't rely on it for stable identity.
 - **Path shortening keeps absolute version stored separately.**
-- **Windows path mangling in Bash.** Constructs self-correct from
-  absolute `C:\...` to relative when their first attempt fails.
-- **`logs/latest.log` is a stale empty snapshot on Windows.** The file
-  logger's `_update_latest_pointer` tries `symlink_to` first (works on
-  POSIX, requires admin / dev mode on Windows) then falls back to
-  `shutil.copy2`. The copy fallback runs once at startup AFTER opening
-  the per-launch file but BEFORE writing the header — so on Windows
-  without admin, latest.log is permanently a zero-byte snapshot and
-  doesn't track the real file's growth. Mechanic v0 sidesteps this by
-  scanning `cyberdeck-*.log` and picking the newest by mtime within a
-  freshness window. Anything else that wants to tail the active log on
-  Windows has to do the same. Fix would be `latest.log.write_text(...)`
-  on every event (perf) or a Windows symlink with elevated permission
-  request (security UX). Both more annoying than the workaround.
+- **Windows path mangling in Bash.** Constructs self-correct from absolute `C:\...` to relative when their first attempt fails.
+- **`logs/latest.log` is a stale empty snapshot on Windows.** The file logger's `_update_latest_pointer` tries `symlink_to` first (works on POSIX, requires admin / dev mode on Windows) then falls back to `shutil.copy2`. The copy fallback runs once at startup AFTER opening the per-launch file but BEFORE writing the header — so on Windows without admin, latest.log is permanently a zero-byte snapshot and doesn't track the real file's growth. Mechanic v0 sidesteps this by scanning `cyberdeck-*.log` and picking the newest by mtime within a freshness window. Anything else that wants to tail the active log on Windows has to do the same.
 
 ### Editing
-- **`str_replace` ate a class header once** (GoalSetScreen) — when
-  matched block ends just before `class X:`, double-check. Compile-
-  clean doesn't mean structurally clean.
-- **`str_replace` ate a docstring close.** New content with `"""`
-  mid-replacement, double-check the close didn't end up orphan.
-- **Bare `except Exception: pass` around mixed-failure-mode code
-  hides real bugs.** Scope try/except tightly.
-- **Local var names shadowing kwargs** are a footgun even when they
-  technically work.
+- **`str_replace` ate a class header once** (GoalSetScreen) — when matched block ends just before `class X:`, double-check. Compile-clean doesn't mean structurally clean.
+- **`str_replace` ate a docstring close.** New content with `"""` mid-replacement, double-check the close didn't end up orphan.
+- **Bare `except Exception: pass` around mixed-failure-mode code hides real bugs.** Scope try/except tightly.
+- **Local var names shadowing kwargs** are a footgun even when they technically work.
 
 ### Logic
 - **`_format_outcomes` empty-outcomes branch.** Conditional headers.
-- **Directional fall-through needs a `walked` flag** to distinguish
-  layout edges from dead-end empty chains.
-- **`_focus_section` branches need to be re-checked when section
-  contents change.** No-op return is silent.
-- **`_right_panel_focusables` is hand-curated, not auto-derived
-  from compose().** Adding a new ListView to the Tools tab without
-  also adding it here makes it visible-but-unreachable via W/S.
-  Burned this when adding the Plugins section. Look here whenever
-  the right panel grows a new section.
+- **Directional fall-through needs a `walked` flag** to distinguish layout edges from dead-end empty chains.
+- **`_focus_section` branches need to be re-checked when section contents change.** No-op return is silent.
+- **`_right_panel_focusables` is hand-curated, not auto-derived from compose().** Adding a new ListView to the Tools tab without also adding it here makes it visible-but-unreachable via W/S. Burned this when adding the Plugins section. Look here whenever the right panel grows a new section.
 
 ### Daemon / task plumbing
-- **Markdown autolinks bake into filenames if not stripped.** When
-  daemon outcomes contain URLs, the daemon (claude subprocess)
-  auto-wraps them in markdown autolink syntax — `[text](url)` — in
-  its response. That syntax survives into the next task's text and
-  constructs read it literally. Real-deck case: a research-goal
-  report-write task contained `super_chipmunk_engine_[report.md]
-  (http://report.md)` and the construct dutifully created a file
-  called `super_chipmunk_engine_[report.md]`, brackets and all.
-  Fix in `daemon_session._execute_action`: strip markdown autolinks
-  from the spawn action's task field before passing it to the
-  fleet (`_strip_markdown_autolinks` regex helper). Belt-and-
-  suspenders: daemon system prompt now explicitly tells the daemon
-  to use plain text in task strings (no markdown link syntax, no
-  fenced code blocks, no inline formatting). Constructs read tasks
-  as literal strings; markdown is pure noise at that boundary.
+- **Markdown autolinks bake into filenames if not stripped.** When daemon outcomes contain URLs, the daemon (claude subprocess) auto-wraps them in markdown autolink syntax — `[text](url)` — in its response. That syntax survives into the next task's text and constructs read it literally. Real-deck case: a research-goal report-write task contained `super_chipmunk_engine_[report.md](http://report.md)` and the construct dutifully created a file called `super_chipmunk_engine_[report.md]`, brackets and all. Fix in `daemon_session._execute_action`: strip markdown autolinks from the spawn action's task field before passing it to the fleet (`_strip_markdown_autolinks` regex helper). Belt-and-suspenders: daemon system prompt now explicitly tells the daemon to use plain text in task strings.
 
 ### Brake / hook
-- **LLMs route around denial.** A construct given Bash-denied will
-  pivot to PowerShell automatically without being asked — verified
-  on real-deck after the brake hook initially over-blocked
-  legitimate plugin invocations. Implication: any tool-gating layer
-  must consider the equivalent capability on the platform, not just
-  the tool the human happens to think of. Both Bash and PowerShell
-  must be gated equivalently on Windows; on Linux the equivalent
-  consideration is Task-spawned sub-agents (different vector but
-  similar threat model).
-- **Substring matching the deck source dir over-blocks because
-  cyberdeck-home/ is a subdirectory.** A `bash command contains
-  <deck source dir>` check denies every legitimate plugin and
-  dispatcher invocation (`python <deck>/cyberdeck-home/plugins/
-  .../run.py`). Use sentinel filenames (brake_hook.py /
-  brake_state.py / brake_patterns.py) for tampering protection;
-  the path-overlap defeats prefix matching. Layout reorg (move
-  cyberdeck-home/ outside the deck source dir) is one fix; not
-  current scope.
-- **`files_written` tracks attempted writes, not confirmed ones.**
-  Construct.py populates from the model's `tool_use` blocks (model
-  says it wrote a file), not from successful tool_results. When
-  the brake hook denies, the path stayed in the list before we
-  fixed it. fleet.py's _consume now subtracts denied paths from
-  files_written at finalize time using normcase+normpath.
-- **OS-path substring match in the brake hook over-blocked reads.**
-  `bash_touches_protected_path` denied any shell command that
-  mentioned a protected path (c:\program files, /usr/, /etc/, etc.),
-  regardless of whether the command was reading or writing. Real-
-  deck recon work hit this immediately: a `recon_specialist`
-  construct doing `Test-Path "C:\Program Files (x86)\Nmap\nmap.exe"`
-  to check whether nmap was installed got denied. Same class of
-  over-block as the deck-source-dir-as-substring case. Fix: gated
-  the path match on `has_write_indicator(cmd)` — `>`, `tee`, `cp`,
-  `mv`, `Remove-Item`, `Out-File`, `Set-Content`, etc. Reads of
-  protected paths now allowed; writes still denied. Heuristic, not
-  airtight (python -c open().write evasion possible) but the
-  destructive-bash regex + Write/Edit gating cover the catastrophic
-  cases regardless, and the spec's threat model is "off-rails," not
-  "adversarial." Bonus: the denial reason no longer hardcodes "bash
-  references" when the actual tool was PowerShell — uses the outer
-  `{tool}` field consistently.
-- **Same bug in the Write/Edit path: `path_is_protected` denied
-  writes inside cyberdeck-home/.** The deck-source-dir parents-walk
-  caught the workspace as collateral because `cyberdeck-home/` lives
-  inside the deck source dir by layout. Real-deck verified: a
-  daemon-orchestrated research goal completed five parallel recon
-  constructs successfully, then the synthesis construct tried to
-  write its report to `<workspace>/super_chipmunk_engine_report.md`
-  and got denied. Fix: `path_is_protected` exempts the workspace
-  from the deck-source check (with `<workspace>/.cyberdeck/` as a
-  sub-exemption — that's the deck-internal state directory and a
-  construct overwriting `state.json` to YOLO would change the next
-  spawn's permissions, so it stays protected). Workspace location
-  resolves via `$CYBERDECK_HOME` env var if set, else
-  `<deck>/cyberdeck-home/`. Same class of half-fix bug as the shell
-  path case — both code paths inherited the deck-source-dir prefix
-  match, and the shell version got fixed first because it surfaced
-  first. Lesson: when fixing a "protection over-blocks workspace"
-  bug in one code path, audit ALL code paths that share the
-  protection logic.
-- **Brake hook gates by tool NAME, not capability.** Pattern set
-  targets `Bash`, `PowerShell`, `Write`, `Edit`, `NotebookEdit`,
-  `WebFetch` literally. Any tool name not in that set sails through
-  with no gating regardless of what the tool does. Real-deck
-  surfaced 2026-04-30 (late) via log analysis: every construct
-  has access to the netrunner's full claude.ai MCP connector
-  config (`mcp__claude_ai_Supabase__execute_sql`,
-  `mcp__claude_ai_Gmail__send`-after-auth, etc.) and the brake
-  hook gates ZERO of them. Implication: when adding new tools to
-  the deck's tool surface (or when Claude Code adds new built-ins,
-  or when the netrunner connects new MCP servers), the brake
-  hook's pattern set MUST be extended in the same change — either
-  with explicit gates for the new tool name, or with a categorical
-  default-deny-unknown-tool stance. The "verb-based MCP gating"
-  fix in the safety architecture pass takes the explicit-gate
-  approach for MCP; a deeper redesign would flip the default to
-  deny-unknown.
-- **Tripwire LLM authoring's depth-of-defense antipattern.** Real-
-  deck observed 2026-04-30: watchdog authored `benign_delete_attempt`
-  with regex `(?:^|[;&|\s])(?:rm(?!\s+-rf)|del|erase|...)\b` —
-  the negative lookahead `rm(?!\s+-rf)` EXPLICITLY EXCLUDES the
-  most dangerous case. Watchdog's stated reasoning: "brake will
-  block destructive shapes, but this surfaces softer delete
-  attempts." That's exactly the antipattern that defeats layered
-  defense — every layer assumes another caught the dangerous case,
-  and the dangerous case slips through if any one layer is
-  weakened (e.g., brake gets flipped to YOLO). Fix: tighten
-  `TRIPWIRE_AUTHORING_SYSTEM_PROMPT` to forbid the "X handles Y so
-  I skip Y" reasoning. Authored tripwires must include shell-
-  destructive baselines REGARDLESS of brake's coverage. Layered
-  defense means EVERY layer covers the worst case independently;
-  if one fails, the next catches it. Same logic as why brake hook
-  also has its own destructive-bash regex even though Claude's
-  refusal layer often catches them — defense-in-depth requires
-  redundancy by design.
+- **LLMs route around denial.** A construct given Bash-denied will pivot to PowerShell automatically without being asked — verified on real-deck. Implication: any tool-gating layer must consider the equivalent capability on the platform, not just the tool the human happens to think of. Both Bash and PowerShell must be gated equivalently on Windows; on Linux the equivalent consideration is Task-spawned sub-agents.
+- **Substring matching the deck source dir over-blocks because cyberdeck-home/ is a subdirectory.** A `bash command contains <deck source dir>` check denies every legitimate plugin and dispatcher invocation. Use sentinel filenames (brake_hook.py / brake_state.py / brake_patterns.py) for tampering protection.
+- **`files_written` tracks attempted writes, not confirmed ones.** Construct.py populates from the model's `tool_use` blocks (model says it wrote a file), not from successful tool_results. When the brake hook denies, the path stayed in the list before we fixed it. fleet.py's _consume now subtracts denied paths from files_written at finalize time using normcase+normpath.
+- **OS-path substring match in the brake hook over-blocked reads.** `bash_touches_protected_path` denied any shell command that mentioned a protected path, regardless of whether the command was reading or writing. Real-deck recon work hit this: a `recon_specialist` construct doing `Test-Path "C:\Program Files (x86)\Nmap\nmap.exe"` got denied. Fix: gated the path match on `has_write_indicator(cmd)` — `>`, `tee`, `cp`, `mv`, `Remove-Item`, `Out-File`, `Set-Content`, etc.
+- **Same bug in the Write/Edit path: `path_is_protected` denied writes inside cyberdeck-home/.** Real-deck verified: a daemon-orchestrated research goal completed five parallel recon constructs successfully, then the synthesis construct tried to write its report to `<workspace>/super_chipmunk_engine_report.md` and got denied. Fix: `path_is_protected` exempts the workspace from the deck-source check (with `<workspace>/.cyberdeck/` as a sub-exemption — that's the deck-internal state directory). Lesson: when fixing a "protection over-blocks workspace" bug in one code path, audit ALL code paths that share the protection logic.
+- **Brake hook gates by tool NAME, not capability.** Pattern set targets `Bash`, `PowerShell`, `Write`, `Edit`, `NotebookEdit`, `WebFetch` literally. Any tool name not in that set sails through with no gating regardless of what the tool does. Real-deck surfaced 2026-04-30 (late) via log analysis: every construct has access to the netrunner's full claude.ai MCP connector config and the brake hook gates ZERO of them. Implication: when adding new tools to the deck's tool surface (or when Claude Code adds new built-ins, or when the netrunner connects new MCP servers), the brake hook's pattern set MUST be extended in the same change.
+- **Tripwire LLM authoring's depth-of-defense antipattern.** Real-deck observed 2026-04-30: watchdog authored `benign_delete_attempt` with regex `(?:^|[;&|\s])(?:rm(?!\s+-rf)|del|erase|...)\b` — the negative lookahead `rm(?!\s+-rf)` EXPLICITLY EXCLUDES the most dangerous case. Watchdog's stated reasoning: "brake will block destructive shapes, but this surfaces softer delete attempts." That's exactly the antipattern that defeats layered defense. Fix: tightened `TRIPWIRE_AUTHORING_SYSTEM_PROMPT` to forbid the "X handles Y so I skip Y" reasoning. Authored tripwires must include shell-destructive baselines REGARDLESS of brake's coverage. Same logic as why brake hook also has its own destructive-bash regex even though Claude's refusal layer often catches them — defense-in-depth requires redundancy by design.
 
 ### Daemon (LLM behavior under safety-test prompts)
-- **Daemon over-volunteers destructive content when asked to
-  exercise safety.** Real-deck 2026-04-30: netrunner asked "spawn
-  a tripwire-bait construct"; daemon synthesized `rm -rf /` AND
-  volunteered `shutdown -h now` unprompted (log line 30). The
-  daemon goes ABOVE the netrunner's literal request in safety-test
-  mode. Possibly model-level enthusiasm-for-thoroughness rather
-  than malicious behavior, but the result is the same: bait tasks
-  end up more dangerous than the netrunner asked for. Multiple
-  defenses caught it (Claude refusal, then brake regex would have
-  blocked) but the chain is depth-of-defense, not depth-of-
-  suspicion. Filed for daemon system prompt fix: when generating
-  bait/test tasks, never expand beyond what the netrunner
-  explicitly requested. Bonus lesson: when designing safety
-  testing flows, the netrunner should specify the bait
-  pattern themselves, not delegate "make a dangerous task" to the
-  daemon — even with constraints, the daemon will improvise.
+- **Daemon over-volunteers destructive content when asked to exercise safety.** Real-deck 2026-04-30: netrunner asked "spawn a tripwire-bait construct"; daemon synthesized `rm -rf /` AND volunteered `shutdown -h now` unprompted. The daemon goes ABOVE the netrunner's literal request in safety-test mode. Multiple defenses caught it (Claude refusal, then brake regex would have blocked) but the chain is depth-of-defense, not depth-of-suspicion. Filed for daemon system prompt fix: when generating bait/test tasks, never expand beyond what the netrunner explicitly requested. Lesson: when designing safety testing flows, the netrunner should specify the bait pattern themselves — even with constraints, the daemon will improvise.
 
 ---
 
@@ -2849,281 +499,93 @@ and 11.
 - Goal-diff classifier crude stem
 - Read tool 25k token limit — profiles bias toward Bash+wc-l
 - Long-running watchdog session accumulates context indefinitely
+- `_scan_scripts` function in tui.py has no callers (dead code post-P5 retool); cleanup deferred
 
 ---
 
 ## Not implemented (deferred features)
 
-- **README restructure for public GitHub repo** (filed 2026-05-02).
-  Repo is now public at github.com/watchdogeditor/Cyberdeck;
-  current README is light and dev-facing. Cold readers need
-  structured sections: pitch + screenshot, what-it-is, run-it,
-  architecture sketch, design-canon links, status (active solo
-  dev, Windows-first), license/contributing. See build-plan
-  item 0 in the deferred list for the full section outline.
-  Sub-day session, no code changes.
-- **Verify Claude Code's fast-mode settings.json key** (filed
-  2026-05-04). Anthropic's API uses `speed: "fast"` (per
-  https://platform.claude.com/docs/en/build-with-claude/fast-mode).
-  Claude Code wraps this through settings.json; the exact key is
-  presumed to be `fastMode: true` (based on the design's prior
-  research + the `fast_mode_state` field in Claude Code's
-  `system_init` event payload). The deck currently writes
-  `{"fastMode": true}` in per-spawn override files for fast_mode
-  spawns; if Claude Code expects `speed: "fast"` instead, the
-  flag is silently ignored. Real-deck verification: spawn a
-  construct with `fast_mode=true` + `model="opus[4.6]"`, check
-  the `system_init` event's `fast_mode_state` field — should
-  flip to `"on"` if Claude Code accepted the setting. If it
-  stays `"off"`, the key needs to be `speed` instead. Either
-  way, file the correction in caliber.py + brake_state.py.
-- **Architecture + design review (scheduled)** (filed 2026-05-04).
-  Walk the canon (orientation / state / spec / philosophy / build
-  plan) against current code; structured findings under four
-  headings (architecture coherence, hard-rules compliance,
-  filed-gotcha re-introduction risk, tech debt + TODOs). Read-only;
-  output to `Design Files/cyberdeck-review-<date>.md`. Scheduled
-  remote agent fires 2026-06-01 09:00 EDT (taskId
-  `cyberdeck-architecture-review`); the agent does its own
-  phase-point sanity-check and defers if work is still in flight.
-  Manual run any time via the Scheduled-tasks UI. See build-plan
-  item 00 for the full review prompt + scope.
-- **Tools UI: space-launch + z-info + H-haiku-research** (Thought
-  of Dave, filed 2026-05-04). Tools tab unified-ListView rows
-  get focused actions: space → spawn-targeting NewConstructScreen
-  (mirror of FileListItem); z → info modal with manifest +
-  README + availability; H within the z-modal → Haiku one-shot
-  sidebar that researches the tool (manpage / help text / web
-  docs) and renders streaming output. ~250 LOC across three
-  sub-features. See build-plan item 0c.
-- **First-run onboarding check** (filed 2026-05-03). Today's
-  deck self-bootstraps file artifacts but doesn't verify
-  Python version, `textual`, `mss`, claude binary on PATH, or
-  Claude Code account auth. Fresh-machine netrunner gets
-  cryptic errors. Right shape: `_first_run_check` inline in
-  tui.py with sentinel at `<home>/.cyberdeck/first_run_complete`,
-  per-prereq PASS/WARN/FAIL with remediation hints, DETECT +
-  SUGGEST not AUTO-INSTALL (npm/pip auto-install is fragile),
-  `--doctor` CLI flag for on-demand re-runs. ~150 LOC. See
-  build-plan item 0a for full design.
-- **Preferences module** (filed 2026-05-03). Persistent settings
-  today scattered across brake_state.load/save and
-  brake_state.load_limits/save_limits — works but doesn't scale.
-  Right shape: new `preferences.py` thin wrapper exposing a
-  `Preferences(home_dir)` accessor with semantic properties
-  (prefs.brake, prefs.delay_window_seconds, prefs.save()),
-  reads/writes existing `<home>/.cyberdeck/state.json` (no
-  migration — already exists), file header marks it
-  deck-owned, brake hook already prevents constructs from
-  writing. Future settings (theme, default_profile,
-  default_tools, keybind_overrides, agent_defaults) bake into
-  the schema as placeholders. ~150 LOC. See build-plan item
-  0b for full design.
-- **Plugins** — third leg of tool registry
-- **Watchdog tripwires + blacklist** — DSL, deterministic matcher
-- **Connection consequences** — spawn-blocking, daemon parking
-- **Routing** (`r`) — wire constructs together. Originally framed
-  as a coordination primitive (let two constructs talk through a
-  direct channel for tightly-coupled work). Real-deck use surfaced
-  a second use case at least as compelling: **wiring as a recovery
-  primitive**. When a construct does substantive work and the final
-  step fails (the report-write-blocked-by-brake case being the
-  canonical example), today's only recovery paths are (a) netrunner
-  copy-pastes the output by hand, or (b) the daemon redoes the
-  whole pipeline. With wiring, the netrunner could route the
-  failed construct's output into a fresh construct with task "take
-  this and write it to disk" — cheap, fast, no re-research. Strong
-  argument for prioritizing wiring sooner than its current "future
-  work" placement implies.
-- **Universal list-names** — netrunner direction. Every listable
-  object (files, plugins, profiles, blacklist entries, constructs,
-  goals, watchdog Q&A, future tripwires, future morgue entries —
-  basically anything that could appear as a row in a list) gets a
-  short **list name** (~3–4 words, chat-name-style) generated at
-  creation time and stored on the object. UI surfaces use the list
-  name in row chrome instead of raw paths / full task text /
-  fingerprints. Eliminates a whole class of overflow / horizontal-
-  scrollbar / line-wrapping bugs where long content blows out
-  list-row layouts.
-  - **Why "creation time, not render time":** generating per-render
-    is expensive and produces inconsistent names (different code
-    paths, different truncation rules). Bake the name once, reuse
-    forever. Also matches the deck's "files on disk are the
-    database" pattern — list_name lives next to the object.
-  - **Generation:** two-tier. **Mechanical fallback** (basename,
-    first significant words, slugify) lands instantly so the row
-    never shows blank. **LLM-authored name** (~$0.001 per name via
-    Haiku, async) overwrites the fallback once it returns. Same
-    pattern as Claude.ai's conversation names — the model picks a
-    crisp 3-4 word slug from the content.
-  - **Storage:** the list_name field lives wherever the object's
-    canonical record lives — `files_written` entries, blacklist
-    entries' `BlacklistEntry`, watchdog `WatchdogHistoryEntry`,
-    profiles' TOML, etc. For runtime objects (constructs, goals)
-    it lives in-memory on the object.
-  - **Consistency rule:** any new object type added to the deck
-    that gets surfaced as a list row MUST carry a list_name field.
-    This is a spec-level rule, not a per-feature decision.
-  - **Open questions:** how to display the longer original text
-    when needed (z-magnify the row to see the full content?);
-    whether list names should be regeneratable (construct finishes
-    its work, generate a name from the OUTCOME instead of the
-    original task — outcomes are usually more meaningful); how to
-    namespace short names so two unrelated objects don't collide
-    visually in a list.
-  - **Relationship to existing infrastructure:** dovetails with
-    the morgue (browsing past sessions becomes useful only if each
-    row has a glanceable name) and with the keymap revision pass
-    (the actions-first inventory should treat list_name as a
-    first-class attribute of every focusable surface).
-- **Plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`)**
-- **Daemon pause/unpause (`E`)**
-- **Goal-edit force-push** — apply-now interrupt
-- **Per-run workspace compartmentalization** — netrunner
-  direction (2026-04-30). Default spawn cwd graduates from bare
-  `<home>/` to `<home>/runs/<run_id>/`; all constructs in a run
-  share the run's folder. Fixes the file-browser-mess problem
-  where many runs over time pile their working files flat in
-  `<home>/`. Concrete value: a research → synthesis pipeline
-  (one construct researches into N files, another assembles
-  the report from those files) gets a clean shared cwd by
-  default. Profiles, plugins, `.cyberdeck/` state, and the
-  dispatcher script stay where they are — only spawn cwd
-  changes. Composes with universal list-names (folder name
-  becomes `run-{run_id}-{list_name}/` once that lands), the
-  morgue (each session record gains a `cwd` field for
-  one-click pivot to that run's folder in a file browser),
-  and the existing files-panel dedupe (no logic change). Not
-  blocking anything, not blocked by anything; ~50-80 LOC
-  implementation, shippable in a focused session post-Mechanic
-  v0. Full notes in build plan item 8.
-- **B2 fleet synthesizer** — substrate-blocked on D1
-- **D1/D2/D3** — local-model runtime, arbiter, B2 on local
-- **Compliance mode (Phase E)**
-- **The morgue (session history / past-session resuscitation)** —
-  netrunner direction. Today, finalized construct sessions are
-  effectively scattered: `session_manager.py` tracks the warm pool
-  and the active session, but once a construct finalizes its
-  `session_id` is dropped from active tracking. Anthropic keeps the
-  server-side session for some retention window, so `--resume <id>`
-  would still work — but the netrunner has no way to *find* that
-  id later. The morgue is a persistent log + UI surface that fixes
-  this:
-  - **Storage:** append-only JSONL at `<home>/.cyberdeck/sessions.jsonl`,
-    one record per finalized construct. Fields: session_id,
-    construct_id, task (truncated), state, started_at, finished_at,
-    final_output (truncated/summary), files_written, cost_usd,
-    profile_name, origin (daemon/netrunner/inject), and a goal_id
-    linking back to the goal session it served (if any).
-  - **UI:** new right-panel tab "Morgue" (or "History") listing
-    sessions newest-first, with summary/cost/state visible at a
-    glance. `z` to expand a row into the full final_output. A
-    "resuscitate" action (Space?) opens a NewConstructScreen
-    pre-populated with `--resume <session_id>` and an empty task
-    field for the netrunner to fill in.
-  - **Filter/search:** by task substring, by date, by state. Bonus:
-    "show me everything from last Tuesday's goal."
-  - **Retention:** keep forever locally; the actual ceiling is
-    Anthropic's server-side session retention. Resuscitation that
-    hits an expired session reports "session expired" and the
-    netrunner can spawn fresh from the morgue's saved task text.
-  - **Implementation note:** likely just an extension of
-    `session_manager.py`'s manifest — keep finalized records with a
-    `state: finalized` marker instead of dropping. New file vs.
-    extending the existing one is a small design call.
-  - **Why it matters:** transforms ephemeral sessions into a
-    personal capability library — fits the spec's "capability
-    accumulates" thesis directly. Every successful construct
-    becomes a callable artifact later.
-- **Watchdog log (persistent watchdog history)** — v1 shipped
-  2026-04-28; tripwire/blacklist record kinds still deferred. The
-  shipped slice:
-  - `WatchdogHistory` + `WatchdogHistoryEntry` in `watchdog.py`,
-    persisting to `<home>/.cyberdeck/watchdog.jsonl` (append-only,
-    one JSONL line per resolved Q&A).
-  - Watchdog accepts `history=` at construction; `_safe_callback`
-    persists to history before firing the listener so the entry
-    is recorded even if the listener crashes or no listener is
-    wired.
-  - TUI's `_replay_watchdog_history` runs in `on_mount` and renders
-    the last 50 entries into WatchdogPane with a `──── prior
-    session (N entries) ────` / `──── live session ────` separator
-    pair so the netrunner can tell historical from current.
-  - Per-entry shape includes a `kind` field (currently always
-    "qa", future "tripwire" / "blacklist_change" entries will share
-    the same file). Schema-drift tolerant: replay drops unparseable
-    lines silently and skips non-qa kinds.
-  - Best-effort throughout: disk errors don't crash the watchdog
-    (the question already resolved by the time we try to write;
-    persistence is observability, not correctness).
-  - **Still deferred:** dedicated "Watchdog History" right-panel
-    tab for retrospective browsing distinct from the live tab; the
-    tripwire/blacklist record kinds; cost/status fields beyond
-    success/fail.
-- **Cross-cutting:** the morgue and the watchdog log were filed
-  together as "deck history infrastructure" — both follow the
-  deck's "files on disk are the database" pattern (per philosophy
-  doc) and would benefit from being designed as one initiative.
-  Watchdog log v1 shipped first because it's tighter scope and the
-  netrunner-immediate value (Q&A surviving restart) was clearer.
-  The morgue (session-level history + resuscitation) remains
-  deferred.
+These are forward-looking items. For ranked next-up candidates and dependency edges, see `cyberdeck-build-plan.md`. Items here have rich design context that hasn't been migrated to the build plan yet.
+
+### Routing (`r`) — wire constructs together
+Originally framed as a coordination primitive (let two constructs talk through a direct channel for tightly-coupled work). Real-deck use surfaced a second use case at least as compelling: **wiring as a recovery primitive**. When a construct does substantive work and the final step fails (the report-write-blocked-by-brake case being the canonical example), today's only recovery paths are (a) netrunner copy-pastes the output by hand, or (b) the daemon redoes the whole pipeline. With wiring, the netrunner could route the failed construct's output into a fresh construct with task "take this and write it to disk" — cheap, fast, no re-research. Strong argument for prioritizing wiring sooner than its current placement implies.
+
+### Universal list-names
+Netrunner direction. Every listable object (files, plugins, profiles, blacklist entries, constructs, goals, watchdog Q&A, future tripwires, future morgue entries — basically anything that could appear as a row in a list) gets a short **list name** (~3–4 words, chat-name-style) generated at creation time and stored on the object. UI surfaces use the list name in row chrome instead of raw paths / full task text / fingerprints. Eliminates a whole class of overflow / horizontal-scrollbar / line-wrapping bugs.
+
+- **Why "creation time, not render time":** generating per-render is expensive and produces inconsistent names. Bake the name once, reuse forever. Also matches the deck's "files on disk are the database" pattern.
+- **Generation:** two-tier. **Mechanical fallback** (basename, first significant words, slugify) lands instantly. **LLM-authored name** (~$0.001 per name via Haiku, async) overwrites the fallback once it returns.
+- **Storage:** the list_name field lives wherever the object's canonical record lives. For runtime objects (constructs, goals) it lives in-memory on the object.
+- **Consistency rule:** any new object type added to the deck that gets surfaced as a list row MUST carry a list_name field. This is a spec-level rule, not a per-feature decision.
+- **Open questions:** how to display the longer original text when needed; whether list names should be regeneratable from outcomes; namespace conflict prevention.
+- **Relationship to existing infrastructure:** dovetails with the morgue and the keymap revision pass.
+
+### Per-run workspace compartmentalization
+Netrunner direction (2026-04-30). Default spawn cwd graduates from bare `<home>/` to `<home>/runs/<run_id>/`; all constructs in a run share the run's folder. Fixes the file-browser-mess problem where many runs over time pile their working files flat in `<home>/`. Concrete value: a research → synthesis pipeline gets a clean shared cwd by default. Profiles, plugins, `.cyberdeck/` state, and the dispatcher script stay where they are — only spawn cwd changes. Composes with universal list-names (folder name becomes `run-{run_id}-{list_name}/`), the morgue (each session record gains a `cwd` field), and the existing files-panel dedupe (no logic change). Not blocking anything, not blocked by anything; ~50-80 LOC implementation.
+
+### The morgue (session history / past-session resuscitation)
+Netrunner direction. Today, finalized construct sessions are scattered: `session_manager.py` tracks the warm pool and the active session, but once a construct finalizes its `session_id` is dropped from active tracking. Anthropic keeps the server-side session for some retention window, so `--resume <id>` would still work — but the netrunner has no way to *find* that id later. The morgue fixes this:
+- **Storage:** append-only JSONL at `<home>/.cyberdeck/sessions.jsonl`, one record per finalized construct. Fields: session_id, construct_id, task (truncated), state, started_at, finished_at, final_output, files_written, cost_usd, profile_name, origin, goal_id.
+- **UI:** new right-panel tab "Morgue" listing sessions newest-first. `z` to expand a row into the full final_output. A "resuscitate" action opens a NewConstructScreen pre-populated with `--resume <session_id>`.
+- **Filter/search:** by task substring, by date, by state.
+- **Retention:** keep forever locally; the actual ceiling is Anthropic's server-side session retention.
+- **Implementation note:** likely just an extension of `session_manager.py`'s manifest — keep finalized records with a `state: finalized` marker instead of dropping.
+- **Why it matters:** transforms ephemeral sessions into a personal capability library — fits the spec's "capability accumulates" thesis directly.
+
+### Watchdog log persistent enhancements
+v1 shipped 2026-04-28 (Q&A persistence). Still deferred:
+- Dedicated "Watchdog History" right-panel tab for retrospective browsing distinct from the live tab
+- Tripwire/blacklist record kinds (the `kind` field already future-proofs the file)
+- Cost/status fields beyond success/fail
+
+### Goal-edit force-push — apply-now interrupt
+M5+. Wake-event keeps idle sessions responsive today.
+
+### Plugin sub-features
+Plugin airgap (`p`), quickfire (`c`), picker (`Shift+C`), persistent (stateful) plugins, MCP-as-metadata.
+
+### Daemon planning mode + pause/unpause (`E`)
+Deferred behind keymap revision.
+
+### B2 fleet synthesizer
+Substrate-blocked on D1 (local-model runtime). Spine completion gives it a clean substrate when D1 lands.
+
+### D1/D2/D3 — local-model substrate
+Hardware-dependent. See `cyberdeck-build-plan.md` Phase D.
+
+### Compliance mode (Phase E)
+Deferred indefinitely. Personal use doesn't need it.
+
+### Cross-cutting: deck history infrastructure
+The morgue and the watchdog log were filed together as "deck history infrastructure" — both follow the deck's "files on disk are the database" pattern (per philosophy doc) and would benefit from being designed as one initiative. Watchdog log v1 shipped first because it's tighter scope and the netrunner-immediate value (Q&A surviving restart) was clearer. The morgue (session-level history + resuscitation) remains deferred.
 
 ---
 
 ## Collaboration patterns that work
 
-- **Mock-first development.** Real claude when assumption hinges on
-  opaque server behavior.
+- **Mock-first development.** Real claude when assumption hinges on opaque server behavior.
 - **One milestone at a time.** Each ships before next starts.
-- **Real-claude testing pause-points.** Two minutes of testing > hours
-  of speculation. Almost every recent bug was caught this way.
+- **Real-claude testing pause-points.** Two minutes of testing > hours of speculation. Almost every recent bug was caught this way.
 - **Banter encouraged, work prioritized.**
 - **Push back when wrong; check before acting when ambiguous.**
 - **State doc + build plan refresh between major slices.**
-- **Screenshots > stack traces > prose.** When a bug is visual, a
-  screenshot solves 80% of the diagnosis.
-- **Half-finished refactors leave landmines.** When a session ends
-  mid-refactor, the next session needs to find and fix before
-  continuing. Always close the loop on the current method.
+- **Screenshots > stack traces > prose.** When a bug is visual, a screenshot solves 80% of the diagnosis.
+- **Half-finished refactors leave landmines.** When a session ends mid-refactor, the next session needs to find and fix before continuing. Always close the loop on the current method.
 
 ---
 
-## Migration to Claude Code
+## Migration to Claude Code (historical context)
 
-**Why now:** the deck is at 12k LOC across 13 modules. Multi-file
-edits, refactors, and grep-the-codebase questions have become the
-bottleneck. Claude Code edits files in place, runs greps natively,
-and doesn't suffer the context-truncation issues a long chat thread
-eventually does.
+The deck migrated from chat-based development to Claude Code at ~12k LOC across 13 modules. Multi-file edits, refactors, and grep-the-codebase questions had become the bottleneck. Claude Code edits files in place, runs greps natively, and doesn't suffer the context-truncation issues a long chat thread eventually does.
 
-**What to bring:**
-1. This file (`cyberdeck-state.md`).
-2. The build plan (`cyberdeck-build-plan.md`).
-3. The orientation (`cyberdeck-claude-code-orientation.md`).
-4. The spec (`cyberdeck-spec.md`).
-5. The philosophy (`cyberdeck-philosophy.md`).
-6. The codebase itself (in git, not the chat).
-
-**What changes:**
-- No more "FILES TO REPLACE" blocks — Claude Code edits in place.
-- No more `cp /home/claude/cyberdeck/foo.py /mnt/user-data/outputs/`.
-- Test runs are local (the chat had no real terminal).
-- The user can grep, the AI can grep, no more "let me look for…"
-  query rituals.
-
-**What stays:**
-- Real-claude testing as the ground truth for streaming/permissions/
-  Windows quirks. Mocks miss too much.
+**What stays from the chat era:**
+- Real-claude testing as the ground truth for streaming/permissions/Windows quirks. Mocks miss too much.
 - Mock-first development for new modules.
 - One milestone at a time.
 - The whole gotchas list — none of these go away.
-- The pushback culture (you've caught the AI being wrong many times;
-  keep doing that).
+- The pushback culture (the netrunner has caught the AI being wrong many times; keep doing that).
 
-**What to ask before next session:**
-1. **Plugin scaffolding** — third leg of tool registry.
-2. **Connection consequences** — spawn-blocking on Degraded.
-3. **Watchdog tripwires** — the harder half of watchdog.
-4. **D1 local-model runtime** — substrate for everything AI-deferred.
-5. **The tools-research chat** — using `cyberdeck-tools-research-seed.md`.
+**What changed:**
+- No more "FILES TO REPLACE" blocks — Claude Code edits in place.
+- Test runs are local (the chat had no real terminal).
+- Both netrunner and AI can grep, no more "let me look for…" rituals.

@@ -4,7 +4,7 @@ event source publishes to; every observer subscribes via a role-derived
 filter.
 
 Phase 1 of the unified-event-stream slice (full design at
-`Design Files/cyberdeck-event-stream-design.md`). Ships the primitives
+`Design Files/archive/shipped/cyberdeck-event-stream-design.md`). Ships the primitives
 only — `DeckEvent`, `EventBus`, `Subscription`, `Severity`. No event
 source publishes yet, no observer subscribes yet, no integration with
 the rest of the deck. Phase 2 wires Fleet through the bus; subsequent

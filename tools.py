@@ -45,7 +45,7 @@ The Tools panel renders unavailable tools with a red ✗ glyph + dim
 name, mirroring the plugin-availability pattern.
 
 Spec note: this is the post-retool shape (filed 2026-05-02 in
-`Design Files/cyberdeck-tools-plugins-profiles-retool.md`). Pre-
+`Design Files/archive/shipped/cyberdeck-tools-plugins-profiles-retool.md`). Pre-
 retool, "tools" meant three different things in three places (panel
 header, profile field, directory tree). Tools, plugins, profiles
 now have clean three-way separation.

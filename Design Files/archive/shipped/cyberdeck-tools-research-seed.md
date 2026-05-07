@@ -1,5 +1,12 @@
 # Cyberdeck — Default Tools Research
 
+> **STATUS: ARCHIVED 2026-05-07.** This seed prompted the research chat
+> that produced `cyberdeck-tools-research-report.md` (also archived) and
+> ultimately the v2 design at `cyberdeck-tools-default-kit.md` (in-flight).
+> Kept for provenance only — the live forward-looking design is the v2 kit.
+
+---
+
 *Seed for a future chat dedicated to deciding what tools ship with a fresh cyberdeck install.*
 
 ---

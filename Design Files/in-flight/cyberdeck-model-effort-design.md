@@ -1,5 +1,35 @@
 # Cyberdeck — Model + Effort Selection Design
 
+> **STATUS: PHASES 1-3 + 5 SHIPPED 2026-05-04; PHASE 4 BLOCKED ON QUOTA SIGNAL.**
+> Updated 2026-05-07.
+>
+> **Shipped slices:**
+> - **Phase 1** — `caliber.py` (~250 LOC); `Caliber` dataclass; threading
+>   through Construct / Fleet.spawn / DaemonSession; CALIBER SELECTION
+>   section in DAEMON_SYSTEM_PROMPT.
+> - **Phase 2** — `SessionPool.warm_caliber` + `pull(requested_caliber=...)`
+>   match-or-skip gate; `make_spawn_settings(fast_mode=...)` per-spawn
+>   override file.
+> - **Phase 3 (scoped down)** — Daemon model PINNED to opus, effort =
+>   netrunner's power-level knob via `EffortPickerScreen` modal (1-5).
+>   Persisted in state.json. Mid-flight subprocess restart + a
+>   `--daemon-model` flag were tried + reverted as overengineered (per
+>   netrunner direction: "the daemon should always be opus, and its
+>   effort should be controllable via limits").
+> - **Phase 5** — Sidebar daemon line; per-pane caliber suffix; watchdog
+>   Q&A CALIBER AWARENESS section.
+>
+> **Phase 4 (quota-aware fallback) HARD-BLOCKED on build-plan item 13**
+> (the quota signal). When item 13 lands, item 0f (adversarial dyad) is
+> Phase 4's natural companion — Phase 4 needs both quota AND quality
+> signals to make smart escalation decisions. See
+> `cyberdeck-build-plan.md` for both items.
+>
+> **Read Phase 4 sections when item 13 lands.** Phase 1-3+5 sections
+> stay relevant for understanding what's already wired and why.
+
+---
+
 *Architecture for the deck's per-spawn model and effort selection: the
 daemon picks `--model` and `--effort` per construct based on task
 needs and remaining quota; the daemon's own caliber is markable and

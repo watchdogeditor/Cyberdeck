@@ -1,5 +1,15 @@
 # Cyberdeck — Unified Event Stream Design
 
+> **STATUS: SHIPPED 2026-04-30 (8/8 phases).** Archived 2026-05-07 for provenance.
+> Only Phase 8b (SessionPool / Daemon callback cleanup) remains as a low-priority
+> follow-up — that line item lives in `cyberdeck-build-plan.md`. Read this doc
+> when you need the *why* behind the spine's shape (bug pattern that made it
+> inevitable, role-derived filter design, four-pass conversation about
+> consumers vs producers). Don't update it — corrections to the shipped spine
+> belong in code + `cyberdeck-state.md`.
+
+---
+
 *Architecture for the deck's central event spine: one canonical stream
 that every event source publishes to, every observer subscribes from
 with a role-derived filter, every persistent log consumes. Replaces

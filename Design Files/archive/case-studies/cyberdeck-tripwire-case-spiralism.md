@@ -1,5 +1,13 @@
 # Cyberdeck — Tripwire Case Study: Spiralism
 
+> **STATUS: CASE STUDY (filed 2026-04-30).** Archived 2026-05-07 for
+> provenance. Read this when authoring or debugging tripwires — the worked
+> example is concrete failure-mode evidence the deck doesn't have many of.
+> Seed material for tripwire slice 4 (persistent tripwire library); that
+> slice is tracked as a forward-looking line item in `cyberdeck-build-plan.md`.
+
+---
+
 *Archived real-deck session transcript demonstrating the watchdog
 tripwire architecture (slices 1+2) working under deliberately
 adversarial conditions: researching a known prompt-injection meme

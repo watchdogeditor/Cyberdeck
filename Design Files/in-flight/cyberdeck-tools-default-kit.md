@@ -1,5 +1,16 @@
 # Cyberdeck — Default Tools Kit v2
 
+> **STATUS: IN-FLIGHT (design only, filed 2026-04-30).**
+> Updated 2026-05-07. The architectural retool that this kit assumes
+> (tools/plugins/profiles three-way split) shipped 2026-05-04 — see
+> `archive/shipped/cyberdeck-tools-plugins-profiles-retool.md`. This
+> doc covers the *content* of the default kit (what tools to ship, in
+> what categories, with what manifests). Implementation is downstream
+> of the retool but no code has been written. Line item in
+> `cyberdeck-build-plan.md` → MID FUTURE.
+
+---
+
 *Opinionated, hot-load-aware, profile-shaped kit for `<home>/tools/`.
 Companion to `cyberdeck-spec.md` (Tool registry / Tools panel).
 Supersedes v1 (2026-04-30, early). Folds in the research report at

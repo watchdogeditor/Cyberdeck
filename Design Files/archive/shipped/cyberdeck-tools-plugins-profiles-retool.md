@@ -1,5 +1,16 @@
 # Cyberdeck — Tools / Plugins / Profiles Retool
 
+> **STATUS: SHIPPED 2026-05-04 (5/5 phases).** Archived 2026-05-07 for provenance.
+> Read this doc when you need the *why* behind the three-way split
+> (tools = registered system CLIs, plugins = deck-extending capability,
+> profiles = role context). Sub-feature deferrals (plugin airgap `p`,
+> quickfire `c`, picker `Shift+C`, persistent plugins, MCP-as-metadata)
+> have been migrated as line items in `cyberdeck-build-plan.md` →
+> mid-future. Don't update this doc — corrections to shipped behavior
+> belong in code + `cyberdeck-state.md`.
+
+---
+
 *Architectural redesign of how the deck thinks about extensible
 capability. Filed 2026-05-02 after a multi-pass conversation that
 walked back two earlier framings to land on a clean three-way split.

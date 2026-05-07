@@ -1,5 +1,40 @@
 # Cyberdeck — Maintbot / Mechanic Design
 
+> **STATUS: v0 + v0.5 + v1 + v1.5 SHIPPED; v2 ACTIVE; v3 DEFERRED INDEFINITELY.**
+> Updated 2026-05-07.
+>
+> **Shipped slices** (mostly 2026-04-30 → 2026-05-06):
+> - **v0** — sibling Python process supervisor, tails NDJSON for live
+>   claude pids, kills on detected deck death. Cross-platform
+>   (`mechanic.py`).
+> - **v0.5** — liveness heartbeat (item 0d). Deck writes
+>   `<home>/.cyberdeck/heartbeat` every 5s; mechanic logs STALE after 20s.
+> - **v1** — diagnose-only LLM-session triage on unclean exit
+>   (`mechanic_triage.py`). Family A clean-spawn recipe; sonnet/medium
+>   caliber; structured Markdown output.
+> - **v1.5** — stale-heartbeat triage with interactive prompt +
+>   listens-for-recovery; `--auto-triage-on-stale` for headless. Live
+>   narration via `stream-json --verbose`. Partial-recovery on timeout.
+>
+> See `cyberdeck-state.md` → Mechanic section for the full shipped
+> reference, and Filed gotchas → Async/subprocess for the bugs caught
+> during real-deck verification (ctypes Windows-handle truncation;
+> log-file-selection race; async-task teardown timing).
+>
+> **v2 (repair authority for non-source config files)** is the active
+> next slice — line item in `cyberdeck-build-plan.md` → CURRENT FRONTIER
+> item 5 (item 0h). Iterative-triage (item 0g) is the companion piece —
+> CURRENT FRONTIER item 4.
+>
+> **v3 (autonomous correction)** stays deferred indefinitely — defer
+> until v1 + v2 give enough trust data.
+>
+> **Read this whole doc when picking up v2.** The architecture
+> decisions for v0–v1.5 are still load-bearing for understanding what
+> v2 should and shouldn't do.
+
+---
+
 *Architecture for the deck's supervisor / repair process. Separate
 from the deck itself; outlives crashes; hooks into the deck's UI
 when both are running. Captures decisions made 2026-04-29 so the

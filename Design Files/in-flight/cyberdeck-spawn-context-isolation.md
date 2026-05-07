@@ -1,5 +1,28 @@
 # Cyberdeck — Spawn Context Isolation Design
 
+> **STATUS: PHASE 1 SHIPPED 2026-05-05; PHASE 2 CONDITIONAL.**
+> Updated 2026-05-07.
+>
+> **Phase 1 (env-var belt) is complete:** per-role
+> `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` + auto-memory + git-instructions
+> applied to Advisor, Construct, Daemon, Pool warmer, Tripwire-authoring
+> Watchdog (KILLED). Watchdog Q&A KEEPS auto-load (deck "security
+> analyst" benefits from CLAUDE.md context). See `cyberdeck-state.md`
+> Filed gotchas → Async/subprocess for the upstream userEmail leak that
+> spawned this work + the multi-line argv truncation gotcha that
+> shipped alongside it.
+>
+> **Phase 2 (role-injection infrastructure) is deferred — conditional.**
+> Real-deck verification of phase 1 confirmed daemon + constructs do
+> NOT regress without CLAUDE.md auto-load. Pull phase 2 forward only on
+> concrete regression. The forward-looking line item is in
+> `cyberdeck-build-plan.md` → CURRENT FRONTIER item 2.
+>
+> **Read phase-1 sections to understand WHY the env-var belt is shaped
+> the way it is. Read phase-2 sections only when picking up phase 2.**
+
+---
+
 *Architecture for stopping the deck's `claude` subprocesses from
 silently leaking the deck's project memory (CLAUDE.md, auto-memory,
 user-level memory, rules dirs) into every turn — and replacing it

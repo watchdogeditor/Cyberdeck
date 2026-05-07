@@ -204,18 +204,25 @@ read in this order:
    ambiguity (the *why*). *Read first if you're disagreeing with a
    design decision and want to understand the reasoning.*
 
-Architecture docs for the major in-flight initiatives:
+In-flight design docs (`Design Files/in-flight/`):
 
-- `cyberdeck-event-stream-design.md` — the spine
-- `cyberdeck-maintbot-design.md` — the mechanic
+- `cyberdeck-maintbot-design.md` — the mechanic (separate-process
+  supervisor + on-demand LLM session triage)
 - `cyberdeck-model-effort-design.md` — caliber (per-spawn model +
   effort + fast-mode)
-- `cyberdeck-tools-plugins-profiles-retool.md` — the three-way split
-  between tools (installed CLIs), plugins (deck-extended capability),
-  and profiles (recipes)
+- `cyberdeck-spawn-context-isolation.md` — per-role CLAUDE.md /
+  auto-memory suppression
+- `cyberdeck-keymap-revision.md` — three-layer keymap revision
+- `cyberdeck-collections-intake-design.md` — recipe-driven plugin
+  scaffolding for github-distributed reference collections
+- `cyberdeck-tools-default-kit.md` v2 — opinionated default tools
+  for a fresh deck
 
-Other entries in `Design Files/` cover narrower topics (collaboration
-norms, future-direction stubs, deferred variants).
+Shipped designs (kept for provenance) live in `Design Files/archive/shipped/`:
+event stream design, tools/plugins/profiles retool, tools research
+seed + report. The deferred wearable variant is in
+`Design Files/archive/deferred/`. The deck's full file inventory
+is in `Design Files/INDEX.md`.
 
 ## Status, more concretely
 

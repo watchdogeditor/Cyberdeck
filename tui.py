@@ -5492,7 +5492,7 @@ class CyberdeckApp(App):
             # every FleetEvent through it (Phase 2 of the unified-
             # event-stream slice; Phase 8 retired the legacy
             # `add_listener` shim and made bus the only fan-out).
-            # See `Design Files/cyberdeck-event-stream-design.md`.
+            # See `Design Files/archive/shipped/cyberdeck-event-stream-design.md`.
             bus=self.bus,
             # Wedge-timeout ceiling for the post-stdout-close wait.
             # Limits modal mutates fleet.wedge_timeout_seconds in
