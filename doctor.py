@@ -14,10 +14,27 @@ a fresh machine and runs `python tui.py` gets either:
   - Silent failure modes when claude is on PATH but not logged in
 
 `doctor.py` runs cheap detection at startup with PASS / WARN / FAIL
-classification + remediation hints. DETECT + SUGGEST, NOT
-AUTO-INSTALL — npm/pip auto-install is fragile across corp
-firewalls, alternate Python distributions, environments where the
-user can't write globally. Better to be the doctor than the surgeon.
+classification + remediation hints.
+
+Policy (post-2026-05-07 split):
+  - HARD PREREQS (Python, textual, claude binary, claude --version)
+    are DETECT + SUGGEST, NOT AUTO-INSTALL. npm install for the
+    claude CLI and a working Python with textual are environment-
+    level concerns where auto-install is fragile across corp
+    firewalls, alternate Python distributions, and locked-down
+    environments. FAIL → print hint + exit 1; netrunner fixes
+    manually.
+  - PLUGIN DEPS (each plugin.toml's `requires.python_imports`) are
+    DETECT + PROMPT-TO-INSTALL. Pre-policy these were WARN-and-
+    continue (plugin marked unavailable, deck still launched). The
+    netrunner's stance after real-deck use: plugin deps shouldn't
+    change mid-engagement — if a plugin is in the plugins/ dir, the
+    deck should be fully outfitted at launch. New flow: if a plugin
+    dep is missing, prompt "install via pip? [y/N]". On yes, run
+    `<python> -m pip install <pkgs>`, re-check; if still missing,
+    exit 1. On no (or non-TTY stdin), exit 1 cleanly with a
+    manual-install hint — no download attempted without explicit
+    consent.
 
 Sentinel: `<home>/.cyberdeck/first_run_complete`. After a run where
 no FAIL is encountered, write the sentinel; subsequent runs skip
@@ -456,3 +473,216 @@ def has_failure(results: list[Result]) -> bool:
 def has_warning(results: list[Result]) -> bool:
     """Convenience: True if any check returned WARN (and no FAIL)."""
     return any(r.severity == Severity.WARN for r in results)
+
+
+# ---- plugin-dep prompt-to-install (post-2026-05-07 policy) ---------
+
+
+def get_missing_plugin_packages(
+    results: list[Result],
+) -> list[tuple[str, str]]:
+    """Extract (plugin_name, package) pairs from `plugin:*` WARN
+    entries. Returns deduplicated list preserving discovery order.
+
+    Used by `run_doctor_or_exit` to drive the prompt-to-install
+    flow: show the list, prompt y/N, install on yes, exit 1 on no.
+    """
+    missing: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for r in results:
+        if r.severity != Severity.WARN:
+            continue
+        if not r.label.startswith("plugin:"):
+            continue
+        # Label format: "plugin:<name>:<import>"
+        parts = r.label.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, name, pkg = parts
+        key = (name, pkg)
+        if key in seen:
+            continue
+        seen.add(key)
+        missing.append(key)
+    return missing
+
+
+def prompt_install_plugin_deps(
+    missing: list[tuple[str, str]],
+) -> bool:
+    """Show the missing-packages list and prompt for install consent.
+
+    Reads from stdin via `input()`. Returns True on affirmative
+    ("y" / "yes", case-insensitive). Returns False on anything
+    else (empty enter, "n", "no", etc.).
+
+    Non-TTY behavior: stdin not interactive (piped input, CI run,
+    detached process) → returns False without prompting. The caller
+    treats this as "decline + exit clean" — matching the policy
+    that no download is ever attempted without explicit consent.
+    """
+    if not sys.stdin.isatty():
+        print(
+            "cyberdeck: stdin is not a TTY; cannot prompt for "
+            "plugin-dep install. Aborting cleanly.",
+            file=sys.stderr,
+        )
+        return False
+    # Group by plugin for legibility — same package required by
+    # multiple plugins is rare but possible.
+    by_plugin: dict[str, list[str]] = {}
+    for plugin, pkg in missing:
+        by_plugin.setdefault(plugin, []).append(pkg)
+    print("cyberdeck: missing plugin dependencies:")
+    for plugin, pkgs in by_plugin.items():
+        joined = ", ".join(pkgs)
+        print(f"  - {plugin}: {joined}")
+    print()
+    pkg_set = sorted({pkg for _, pkg in missing})
+    print(f"Install via pip?  ({' '.join(pkg_set)})")
+    try:
+        response = input("[y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        # Ctrl+D / Ctrl+C during the prompt — treat as decline.
+        print()
+        return False
+    return response in ("y", "yes")
+
+
+def install_packages(packages: list[str]) -> tuple[bool, str]:
+    """Run `<python> -m pip install <packages>`. Returns (success,
+    output) — output is captured stdout+stderr suitable for the
+    netrunner to see when something went wrong.
+
+    Uses `sys.executable` to install into the same Python that's
+    running the deck. Avoids picking up the wrong pip when multiple
+    Python distributions are on PATH (the alternative — bare `pip`
+    on PATH — frequently targets the wrong environment on Windows
+    with multiple Python installs).
+
+    5-minute timeout: pip installs over slow corporate firewalls
+    sometimes take a while; 5min is generous but bounded so a
+    network hang doesn't sit forever.
+    """
+    if not packages:
+        return True, ""
+    cmd = [sys.executable, "-m", "pip", "install", *packages]
+    print(f"cyberdeck: running: {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300.0,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "pip install timed out (5min)"
+    except OSError as exc:
+        return False, f"pip invocation failed: {exc}"
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        return False, output.strip() or "pip exited non-zero (no output)"
+    return True, output.strip()
+
+
+def run_doctor_or_exit(
+    claude_bin: str,
+    home_dir: Path,
+    *,
+    doctor_flag: bool = False,
+) -> None:
+    """Top-level orchestration. Either returns cleanly (deck can
+    launch) or calls sys.exit(N).
+
+    Flow:
+      1. Run checks.
+      2. If first run / `--doctor` / any FAIL: print the report.
+      3. If `--doctor` flag: exit (0 on PASS-only, 1 on any FAIL).
+         Observational mode — no install prompt even when plugin
+         deps are missing.
+      4. If any FAIL: print error + exit 1. Hard prereqs are
+         DETECT + SUGGEST per the docstring policy.
+      5. If any plugin dep WARN: prompt to install. Yes → pip
+         install + re-check + exit 1 if still missing. No / non-TTY
+         → exit 1 cleanly with manual-install hint.
+      6. Otherwise: mark first-run done, return.
+
+    Caller is expected to skip this entirely when the netrunner
+    passes `--no-doctor` (escape hatch for development with mock
+    Claude binaries / unusual environments).
+    """
+    results = run_checks(claude_bin)
+    failed = has_failure(results)
+    force_show = doctor_flag or is_first_run(home_dir)
+    if force_show or failed:
+        color = sys.stdout.isatty()
+        print(format_report(results, color=color))
+        print()
+
+    if doctor_flag:
+        # --doctor is observational. Exit 0 on PASS-only, 1 on
+        # any FAIL so the netrunner can use it in shell scripts
+        # (`python tui.py --doctor && python tui.py --goal ...`).
+        # Plugin WARNs don't affect exit code here; they'll be
+        # picked up by a non-doctor launch's prompt flow.
+        sys.exit(1 if failed else 0)
+
+    if failed:
+        print(
+            "cyberdeck: hard prerequisites failed. Fix the FAIL "
+            "items above and re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Plugin-dep prompt-to-install (post-2026-05-07 policy).
+    missing = get_missing_plugin_packages(results)
+    if missing:
+        # Make sure the netrunner sees the report (which lists
+        # which plugin needs what) before they answer the prompt.
+        # If we already printed it above (first_run / FAIL), this
+        # is a no-op double-print guard.
+        if not (force_show or failed):
+            color = sys.stdout.isatty()
+            print(format_report(results, color=color))
+            print()
+        if not prompt_install_plugin_deps(missing):
+            packages = sorted({pkg for _, pkg in missing})
+            print(
+                f"cyberdeck: aborting. To install manually: "
+                f"pip install {' '.join(packages)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Affirmative → run pip install.
+        packages = sorted({pkg for _, pkg in missing})
+        ok, output = install_packages(packages)
+        if not ok:
+            print(
+                f"cyberdeck: pip install failed:\n{output}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Re-check to confirm everything resolved. This catches
+        # cases where pip "succeeded" (exit 0) but the import is
+        # still unfindable — version mismatch, namespace package
+        # issue, install into wrong site-packages, etc.
+        results = run_checks(claude_bin)
+        still_missing = get_missing_plugin_packages(results)
+        if still_missing:
+            packages_str = ", ".join(
+                pkg for _, pkg in still_missing
+            )
+            print(
+                f"cyberdeck: install completed but the following "
+                f"are still missing: {packages_str}. Check pip "
+                f"output above and your Python environment.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("cyberdeck: plugin dependencies installed.")
+
+    # PASS (or WARN-only that we just installed) → mark first-run
+    # done so future launches stay quiet. Best-effort; a write
+    # failure means the diagnostics show again next launch.
+    mark_first_run_complete(home_dir)

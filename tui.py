@@ -11290,36 +11290,17 @@ if __name__ == "__main__":
     # next launch is silent (mss missing → screenshot plugin
     # unavailable, but the deck still runs).
     if not args.no_doctor:
-        from doctor import (
-            run_checks, format_report, has_failure, has_warning,
-            is_first_run, mark_first_run_complete,
+        # Orchestration lives in doctor.run_doctor_or_exit — see
+        # there for the full flow (run checks, print report on
+        # first-run / FAIL / --doctor, exit on FAIL, prompt-to-
+        # install on plugin-dep WARN, mark first-run done on PASS).
+        # Either returns cleanly (deck launches) or calls sys.exit.
+        from doctor import run_doctor_or_exit
+        run_doctor_or_exit(
+            claude_bin=args.claude_bin,
+            home_dir=home_dir,
+            doctor_flag=args.doctor,
         )
-        results = run_checks(claude_bin=args.claude_bin)
-        force_show = args.doctor or is_first_run(home_dir)
-        failed = has_failure(results)
-        if force_show or failed:
-            # Color only when stdout is a TTY (skip in CI / piped)
-            color = sys.stdout.isatty()
-            print(format_report(results, color=color))
-            print()
-        if args.doctor:
-            # --doctor flag: print report and exit cleanly.
-            # Exit 0 if no FAIL; exit 1 if FAIL so the netrunner
-            # can use it in scripts (`python tui.py --doctor &&
-            # python tui.py --goal ...`).
-            sys.exit(1 if failed else 0)
-        if failed:
-            print(
-                "cyberdeck: hard prerequisites failed. Fix the "
-                "FAIL items above and re-run.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        # PASS (and WARN-only) → mark first-run done so future
-        # launches stay quiet. Best-effort (mark function swallows
-        # OSError); a write failure just means the diagnostics
-        # show again next launch.
-        mark_first_run_complete(home_dir)
 
     # Phase 7: log directory defaults to <deck source>/logs/ inside
     # CyberdeckApp.__init__ when log_dir is None. Explicit
