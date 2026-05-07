@@ -540,18 +540,47 @@ Roughly ordered by likely appeal:
    action; v1 LLM session triage is the deferred follow-up.
    ~80 LOC across tui.py + mechanic.py.
 
-0e. **Mechanic v1 LLM-session half** (filed 2026-05-04 — bigger
-   lift, deferred). With the bridge slice now providing the
-   detection signal (PID alive + heartbeat stale), v1 is "what
-   to do when triggered." Spawns a fresh `claude -p` subprocess
-   on the supervisor side; reads the deck's recent log records
-   to give the triage model context; emits a structured triage
-   report; optionally terminates the wedged deck. Subprocess
-   management on the supervisor side (no Construct primitive
-   available there — supervisor is mechanic.py, not part of the
-   deck), claude prompt for triage decisions, threading +
-   timeout. ~300 LOC. Design needs more thought; revisit
-   pre-1.0.
+0e. **Mechanic v1 LLM-session half** ✅ SHIPPED 2026-05-06.
+   Diagnose-only LLM session that fires on unclean deck exit.
+   New module `mechanic_triage.py` (~480 LOC) — TriageRequest /
+   TriageResult dataclasses, MECHANIC_SYSTEM_PROMPT (Family A,
+   self-contained vocabulary; no CLAUDE.md auto-load),
+   `run_triage()` synchronous spawn. Same clean-spawn recipe as
+   the Advisor: `--system-prompt-file` (argv-newline truncation
+   gotcha — see Hard Rule), `--tools "Read,Glob,Grep"` (read-only
+   triage tooling), `--disable-slash-commands`,
+   `--no-session-persistence`, env-var belt for CLAUDE.md /
+   auto-memory / git-instructions suppression. Caliber sonnet/
+   medium.
+
+   `mechanic.py` integration: after subprocess cleanup on deck
+   death, checks `clean_close_reason`. If unset / non-shutdown /
+   non-eject (i.e. unclean exit), fires `run_triage()`
+   synchronously. Output: structured Markdown report written to
+   `<log-basename>-triage.md` next to the original log; one-line
+   summary printed to mechanic stderr. Best-effort throughout —
+   any failure produces a stub report, supervisor never panics
+   over an LLM call.
+
+   New CLI args on mechanic.py: `--no-triage` (disable; useful on
+   known-flaky branches to avoid burning tokens per crash),
+   `--triage-timeout` (default 180s), `--claude-bin` (path
+   override matching deck's CLAUDE_BIN env var).
+
+   v1 scope (per maintbot design doc): unclean-exit triage only.
+   Two paths deferred:
+     - **Stale-heartbeat triage** (deck PID alive but TUI wedged):
+       needs careful design around log-write-vs-read race while
+       the deck is still alive. Filed for v1.5.
+     - **Deliberate summon** (netrunner UI button): needs UI
+       plumbing in tui.py (keybind + modal). Filed for v2.
+   v3 (autonomous correction) deferred indefinitely per design.
+
+   Real-deck verification pending: trigger an unclean exit
+   (e.g. force-kill the deck process), observe mechanic stderr
+   for "firing v1 triage" message, check that
+   `<log-basename>-triage.md` lands next to the log with a
+   structured report.
 
 1. **Plugin scaffolding** — ✓ shipped (v1: stateless, screenshot
    plugin as first example, brake hook gates invocations naturally

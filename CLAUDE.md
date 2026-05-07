@@ -912,24 +912,25 @@ all build-plan items 0/0a/0b/0c/0d closed (0c slice complete with
 the Advisor landing 2026-05-05). Recommended order for the next
 push, ranked by tractability:
 
-1. **🚨 Auto-context audit + per-role subprocess isolation**
-   (build-plan 000). The big one. Filed during Advisor
-   verification 2026-05-05. Touches every subprocess. Read the
-   build-plan entry; this needs a design doc before
-   implementation. The longer we wait, the more spawn sites we
-   accumulate that'll need refactoring.
+1. **Item 000 phase 2: role-injection infrastructure** —
+   conditional. Real-deck verification of phase 1 (env-var belt)
+   confirmed daemon + constructs do NOT regress without CLAUDE.md
+   auto-load — they had enough explicit context in their system
+   prompts. So the role-injection slice is no longer urgent. Pull
+   it forward only if a concrete regression appears.
 
-2. **Mechanic v1 LLM-session half** (build-plan 0e). The bridge
-   slice now provides the trigger signal; v1 is "what to do." Spawn
-   fresh claude on the supervisor side, read deck log for context,
-   emit triage report. ~300 LOC. Design needs more thought —
-   subprocess primitives differ on the supervisor side (no Construct
-   available; mechanic.py is sibling-process, not part of deck).
-   **Coordinate with item 000** — mechanic's LLM session is one
-   more spawn site; if 000 lands first, mechanic v1 inherits the
-   isolation pattern from the start.
+2. **Item 0000 — tripwire-authoring "gotchas" addendum.** Small,
+   real-deck-tunable. Curated content teaching the authoring
+   spawn what NOT to fire on. ~150 LOC. Real-deck observation
+   2026-05-06: tripwire authoring "seems to be working" post
+   item 000 phase 1 (less overzealous), so urgency is low.
 
-3. **Caliber Phase 4** — STILL BLOCKED on build-plan item 13
+3. **Mechanic v1.5 — stale-heartbeat triage.** Now that v1
+   (unclean-exit triage) shipped 2026-05-06, the natural
+   follow-up is firing triage when the deck PID is alive but the
+   TUI is wedged. Needs design around log-write-vs-read race.
+
+4. **Caliber Phase 4** — STILL BLOCKED on build-plan item 13
    (quota signal). Don't pick this up until item 13 lands.
 
 4. **Discrete bugs** — both still deferred:
@@ -943,7 +944,7 @@ push, ranked by tractability:
    phase-checks first; expect findings on the heavy churn from
    this session (tools/plugins/profiles retool + caliber slice +
    doctor + preferences + mechanic bridge + Advisor + the
-   auto-context discovery itself).
+   auto-context discovery itself + item 000 phase 1 + Mechanic v1).
 
 **Real-deck verification opportunities** for the netrunner's next
 session:

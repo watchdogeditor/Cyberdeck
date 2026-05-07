@@ -333,6 +333,41 @@ def parse_args() -> argparse.Namespace:
             "The deck writes every 5s, so 20s = ~4 missed ticks."
         ),
     )
+    parser.add_argument(
+        "--no-triage",
+        action="store_true",
+        help=(
+            "Disable v1 LLM-session triage on unclean deck exit. "
+            "Default behavior fires a `claude -p` triage call after "
+            "subprocess cleanup whenever the deck dies without "
+            "writing a clean shutdown/eject footer; the report "
+            "lands at <log-basename>-triage.md next to the log. "
+            "Disable this if you don't want claude burning tokens "
+            "on every crash (e.g. while iterating on a known-flaky "
+            "branch)."
+        ),
+    )
+    parser.add_argument(
+        "--triage-timeout",
+        type=float,
+        default=180.0,
+        help=(
+            "Per-call hard timeout for the v1 triage subprocess "
+            "(default 180s). Mechanic kills the claude process and "
+            "writes a stub failure report if the LLM call doesn't "
+            "complete in time."
+        ),
+    )
+    parser.add_argument(
+        "--claude-bin",
+        type=str,
+        default="claude",
+        help=(
+            "Path to the claude binary. Default 'claude' (uses PATH). "
+            "Match the deck's CLAUDE_BIN env var if it's set "
+            "elsewhere on disk."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -549,7 +584,112 @@ def main() -> int:
         f"failed={failed}",
         file=sys.stderr,
     )
+
+    # Mechanic v1: diagnose-only LLM session (build-plan 0e). Fires
+    # only on UNCLEAN exit — when the deck recorded a clean
+    # `shutdown` or `eject` close_reason in its log_footer, the
+    # netrunner closed the deck deliberately and triage adds noise.
+    # Anything else (Python traceback, OOM, kill -9, blue screen,
+    # network-driven hang) → fire triage. Synchronous: the
+    # supervisor blocks until the report is written. ~10-30s on
+    # cache-warm, longer on cold. Result + summary go to stderr;
+    # full report writes to <log-basename>-triage.md next to the
+    # original log. Best-effort throughout — triage failure
+    # produces a stub report explaining what failed; the
+    # supervisor never panics over an LLM call.
+    if args.no_triage:
+        print(
+            f"[mechanic] triage disabled by --no-triage; skipping",
+            file=sys.stderr,
+        )
+        return 0
+    is_unclean = clean_close_reason not in ("shutdown", "eject")
+    if not is_unclean:
+        print(
+            f"[mechanic] clean close ({clean_close_reason!r}); "
+            f"skipping triage",
+            file=sys.stderr,
+        )
+        return 0
+    try:
+        # Local import so the mechanic doesn't pay module-load cost
+        # on the common clean-shutdown path. The LLM session module
+        # has its own dependencies (tempfile, subprocess.run for the
+        # synchronous claude call); cleaner to lazy-load.
+        from mechanic_triage import TriageRequest, run_triage
+    except Exception as e:
+        print(
+            f"[mechanic] triage module import failed: {e}; "
+            f"skipping triage",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Locate deck source — the directory containing tui.py +
+    # Design Files/. The triage LLM uses Read/Glob/Grep against it
+    # for gotcha lookups. Heuristic: walk up from log_dir looking
+    # for tui.py. Falls back to None on miss; triage runs without
+    # source-tree access (still useful — it has the log itself).
+    deck_source_dir = _locate_deck_source(log_path.parent)
+
+    print(
+        f"[mechanic] firing v1 triage (unclean exit; "
+        f"reason={clean_close_reason!r}); claude -p will write "
+        f"a report alongside the log",
+        file=sys.stderr,
+    )
+    triage_req = TriageRequest(
+        log_path=log_path,
+        clean_close_reason=clean_close_reason,
+        deck_pid=deck_pid,
+        tracked_subprocesses=len(tracked),
+        subprocesses_killed=killed,
+        deck_source_dir=deck_source_dir,
+        claude_bin=args.claude_bin,
+        timeout=args.triage_timeout,
+    )
+    triage_result = run_triage(triage_req)
+    if triage_result.success:
+        print(
+            f"[mechanic] triage written ({triage_result.elapsed_s:.1f}s) "
+            f"-> {triage_result.report_path}",
+            file=sys.stderr,
+        )
+        print(
+            f"[mechanic] summary: {triage_result.summary_line}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[mechanic] triage FAILED ({triage_result.elapsed_s:.1f}s): "
+            f"{triage_result.error}",
+            file=sys.stderr,
+        )
+        if triage_result.report_path:
+            print(
+                f"[mechanic]   stub written -> {triage_result.report_path}",
+                file=sys.stderr,
+            )
     return 0
+
+
+def _locate_deck_source(log_dir: Path) -> Optional[Path]:
+    """Walk up from `log_dir` looking for the directory containing
+    tui.py. Returns the first hit or None.
+
+    Logs typically live at `<deck-source>/logs/`, so we usually find
+    deck source one parent up. Cap the walk at 5 levels to avoid
+    pathological filesystem structures.
+    """
+    candidate = log_dir.resolve()
+    for _ in range(5):
+        if (candidate / "tui.py").is_file():
+            return candidate
+        parent = candidate.parent
+        if parent == candidate:
+            return None
+        candidate = parent
+    return None
 
 
 if __name__ == "__main__":

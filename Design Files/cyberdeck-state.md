@@ -1008,6 +1008,93 @@ existing TRIPWIRE_AUTHORING_SYSTEM_PROMPT.
 
 ---
 
+**✅ MECHANIC v1 LLM-SESSION HALF SHIPPED 2026-05-06.**
+Diagnose-only triage that fires when the deck dies uncleanly.
+Closes build-plan item 0e.
+
+The supervisor (mechanic.py v0) already reaped orphan claude
+subprocesses on deck death; v1 adds a `claude -p` triage call
+AFTER cleanup that reads the just-died deck's log file and
+produces a structured Markdown report explaining what happened.
+
+**Module split.** New `mechanic_triage.py` (~480 LOC) holds the
+LLM-session half — TriageRequest / TriageResult dataclasses,
+MECHANIC_SYSTEM_PROMPT (Family A, full-replace; carries the
+deck architecture vocabulary the triage needs since CLAUDE.md
+auto-load is suppressed), build_user_prompt /
+_load_log_tail / _build_report_path helpers, and the
+synchronous `run_triage(req) -> TriageResult` entry point.
+Kept separate from mechanic.py because the LLM session lifecycle
+(one-shot per crash) and dependencies (subprocess.run + tempfile)
+are distinct from the supervisor's loop.
+
+**Clean-spawn recipe** (same as Advisor, Family A):
+  - `--system-prompt-file` (argv-newline truncation gotcha
+    applies — the system prompt is ~5900 chars, would lose
+    everything after first newline if passed as argv)
+  - `--tools "Read,Glob,Grep"` (read-only — triage can read the
+    log + walk deck source for gotcha lookups, but no Bash, no
+    Write, no Edit)
+  - `--disable-slash-commands` (no skills firing during triage)
+  - `--no-session-persistence` (don't save transcripts of
+    triage Q&A)
+  - `--add-dir <deck-source-dir>` (so Read/Glob/Grep can target
+    the deck source from the supervisor's cwd)
+  - `--permission-mode bypassPermissions` (read-only tools have
+    no side effects; permission prompts would just block)
+  - env: CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 / DISABLE_AUTO_MEMORY=1
+    / DISABLE_GIT_INSTRUCTIONS=1 (suppress claude code's silent
+    auto-loads)
+  - Caliber: sonnet/medium
+
+**System prompt** carries: deck architecture vocabulary (four
+runtime entities, brake / tripwire / blacklist primitives, log
+record kinds), triage method (find death point → identify
+state at death → match against filed gotchas via Read on
+Design Files/cyberdeck-state.md → reason about causes → suggest
+next steps), output format (structured Markdown with Summary /
+Death point / State / Plausible causes / Filed-gotcha matches /
+Next steps / Cleanup status sections, ~1200 word target), and
+hard constraints (READ-ONLY, NO AUTOMATIC FIXES, HONEST ABOUT
+UNKNOWNS, BRIEF).
+
+**mechanic.py integration.** After subprocess cleanup, checks
+clean_close_reason. If "shutdown" or "eject" → skip triage
+(deliberate close, triage adds noise). Otherwise (None or any
+other value → unclean exit) → fire run_triage synchronously.
+Result: report writes to `<log-basename>-triage.md` next to the
+original log; one-line summary printed to mechanic stderr; full
+report sits on disk for the netrunner to read post-mortem.
+Best-effort throughout — any failure produces a stub report
+("Triage failed: <reason>") so the netrunner has SOMETHING to
+find next to every crash log.
+
+**New CLI args on mechanic.py:** `--no-triage` (disable; useful
+on known-flaky branches), `--triage-timeout` (default 180s),
+`--claude-bin` (path override matching deck's CLAUDE_BIN env
+var if set elsewhere).
+
+**v1 scope per maintbot design doc:** unclean-exit triage only.
+Two paths deferred:
+  - **Stale-heartbeat triage** (deck PID alive but TUI wedged):
+    filed for v1.5 — needs design around log-write-vs-read race
+    while the deck is still writing.
+  - **Deliberate summon** (netrunner UI button to ask "what's
+    going on" mid-flight): filed for v2 — needs UI plumbing.
+v3 (autonomous correction / relaunch) deferred indefinitely
+per the design doc's explicit non-goals.
+
+**Verified.** Module imports clean. CLI args registered + show
+in `mechanic.py --help`. Shape-tested against an actual on-disk
+log: log-tail extraction works (30,968 bytes within 200KB cap),
+report-path computed correctly (`<basename>-triage.md` next to
+log), user-prompt rendered (31,699 chars, contains expected
+markers). Real-deck verification pending: force-kill the deck
+process, observe mechanic stderr for "firing v1 triage" → check
+that `<log-basename>-triage.md` lands with a structured report.
+
+---
+
 **Next session picks up at: open netrunner choice.**
   - Caliber Phase 4 (quota-aware fallback) — BLOCKED on
     build-plan item 13.
