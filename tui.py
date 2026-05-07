@@ -532,7 +532,8 @@ class AttentionPanel(Static, can_focus=False):
                 f"[b]{remaining:.1f}s[/b]"
             )
             lines.append(
-                f"[dim]{detail}  ·  press [b]X[/b] to approve[/dim]"
+                f"[dim]{detail}  ·  "
+                f"[reverse b] X [/reverse b] approve[/dim]"
             )
         self.update("\n".join(lines))
 
@@ -1270,7 +1271,7 @@ class ConstructPane(Static, can_focus=True):
         text = (
             f"[b]{verb}[/b] in [b]{remaining:.1f}s[/b]  "
             f"[{bar_color}]{bar}[/{bar_color}]\n"
-            f"[dim]press [b]X[/b] to {x_action}  "
+            f"[dim][reverse b] X [/reverse b] {x_action}  "
             f"[bright_black]· brake={e.brake} · "
             f"{e.tool_name}[/bright_black][/dim]"
         )
@@ -1623,7 +1624,10 @@ class NewConstructScreen(ModalScreen[Optional[str]]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("[b]Spawn new construct[/b]  [dim](Esc to cancel)[/dim]")
+            yield Label(
+                "[b]Spawn new construct[/b]  "
+                "[dim]([reverse b] Esc [/reverse b] cancel)[/dim]"
+            )
             yield Input(placeholder="task for the new construct...", id="task_input")
 
     def on_mount(self) -> None:
@@ -1691,7 +1695,7 @@ class LaunchScreen(ModalScreen[Optional[str]]):
         with Vertical(id="launch_dialog"):
             yield Label(
                 f"[b]{self.header_markup}[/b]  "
-                f"[dim](Esc to cancel)[/dim]"
+                f"[dim]([reverse b] Esc [/reverse b] cancel)[/dim]"
             )
             yield Label(self.context_markup, id="launch_context")
             yield Input(
@@ -1779,7 +1783,8 @@ class TalkDaemonScreen(ModalScreen[Optional[str]]):
         with Vertical(id="talk_dialog"):
             yield Label(
                 "[b]Talk to the Daemon[/b]  "
-                "[dim](Esc to cancel · plan-affecting, sync)[/dim]"
+                "[dim]([reverse b] Esc [/reverse b] cancel · "
+                "plan-affecting, sync)[/dim]"
             )
             if not self.session_running:
                 # Without a session, there's no daemon to talk TO.
@@ -1789,8 +1794,9 @@ class TalkDaemonScreen(ModalScreen[Optional[str]]):
                 # tell them so post-submit too.
                 yield Label(
                     "[b red]No daemon session is currently running.[/b red]  "
-                    "Press [b]e[/b] to set a goal and start one — your "
-                    "message will be lost if you submit now.",
+                    "Press [reverse b] e [/reverse b] to set a goal and "
+                    "start one — your message will be lost if you submit "
+                    "now.",
                     id="talk_no_session_hint",
                 )
             elif self.pending_count > 0:
@@ -1868,7 +1874,8 @@ class AskWatchdogScreen(ModalScreen[Optional[str]]):
         with Vertical(id="ask_dialog"):
             yield Label(
                 "[b]Ask the Watchdog[/b]  "
-                "[dim](Esc to cancel · async, informational)[/dim]"
+                "[dim]([reverse b] Esc [/reverse b] cancel · "
+                "async, informational)[/dim]"
             )
             # Queue-depth hint only renders when relevant. Computing
             # the wording here keeps the compose method declarative
@@ -2026,14 +2033,18 @@ class AdvisorScreen(ModalScreen[None]):
             )
             yield Input(
                 placeholder=(
-                    "how can I use it to do X? … (Enter to ask, Esc to close)"
+                    "how can I use it to do X? …  (Enter ask · Esc close)"
                 ),
                 id="advisor_input",
             )
             yield Label(
-                "[dim]Esc / h close · Enter to ask · "
-                "y copy · w/s line · PgUp/PgDn page · "
-                "Tab to defocus input[/dim]",
+                "[dim][reverse b] Esc [/reverse b] / "
+                "[reverse b] h [/reverse b] close · "
+                "[reverse b] Enter [/reverse b] ask · "
+                "[reverse b] y [/reverse b] copy · "
+                "[reverse b] w [/reverse b]/[reverse b] s [/reverse b] line · "
+                "[reverse b] PgUp [/reverse b]/[reverse b] PgDn [/reverse b] page · "
+                "[reverse b] Tab [/reverse b] defocus input[/dim]",
                 id="advisor_hint",
             )
 
@@ -2211,7 +2222,11 @@ class GoalSetScreen(ModalScreen[Optional[str]]):
     def compose(self) -> ComposeResult:
         with Vertical(id="goal_dialog"):
             title = "Edit goal" if self.current_goal else "Set goal"
-            yield Label(f"[b]{title}[/b]  [dim](Esc to cancel, Enter to commit)[/dim]")
+            yield Label(
+                f"[b]{title}[/b]  "
+                f"[dim]([reverse b] Esc [/reverse b] cancel · "
+                f"[reverse b] Enter [/reverse b] commit)[/dim]"
+            )
             yield Input(
                 value=self.current_goal,
                 placeholder="what should the daemon do?",
@@ -2304,7 +2319,8 @@ class InjectScreen(ModalScreen[Optional[tuple[str, str, str]]]):
                 id="inject_input",
             )
             yield Label(
-                "[b]Enter[/b] send  ·  [b]Esc[/b] cancel",
+                "[reverse b] Enter [/reverse b] send  ·  "
+                "[reverse b] Esc [/reverse b] cancel",
             )
 
     def _task_preview(self) -> str:
@@ -2448,7 +2464,9 @@ class EffortPickerScreen(ModalScreen[Optional[str]]):
                     classes=cls,
                 )
             yield Label(
-                "[dim]1-5 to pick · Esc to cancel[/dim]",
+                "[dim][reverse b] 1 [/reverse b]-"
+                "[reverse b] 5 [/reverse b] pick · "
+                "[reverse b] Esc [/reverse b] cancel[/dim]",
             )
 
     def action_pick_low(self) -> None:
@@ -2619,9 +2637,12 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
                 f"[cyan]${self.cost_so_far:.4f}[/cyan] cost"
             )
             yield Label(
-                "[dim]Adjust caps + power levels. Tab between fields, "
-                "Enter or Ctrl+S to save, Esc to cancel. "
-                "[reverse b] E [/reverse b] daemon effort  ·  "
+                "[dim]Adjust caps + power levels.  "
+                "[reverse b] Tab [/reverse b] fields · "
+                "[reverse b] Enter [/reverse b] / "
+                "[reverse b] Ctrl+S [/reverse b] save · "
+                "[reverse b] Esc [/reverse b] cancel · "
+                "[reverse b] E [/reverse b] daemon effort · "
                 "[reverse b] F [/reverse b] fast-mode toggle[/dim]"
             )
             with Horizontal(id="limits_columns"):
@@ -3065,7 +3086,9 @@ class BrakeScreen(ModalScreen[Optional["BrakeState"]]):
                 classes="brake_option",
             )
             yield Label("")
-            yield Label("[dim]Esc to cancel.[/dim]")
+            yield Label(
+                "[dim][reverse b] Esc [/reverse b] cancel.[/dim]"
+            )
 
     def action_select_paranoid(self) -> None:
         self.dismiss(BrakeState.PARANOID)
@@ -3184,7 +3207,12 @@ class KeybindsScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="keybinds_dialog"):
-            yield Label("[b]CYBERDECK KEYBINDS[/b]  [dim](Esc / ? / Space to close)[/dim]")
+            yield Label(
+                "[b]CYBERDECK KEYBINDS[/b]  "
+                "[dim]([reverse b] Esc [/reverse b] / "
+                "[reverse b] ? [/reverse b] / "
+                "[reverse b] Space [/reverse b] close)[/dim]"
+            )
             with VerticalScroll(id="keybinds_scroll"):
                 yield Static(self._build_keybinds_text(), id="keybinds_body")
 
@@ -4104,6 +4132,19 @@ class CyberdeckApp(App):
         border-top: solid $primary;
         background: $panel;
         padding: 0 1;
+    }
+    /* Awaiting-netrunner state (post-2026-05-07 evening): when the
+     * daemon emits status="waiting" AND there are no in-flight
+     * constructs, the wait is for netrunner input — the daemon just
+     * finished a task and is asking whether to chain. Without a
+     * visual cue the netrunner can't tell from elsewhere on the
+     * deck that the daemon is parked. Heavy magenta border around
+     * the entire #daemon_bar matches the deck-wide "act-on-it"
+     * color used for delay overlays + attention items. The class
+     * is toggled by _update_awaiting_netrunner_state from both
+     * the daemon-status handler and the fleet-meta handler. */
+    #daemon_bar.-awaiting-netrunner {
+        border: heavy magenta;
     }
     /* Right-panel content lists (Chatlog / Files / Tools) get a heavy
      * border when focused so the netrunner can clearly see they're "in"
@@ -6800,8 +6841,54 @@ class CyberdeckApp(App):
             self.daemon_pane.write_line(
                 "[dim]— session complete; press 'e' to set a new goal —[/dim]"
             )
+        # Drop any awaiting-netrunner border that was on at session
+        # end (rare — the daemon should emit status="done" before
+        # exiting — but defensive cleanup keeps the UI clean if a
+        # session exits via exception during a waiting state).
+        self._update_awaiting_netrunner_state("idle")
         self._refresh_subtitle()
         self._refresh_sidebar_info()
+
+    def _update_awaiting_netrunner_state(self, daemon_status: str) -> None:
+        """Toggle the .-awaiting-netrunner CSS class on #daemon_bar.
+
+        The class fires when the daemon parks at "waiting" AND there
+        are no in-flight constructs — i.e., the daemon is waiting on
+        the NETRUNNER, not on construct outcomes. Visual: heavy
+        magenta border around the whole daemon bar (matches the
+        deck-wide act-on-it color). Cleared on any other status, on
+        spawn-out-of-waiting (a new construct landed; wait is now
+        for outcomes), or on _return_to_idle.
+
+        Best-effort: query failures + missing daemon_bar are
+        swallowed silently so a class-toggle bug can't take down
+        the event handler that called us."""
+        try:
+            in_flight = self._has_inflight_constructs()
+        except Exception:
+            in_flight = False
+        awaiting = (daemon_status == "waiting" and not in_flight)
+        try:
+            bar = self.query_one("#daemon_bar")
+            bar.set_class(awaiting, "-awaiting-netrunner")
+        except Exception:
+            pass
+
+    def _has_inflight_constructs(self) -> bool:
+        """True if any construct is in a non-terminal state (running
+        or starting). Used by the awaiting-netrunner check to
+        disambiguate 'daemon waiting on outcomes' from 'daemon
+        waiting on netrunner input'."""
+        if self.fleet is None:
+            return False
+        try:
+            for c in self.fleet._constructs:
+                state_val = getattr(c.state, "value", None)
+                if state_val not in ("done", "failed", "killed"):
+                    return True
+        except Exception:
+            return False
+        return False
 
     def _handle_daemon_event(self, event: DaemonEvent) -> None:
         """Route a daemon event to the daemon pane and log it."""
@@ -6814,7 +6901,14 @@ class CyberdeckApp(App):
         elif event.kind == "action":
             self.daemon_pane.write_action(event.payload.get("action", {}))
         elif event.kind == "status":
-            self.daemon_pane.set_status(event.payload.get("status", "?"))
+            new_status = event.payload.get("status", "?")
+            self.daemon_pane.set_status(new_status)
+            # Awaiting-netrunner visual cue (post-2026-05-07 evening):
+            # when the daemon parks at "waiting" with no constructs
+            # in flight, it's waiting for netrunner input — surface
+            # that with a magenta border on the daemon bar so the
+            # netrunner can spot it from elsewhere on the deck.
+            self._update_awaiting_netrunner_state(new_status)
         elif event.kind == "error":
             self.daemon_pane.write_error(event.payload.get("text", ""))
         # 'started' and 'raw' aren't rendered in the daemon pane —
@@ -7744,6 +7838,19 @@ class CyberdeckApp(App):
             # screen real estate by default.
             self._schedule_compact_pane(fevent.construct_id)
         # run_start / run_end are noise in the TUI; logged to file regardless
+
+        # Re-evaluate awaiting-netrunner border. Spawn / finalize
+        # changes the in-flight count, which is one of the two
+        # factors (daemon_status="waiting" + no_in_flight). Without
+        # this hook, the border could persist after a spawn lands
+        # mid-wait, or fail to appear after the last construct
+        # finalizes. Cheap (one query + class toggle) so we just
+        # re-evaluate on every meta event rather than diffing the
+        # specific cases.
+        if self.daemon_pane is not None:
+            self._update_awaiting_netrunner_state(
+                self.daemon_pane.status,
+            )
 
     def _handle_event_kind(self, fevent: FleetEvent) -> None:
         pane = self.panes.get(fevent.construct_id)
