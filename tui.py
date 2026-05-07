@@ -2277,6 +2277,15 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
     #limits_title {
         text-style: bold;
     }
+    /* Focus indicator for the title's "rest position" role. With
+       can_focus=True set in on_mount, the title is the initial
+       focal point so E/F priority bindings fire immediately
+       without an Input intercepting. The accent-tinted background
+       makes that focal state visible — Static-derived widgets
+       don't get a default focus border. */
+    #limits_title:focus {
+        background: $accent 25%;
+    }
     #limits_columns {
         height: auto;
     }
@@ -2491,11 +2500,40 @@ class LimitsScreen(ModalScreen[Optional[dict]]):
             )
 
     def on_mount(self) -> None:
-        # Focus the first input so user can immediately type/edit
+        """Focus the title (made focusable here) as the modal's
+        "rest position." Pre-2026-05-07 fix, focus landed on
+        input_max_concurrent — but real-deck testing showed that
+        priority=True bindings for E/F didn't fire reliably when a
+        type='integer' Input had focus (the type filter intercepted
+        the letter at a level the priority chain didn't reach).
+        Symptom: netrunner opens modal, presses E or F, nothing
+        happens; only way to invoke them was to Tab through every
+        input until focus left the Inputs entirely.
+
+        Fix: title is the rest position. Static-derived widgets
+        don't filter letter keys, so E/F priority bindings work
+        immediately on modal open. Tab cycles into the inputs;
+        Shift+Tab wraps back to the title. CSS gives the title a
+        subtle focus highlight (Static has no default focus
+        indicator — filed gotcha)."""
         try:
-            self.query_one("#input_max_concurrent", Input).focus()
+            title = self.query_one("#limits_title", Label)
+            # Static defaults can_focus=False (cyberdeck-state.md
+            # gotcha). Override per-instance so this Label can be
+            # the modal's tab-cycle starting point.
+            title.can_focus = True
+            title.focus()
         except Exception:
-            pass
+            # Belt-and-suspenders: if the title can't be focused
+            # for any reason, fall back to the legacy first-input
+            # focus so the modal is still usable (E/F may not
+            # work without Tabbing first, but Inputs do).
+            try:
+                self.query_one(
+                    "#input_max_concurrent", Input,
+                ).focus()
+            except Exception:
+                pass
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Enter on any input commits all values
