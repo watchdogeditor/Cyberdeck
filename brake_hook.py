@@ -610,6 +610,52 @@ def check_default(tool: str, inp: dict) -> tuple[bool, str]:
     return False, ""
 
 
+def kill_pending_path(construct_id: str) -> Path:
+    """Where Construct.kill writes its kill_pending.json flag — read
+    here at the top of every hook invocation to unconditionally deny
+    every tool call from a killed construct.
+
+    This is the netrunner's "instantly remove 100% of authentication"
+    mechanism (filed 2026-05-07 evening from real-deck observation).
+    Pre-fix the kill function awaited proc.terminate() + a 2s grace
+    before tree-killing; in practice kills sometimes took the full
+    duration of an in-flight turn before landing, during which the
+    construct kept executing tool calls. Even with the post-fix
+    instant tree-kill, claude-code's child subprocesses can survive
+    the parent's death briefly (Windows orphan-child issue).
+
+    The kill_pending flag is the defense-in-depth: written ~1ms after
+    the netrunner presses k, read by the hook before any other check,
+    causes immediate exit 2 with no override path. The blast radius
+    of a post-kill construct is bounded to whatever tool calls were
+    already in flight at the moment of kill.
+
+    No cleanup. The construct is dying; the cid won't be reused
+    (UUID-based fingerprints). The flag persists until deck-launch
+    tidy-up or manual rm — fine, it's inert."""
+    return cyberdeck_home_dir() / ".cyberdeck" / "spawns" / f"{construct_id}.kill_pending.json"
+
+
+def read_kill_pending(construct_id: str):
+    """Read kill_pending.json if present. Returns the parsed dict on
+    success, None otherwise. Does NOT delete the flag — kill_pending
+    is permanent for the construct's lifetime (the construct is dead;
+    nothing legitimate should be reading from it again).
+
+    Best-effort: any I/O / parse failure returns None and the hook
+    falls through to its normal allow/deny logic. The kill flag is
+    defense-in-depth, not the only defense; missing it doesn't break
+    anything that wasn't already broken."""
+    path = kill_pending_path(construct_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def deny_pending_path(construct_id: str) -> Path:
     """Where the watchdog's TripwireEngine writes its
     deny_pending.json files. Mirrors the per-spawn settings convention
@@ -1023,6 +1069,35 @@ def main() -> int:
                 ).strip()
         except OSError:
             pass
+
+    # Kill-pending flag check (filed 2026-05-07 evening — netrunner
+    # direction: kill must instantly revoke 100% of authentication).
+    # Construct.kill writes this flag ~1ms after the netrunner
+    # presses k. If it's present, this construct is dead (or being
+    # killed) — deny EVERY tool call unconditionally. No delay
+    # window, no X-override, no tripwire-vs-brake routing. Just
+    # exit 2 with a "construct killed" stderr.
+    #
+    # Runs BEFORE tripwire deny_pending and BEFORE brake checks
+    # because if the construct is killed, none of those other
+    # gates matter — we just want everything blocked. The flag is
+    # not deleted on read; it persists for the construct's lifetime
+    # (the construct is dying; cid is uuid-fresh per spawn so no
+    # collision risk).
+    if construct_id:
+        kill_flag = read_kill_pending(construct_id)
+        if kill_flag is not None:
+            reason = kill_flag.get("kill_reason", "unspecified")
+            print(
+                f"BLOCKED: construct {construct_id} has been killed "
+                f"(reason={reason!r}). All tool calls from this "
+                f"construct are denied unconditionally. The kill "
+                f"signal may still be propagating to the subprocess; "
+                f"this gate fires immediately to prevent further "
+                f"actions during the kill window.",
+                file=sys.stderr,
+            )
+            return 2
 
     # Tripwire deny_pending check. The watchdog's TripwireEngine
     # writes the flag when a warning or critical tripwire matches a

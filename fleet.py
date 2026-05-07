@@ -952,6 +952,11 @@ class Fleet:
             profile=profile,
             deck_addendum=composed_deck_addendum,
             caliber=effective_caliber,
+            # home_dir threaded through so Construct.kill can write
+            # the kill_pending brake-hook flag (post-2026-05-07
+            # evening). Stays None for tests / standalone usage —
+            # construct degrades to "tree-kill only, no flag write."
+            home_dir=str(self.home_dir) if self.home_dir is not None else None,
         )
 
         # Generate the brake-hook --settings file for this spawn, if

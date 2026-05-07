@@ -401,6 +401,7 @@ class Construct:
         deck_addendum: Optional[str] = None,
         settings_path: Optional[str] = None,
         caliber: Optional["Caliber"] = None,
+        home_dir: Optional[str] = None,
     ):
         self.id = construct_id or f"cx-{uuid.uuid4().hex[:8]}"
         self.task = task
@@ -434,6 +435,12 @@ class Construct:
             self.tools = list(DEFAULT_TOOLS)
         self.permission_mode = permission_mode
         self.cwd = cwd
+        # Deck home directory — used to write the kill_pending flag
+        # (post-2026-05-07 evening). Falls back to None when not
+        # provided; kill() then skips the flag write but still does
+        # tree-kill. Fleet.spawn passes self.home_dir through; tests
+        # / standalone construct usage may not.
+        self.home_dir = home_dir
         self.claude_bin = claude_bin
         self.extra_args = extra_args or []
         # When set, prompt is piped through stdin rather than passed as
@@ -934,57 +941,104 @@ class Construct:
         if not self._kill_reason:
             self._kill_reason = reason or "unspecified"
 
-        # Snapshot the pid before we start tearing down — proc.pid
-        # can become None after the process exits, and we need it
-        # for the tree-kill pass below regardless of which branch
-        # fires.
+        # Snapshot the pid before tearing things down — proc.pid can
+        # become None after exit, and we need it for tree-kill.
         root_pid = self._proc.pid
 
-        try:
-            self._proc.terminate()
-            await asyncio.wait_for(self._proc.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            # Escalation: claude didn't respond to terminate within
-            # the grace window. Hard tree-kill — taskkill /T /F on
-            # Windows, killpg + descendant walk + SIGKILL on POSIX.
-            # Pre-2026-05-07 evening this was just proc.kill() which
-            # only takes down the parent claude PID; child
-            # subprocesses (bash workers, python interpreters,
-            # whatever the model invoked) survived as orphans.
-            # Real-deck observation: kill would "succeed" while a
-            # background curl / nmap / ssh ran on indefinitely.
-            if root_pid is not None:
-                _hard_kill_tree(root_pid)
-            else:
-                # Defensive fallback: pid was already None somehow
-                # (proc never started cleanly?). Best we can do.
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=2.0)
-            except (ProcessLookupError, asyncio.TimeoutError):
-                pass
-        except ProcessLookupError:
-            pass  # already gone
+        # === STEP 1: Authentication revoke (instant, ~1ms) ===
+        #
+        # Write the kill_pending flag BEFORE attempting any actual
+        # process termination. The brake hook reads this flag at the
+        # top of every PreToolUse invocation; if present, the hook
+        # denies ALL tool calls from this construct unconditionally
+        # (no override, no delay window). This is the "instantly
+        # remove 100% of authentication" mechanism the netrunner
+        # asked for after observing pre-fix kills sometimes took the
+        # full duration of an in-flight turn before landing.
+        #
+        # Even if SIGKILL takes seconds (or fails) — the construct
+        # cannot run any further tool calls within ~10ms of the kill
+        # being requested. The blast radius is bounded.
+        self._write_kill_pending_flag()
 
-        # Belt-and-suspenders tree-kill on EVERY kill path (clean
-        # terminate succeeded, escalation fired, or process was
-        # already gone). claude can shutdown gracefully without
-        # propagating SIGTERM to its children — even on the clean
-        # path we've seen background work continue. Netrunner
-        # direction: kill must be "stop instantly" — re-walking the
-        # tree is cheap (taskkill on a dead pid no-ops; descendant
-        # walks find nothing if already cleaned) and prevents the
-        # orphan-subprocess class of bugs entirely.
+        # === STEP 2: Tree-kill the subprocess (immediate, no grace) ===
+        #
+        # Pre-fix this fired terminate() then waited up to 2s before
+        # escalating to tree-kill. Real-deck observation 2026-05-07:
+        # kill commands appeared to take the full turn duration to
+        # land (30-180s). Hypothesis: either the proc.wait() doesn't
+        # honor its timeout reliably on Windows ProactorEventLoop with
+        # active subprocess pipes, or the tree-kill path was firing
+        # but claude-code's child subprocesses survived the parent's
+        # death anyway. Either way, the user-experience-correct fix is
+        # the same: don't wait. Tree-kill IMMEDIATELY. Autopsy the
+        # corpse afterward — netrunner direction: "I don't care what
+        # breaks, kill needs to be the 'stop instantly' button."
         if root_pid is not None:
             try:
                 _hard_kill_tree(root_pid)
             except Exception:
                 pass
+        else:
+            # Defensive fallback: pid was already None somehow
+            # (proc never started cleanly?). Best we can do is the
+            # asyncio handle's terminate/kill.
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+
+        # === STEP 3: Brief wait for cleanup (don't gate on it) ===
+        #
+        # The subprocess SHOULD already be dead from the tree-kill
+        # above. Wait briefly for proc.wait() to ack the exit so the
+        # state transition is clean, but cap aggressively — if it
+        # hangs past this we still flip to KILLED and let _consume
+        # drain whatever's left in the pipe buffer.
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=1.0)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
 
         self.state = ConstructState.KILLED
+
+    def _write_kill_pending_flag(self) -> None:
+        """Write the kill_pending flag the brake hook reads to
+        unconditionally deny ALL tool calls from this construct.
+
+        File path: `<home_dir>/.cyberdeck/spawns/<cid>.kill_pending.json`.
+        Same directory the existing tripwire deny_pending and brake
+        delay_pending files live in. Hook reads at the top of main()
+        AFTER construct_id is resolved from session_id.
+
+        Best-effort: file-write failures are silent. The fallback is
+        the SIGKILL itself — if the flag never lands but the kill
+        does, behavior is identical to the pre-flag world. The flag
+        is the defense-in-depth mechanism for the case where the
+        kill is slow or fails.
+
+        No cleanup. The construct is being killed; the cid won't be
+        reused. The flag persists until deck-launch tidy-up (or
+        manual rm) — fine; it's inert.
+        """
+        if not self.home_dir:
+            return
+        try:
+            from pathlib import Path as _Path
+            spawns_dir = _Path(self.home_dir) / ".cyberdeck" / "spawns"
+            spawns_dir.mkdir(parents=True, exist_ok=True)
+            flag_path = spawns_dir / f"{self.id}.kill_pending.json"
+            payload = {
+                "construct_id": self.id,
+                "kill_reason": self._kill_reason or "unspecified",
+                "killed_at": time.time(),
+            }
+            flag_path.write_text(
+                json.dumps(payload), encoding="utf-8",
+            )
+        except Exception:
+            # File-write failure is silent — see docstring.
+            pass
 
     # ---- introspection --------------------------------------------------
 
