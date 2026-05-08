@@ -14,7 +14,7 @@ magic marker line on stdout. The cyberdeck deck process, which sees
 construct stdout via the event stream, recognizes the marker and
 performs the corresponding UI action.
 
-The protocol is one-way (script → deck) by design. The script never
+The protocol is one-way (script -> deck) by design. The script never
 reads from the deck or affects construct execution — it just signals.
 
 Marker format:
@@ -92,7 +92,7 @@ def cmd_files_remove(args: list) -> int:
     return 0
 
 
-# Dispatcher table: (category, action) → handler. Adding new commands
+# Dispatcher table: (category, action) -> handler. Adding new commands
 # is a one-entry change — keep handlers self-contained and the
 # protocol versioned per ACTION (PROTOCOL_VERSION bumps if we ever
 # break the wire format).

@@ -408,6 +408,28 @@ class Kind:
     # without inspecting payloads. See fleet.py's _META_TYPE_TO_KIND.
     CONSTRUCT_REFUSED = "construct.refused"
 
+    # Per-run workspace lifecycle (filed 2026-05-07). RUN_OPENED
+    # fires once on app mount when the deck mints its launch's run
+    # dir; RUN_CLOSED fires once on quit/eject. The run is the deck
+    # process's lifetime — see `Design Files/in-flight/cyberdeck-per-
+    # run-workspaces-design.md`. Distinct from FLEET_RUN_START/END
+    # (those are deck-launch boundaries used by mechanic.py + the
+    # NDJSON log envelope; semantically overlapping but FLEET_*
+    # rides Fleet's lifecycle while RUN_* rides App's). Payload: a
+    # `runs.Run` object on DeckEvent.payload.
+    RUN_OPENED = "run.opened"
+    RUN_CLOSED = "run.closed"
+
+    # `Fleet._handle_stale_resume` fires this when a pool-served
+    # session_id is rejected by Claude Code at startup with
+    # "No conversation found with session ID: <uuid>". Defensive
+    # surface: the construct gets auto-retried fresh (see
+    # `Fleet._handle_stale_resume` + the retry path in `_consume`),
+    # but we publish the event so the chatlog renders the retry as
+    # narrative rather than as a silent reflow. Payload:
+    # session_id, construct_id, task_preview, err.
+    POOL_STALE_RESUME = "pool.stale_resume"
+
     # Daemon (Phase 3). DaemonEvent.kind enumerates: thinking, chat,
     # action, status, error, raw. Each maps to a daemon.<kind> bus
     # event. DaemonSession synthesizes additional `error` events

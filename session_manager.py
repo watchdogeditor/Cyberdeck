@@ -283,6 +283,9 @@ class SessionManager:
         2. `warm` entries from the prior run get the normal stale check
            — fresh ones survive and the pool can reuse them, old ones
            expire. This is where cross-restart pool reuse pays off.
+           Stable cwd across launches (the deck stays at `<home>`)
+           keeps Claude Code's per-project session storage consistent,
+           so resume actually works for entries that pass is_stale.
 
         Returns a dict {"orphaned": [...], "stale": [...]} with the
         entries that were transitioned, for logging/diagnostics."""

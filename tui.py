@@ -88,6 +88,7 @@ from brake_delay import (
     DelayEntry, DelayResolution, DelayMonitor,
     write_delay_override,
 )
+from runs import Run, mint_run
 from attention import (
     AttentionItem, AttentionKind, AttentionResolved, AttentionResolution,
 )
@@ -4587,6 +4588,19 @@ class CyberdeckApp(App):
         self.session_manager: Optional[SessionManager] = None
         self.session_pool: Optional[SessionPool] = None
         self._daemon_task: Optional[asyncio.Task] = None
+        # Per-run workspace (filed 2026-05-07, final form 2026-05-08
+        # — see `Design Files/in-flight/cyberdeck-per-run-workspaces-
+        # design.md`).
+        #
+        # A run = the deck process's lifetime. ONE run per launch,
+        # minted once at `on_mount`, kept until shutdown. Mirrors
+        # the per-launch log file structure. The run dir is a
+        # PROMPT-LEVEL OUTPUT CONVENTION, not a cwd: constructs cwd
+        # at `<home>` (stable for cache + Claude Code's per-project
+        # session storage), but the deck addendum + daemon system
+        # prompt instruct them to write outputs to the run dir's
+        # absolute path.
+        self._active_run: Optional[Run] = None
         # The spine. One canonical event bus that every event source
         # on the deck eventually publishes to. Phase 1 added the
         # primitives (event_bus.py); Phase 2 wires Fleet through it
@@ -4873,6 +4887,11 @@ class CyberdeckApp(App):
             filter=["brake.delay_resolved"],
             name="tui.delay_resolved",
         )
+        # Per-run-workspaces (final form 2026-05-08): `run.opened`
+        # and `run.closed` are observability-only. They fire on
+        # mount and on quit/eject so DeckLogger captures the
+        # boundary in the per-launch NDJSON, but no in-deck
+        # subscriber acts on them.
         # Periodic refresh of the DelayPanel's countdown bars. 100ms
         # gives smooth visible motion without burning cycles. Started
         # after the UI mounts; see on_mount.
@@ -5636,6 +5655,75 @@ class CyberdeckApp(App):
 
     def on_mount(self) -> None:
         self.title = "Cyberdeck"
+        # Per-run workspace mint (filed 2026-05-07, final form
+        # 2026-05-08). One run dir per deck launch, minted now,
+        # kept for the process lifetime. Constructs cwd at `<home>`;
+        # the run dir is communicated to them as an output-directory
+        # convention via deck_addendum + daemon system prompt.
+        # Mint failure: deck stays usable; the addendum just doesn't
+        # include the OUTPUT DIRECTORY section, so files smear flat
+        # in `<home>/` until the netrunner restarts.
+        try:
+            self._active_run = mint_run(
+                home=self.home_dir,
+                origin="deck",
+                goal=None,
+            )
+            self._publish_run_event("run.opened", self._active_run)
+        except Exception as exc:
+            self._active_run = None
+            try:
+                import sys as _sys
+                print(
+                    f"[deck] runs.mint_run failed at startup; "
+                    f"constructs will use fleet default cwd: {exc!r}",
+                    file=_sys.stderr,
+                )
+            except Exception:
+                pass
+        # Crash-traceback capture for async tasks (filed 2026-05-07
+        # evening). The asyncio loop's exception handler catches
+        # task exceptions that would otherwise be silently lost when
+        # nothing awaits them. Pair with the sys.excepthook in
+        # tui.py's `__main__` block (covers main-thread escapes).
+        # See logs/cyberdeck-2026-05-07-214251.log — first CTD where
+        # we wished we'd had the traceback in the NDJSON.
+        try:
+            import traceback as _tb_mod
+            loop = asyncio.get_event_loop()
+
+            def _loop_exc_handler(loop, context):
+                exc = context.get("exception")
+                if exc is None:
+                    loop.default_exception_handler(context)
+                    return
+                try:
+                    tb_text = "".join(
+                        _tb_mod.format_exception(
+                            type(exc), exc, exc.__traceback__,
+                        )
+                    )
+                except Exception:
+                    tb_text = repr(exc)
+                try:
+                    self.bus.publish(DeckEvent(
+                        kind="deck.crash",
+                        source="asyncio.loop",
+                        severity="critical",
+                        payload={
+                            "exc_type": type(exc).__name__,
+                            "exc_repr": repr(exc),
+                            "traceback": tb_text,
+                            "context_message": context.get("message"),
+                        },
+                    ))
+                except Exception:
+                    pass
+                loop.default_exception_handler(context)
+
+            loop.set_exception_handler(_loop_exc_handler)
+        except Exception:
+            pass
         self._refresh_subtitle()
         # Populate the Tools tab from current registry state. Empty at
         # startup; the registry's first scan_complete event will refill
@@ -5858,6 +5946,14 @@ class CyberdeckApp(App):
         # creation entirely (cheap mock testing, metered connections).
         # Pool warming subprocesses share the home dir with everyone
         # else — they're constructs, just very short-lived ones.
+        # CRITICAL (filed 2026-05-08 — see state.md gotcha): pool
+        # cwd MUST match construct spawn cwd. Claude Code's per-
+        # project session storage (`~/.claude/projects/<cwd-path>/`)
+        # keys on cwd, so cross-cwd `--resume` returns "No conversation
+        # found." Both stay at `<home>` for cross-launch reuse to work.
+        # The run dir is communicated to constructs via the system
+        # prompt addendum (output-directory convention), not by
+        # changing cwd.
         if self.use_pool:
             self.session_pool = SessionPool(
                 manager=self.session_manager,
@@ -6645,6 +6741,35 @@ class CyberdeckApp(App):
         except Exception:
             pass
 
+    def _publish_run_event(self, kind: str, run: "Run") -> None:
+        """Publish a `run.opened` / `run.closed` bus event.
+
+        Observability-only — DeckLogger picks the events up into the
+        per-launch NDJSON so log readers can see the run lifecycle.
+        No in-deck subscriber acts on these events; the run is
+        observed, not gated.
+
+        kind: "run.opened" or "run.closed".
+        run:  the Run object whose lifecycle moment this is.
+        Best-effort — bus publish failure is logged but never propagates.
+        """
+        try:
+            self.bus.publish(DeckEvent(
+                kind=kind,
+                source="tui.runs",
+                severity="info",
+                payload=run,
+            ))
+        except Exception as exc:
+            try:
+                import sys as _sys
+                print(
+                    f"runs: bus publish failed for {kind!r}: {exc!r}",
+                    file=_sys.stderr,
+                )
+            except Exception:
+                pass
+
     def _start_daemon_task(self) -> None:
         """Kick off a daemon session worker for the current goal.
         Caller must have set self.goal before calling this."""
@@ -6678,6 +6803,21 @@ class CyberdeckApp(App):
         important bit for steering, the catalog is for delegation hints.
         """
         sections: list[str] = [DAEMON_SYSTEM_PROMPT]
+
+        # Per-run output directory: bake the absolute run dir path
+        # into the prompt so the daemon can reference it in spawn
+        # task strings ("write your output to <abs_run_dir>/foo.txt").
+        # The DAEMON_SYSTEM_PROMPT's PER-RUN OUTPUT DIRECTORY section
+        # describes the convention abstractly; this section grounds
+        # it with the concrete path for THIS launch.
+        if self._active_run is not None:
+            sections.append(
+                "RUN DIR FOR THIS LAUNCH:\n"
+                f"  {self._active_run.dir_path}\n"
+                "When spawning constructs that produce files, "
+                "instruct them to write to absolute paths under "
+                "this directory."
+            )
 
         # Brake state awareness. The daemon needs to know what's
         # currently allowed so it doesn't plan actions that'll get
@@ -6851,6 +6991,9 @@ class CyberdeckApp(App):
             # daemon run / goal restart, not mid-flight.
             caliber=self.daemon_caliber,
         )
+        # Per-run workspace: minted once at on_mount; daemon just
+        # uses the existing run. No goal-set-time minting any more.
+
         self.session = DaemonSession(
             daemon=self.daemon,
             fleet=self.fleet,
@@ -6913,7 +7056,11 @@ class CyberdeckApp(App):
             self._return_to_idle()
 
     def _return_to_idle(self) -> None:
-        """Reset daemon state so the app is ready for a new goal."""
+        """Reset daemon state so the app is ready for a new goal.
+        Per-run workspaces (simplified 2026-05-07 late evening):
+        the run is the deck process's lifetime — minted at on_mount,
+        closed at shutdown/eject. Daemon idle leaves it untouched.
+        """
         self.daemon = None
         self.session = None
         self._daemon_task = None
@@ -7375,17 +7522,43 @@ class CyberdeckApp(App):
           (b) Telling the construct exact bytes to invoke is
               clearer than hoping it figures out invocation form."""
         dispatcher = self.home_dir / "tools" / "deck" / "cyberdeck.py"
-        return (
+        sections: list[str] = [
             f"You have access to a deck-control utility at "
             f"{dispatcher}. Invoke it via the Bash tool to surface "
             f"files in the netrunner's UI panel:\n"
-            f"  python {dispatcher} files add <path>\n"
-            f"  python {dispatcher} files remove <path>\n"
+            f'  python "{dispatcher}" files add "<path>"\n'
+            f'  python "{dispatcher}" files remove "<path>"\n'
             f"Use this when you produce a file the netrunner should "
             f"see in their Files panel — finished outputs, generated "
             f"reports, etc. Don't surface every intermediate scratch "
-            f"file. Paths can be absolute or relative to your cwd."
-        )
+            f"file. Paths can be absolute or relative to your cwd. "
+            f"ALWAYS double-quote both the dispatcher path and the "
+            f"target path — Bash on Windows strips backslashes from "
+            f"unquoted paths and your invocation will fail with "
+            f'"file not found" on a mangled path.'
+        ]
+
+        # Per-run output directory convention (filed 2026-05-08 after
+        # the cwd-as-project-key issue surfaced — see state.md
+        # gotcha). The deck mints one run dir per launch but DOES
+        # NOT change your cwd. Output files belong in this dir as a
+        # convention; files outside it won't be cleaned up
+        # automatically. We bake the absolute path in here so
+        # constructs don't need to compute it.
+        if self._active_run is not None:
+            sections.append(
+                f"OUTPUT DIRECTORY (for this deck launch): "
+                f"`{self._active_run.dir_path}`. When you create "
+                f"files for the netrunner — reports, generated "
+                f"artifacts, anything you'd surface via "
+                f"`files add` — write them inside this directory "
+                f"using absolute paths. Your cwd is `{self.home_dir}` "
+                f"(stable across the deck's lifetime); the output "
+                f"dir is a SEPARATE convention, not your cwd. Files "
+                f"written outside the output dir end up flat in the "
+                f"home dir and won't be cleaned up between runs."
+            )
+        return "\n\n".join(sections)
 
     def _build_per_spawn_addendum(
         self,
@@ -8170,6 +8343,9 @@ class CyberdeckApp(App):
         #    in this path.
         # 2. Tell fleet to tear down (cheap if already idle), then
         #    let Textual unwind.
+        if self._active_run is not None:
+            self._publish_run_event("run.closed", self._active_run)
+            self._active_run = None
         if self.deck_logger is not None:
             self.deck_logger.close(reason="shutdown")
         if self.fleet is not None:
@@ -8290,6 +8466,10 @@ class CyberdeckApp(App):
         # unclean crash. The logger keeps subscribed up to this point
         # so any in-flight events from the kill cascade still get
         # written to the file.
+        # Close the run before footer so run.closed makes it into NDJSON.
+        if self._active_run is not None:
+            self._publish_run_event("run.closed", self._active_run)
+            self._active_run = None
         if self.deck_logger is not None:
             self.deck_logger.close(reason="eject")
 
@@ -11796,4 +11976,92 @@ if __name__ == "__main__":
         ),
         default_profile_name=args.default_profile,
     )
+
+    # Crash-traceback capture (filed 2026-05-07 evening after the
+    # per-run-workspaces CTD lost its traceback to terminal-window
+    # death). Install hooks BEFORE app.run() so they're live for
+    # the entire deck lifetime. Both excepthook (main thread) and
+    # the asyncio loop exception handler (async tasks) write the
+    # traceback to the deck's NDJSON log via a `crash` bus event,
+    # then call DeckLogger.close(reason="crash") so mechanic.py
+    # sees the structured footer.
+    #
+    # Without this, an uncaught exception that escapes Textual
+    # prints to terminal stderr — and `wt --fullscreen` dies on
+    # CTD, taking the traceback with it. Mechanic + triage end up
+    # diagnosing from event-flow context only.
+    import traceback as _traceback
+
+    def _record_crash(exc_type, exc_value, exc_tb, source: str) -> None:
+        """Write the traceback to the bus + close the logger.
+        Best-effort; never raises (we're already in a crash path).
+        """
+        try:
+            tb_text = "".join(
+                _traceback.format_exception(exc_type, exc_value, exc_tb)
+            )
+        except Exception:
+            tb_text = f"{exc_type!r}: {exc_value!r} (traceback format failed)"
+        # Try to publish via the bus first — the logger subscribes
+        # to everything, so this gets the traceback into NDJSON.
+        try:
+            from event_bus import DeckEvent
+            app.bus.publish(DeckEvent(
+                kind="deck.crash",
+                source=source,
+                severity="critical",
+                payload={
+                    "exc_type": exc_type.__name__ if exc_type else "?",
+                    "exc_repr": repr(exc_value),
+                    "traceback": tb_text,
+                },
+            ))
+        except Exception:
+            pass
+        # Then close the logger with reason="crash" so the footer
+        # records the unclean exit explicitly.
+        try:
+            if app.deck_logger is not None:
+                app.deck_logger.close(reason="crash")
+        except Exception:
+            pass
+        # Echo to stderr too; if launch.bat ever tees stderr to a
+        # file, this gives a second copy.
+        try:
+            sys.stderr.write(
+                f"\n=== DECK CRASH ({source}) ===\n{tb_text}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        # KeyboardInterrupt is a clean operator gesture; let it
+        # through to the default handler so the deck exits cleanly.
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        _record_crash(exc_type, exc_value, exc_tb, "sys.excepthook")
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    def _loop_exc_handler(loop, context):
+        # asyncio loop's exception handler. context['exception'] is
+        # the exception object (when raised); context['message'] is
+        # set on non-exception warnings. We only record actual
+        # exceptions — the message-only events are typically
+        # cleanup noise.
+        exc = context.get("exception")
+        if exc is None:
+            # Not an exception (e.g. unclosed transport warning).
+            # Let the default handler print it; don't pollute the
+            # log with non-crashes.
+            loop.default_exception_handler(context)
+            return
+        _record_crash(type(exc), exc, exc.__traceback__, "asyncio.loop")
+        loop.default_exception_handler(context)
+
+    sys.excepthook = _excepthook
+    # The loop exception handler (catches async-task exceptions)
+    # gets installed inside CyberdeckApp.on_mount where the loop
+    # is live. sys.excepthook here covers main-thread escapes.
     app.run()

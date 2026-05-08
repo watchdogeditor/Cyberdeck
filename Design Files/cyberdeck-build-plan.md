@@ -119,6 +119,48 @@ Real-deck UX pass on the deck's primary read surfaces.
 - Mechanic CLI gains `--no-iterative` (collapse to single-pass behavior) and `--max-triage-passes` (default 4). Non-TTY stdin auto-skips the prompt so headless / wall-mount deployments get single-pass without hanging on `input()`
 - *Design:* `in-flight/cyberdeck-maintbot-design.md` (now noted in STATUS banner)
 
+### Stale pool session detect-and-retry (2026-05-07 → 2026-05-08)
+
+Defensive backstop for the case where a pool-served `--resume <id>` fails with "No conversation found." The original symptom was a real-deck storm of failed manual spawns triggered by the per-run-workspaces cwd plumbing (Claude Code's per-project session storage broke cross-cwd resume). The cwd plumbing got reverted in v5; the detect-and-retry layer stays as defense in depth — server-side eviction or any other surprise gets caught and recovered without netrunner intervention.
+
+- `Fleet._handle_stale_resume` watches result events for the "No conversation found" error string, evicts the bad session_id from the manifest, publishes `pool.stale_resume`, and marks the construct for auto-retry. The finalize path synthesizes a fresh respawn with the same params (sans `--resume`). Gated on `_retry_params` (only pool-resumed spawns retry; explicit-resume callers like inject opt out) and `_retry_attempted` (prevents loops).
+- `Fleet.spawn(force_fresh=True)` kwarg lets the retry path skip the pool entirely (otherwise the retry pulls another stale entry — real-deck-observed fork-bomb).
+- `DEFAULT_STALE_AFTER_SECS` stays at 5h (the original heuristic). It WAS tightened to 1h mid-iteration but reverted when the cwd revert removed the actual bug.
+- New `Kind.POOL_STALE_RESUME` bus constant.
+- Filed gotchas + design lessons in `cyberdeck-state.md` Filed gotchas → Async/subprocess (cwd-as-project-key + fork-bomb sub-gotcha).
+
+### Per-run workspace compartmentalization (2026-05-07 → 2026-05-08)
+
+Filed mid-day 2026-05-07, designed in five revisions over 18 hours, ended up much smaller than it started. Net code surface: `runs.py` (new, ~175 LOC), small additions to `tui.py`, `daemon.py`, `event_bus.py`. (`fleet.py`, `daemon_session.py`, `dispatcher.py`, `session_manager.py` were touched in mid-iterations and reverted.)
+
+**Final shape (v5, 2026-05-08):**
+
+- ONE run per deck launch. Minted at `App.on_mount`; kept for the process lifetime; closed at shutdown / eject.
+- Run dir: `<home>/runs/run-<YYYY-MM-DD-HHMMSS>-<4hex>/`. Mirrors per-launch log file structure.
+- Constructs (all paths) cwd at `<home>` — STABLE, not the run dir. Pool warms at `<home>`, fleet default at `<home>`, manual + daemon spawns all at `<home>`. Cross-launch session reuse works because cwd path determines Claude Code's per-project session storage.
+- Run dir is communicated as a PROMPT-LEVEL convention: deck addendum says "write your outputs to `<absolute_run_dir>/`", daemon system prompt has the run dir baked in for task-string composition. Constructs honor it because the prompt asks them to, not because they're forced to.
+- Bus events: `run.opened` (on mount), `run.closed` (on quit / eject).
+- Run dirs persist on disk indefinitely. Cleanup is manual; auto-purge is in EXPLICIT NON-GOALS.
+
+**Iteration history (preserved in design doc; the value of the slice is the lessons):**
+
+- **v1**: per-goal-set runs, auto-close on daemon idle, end-of-run modal with 4 wholesale buttons. Surfaced two catastrophic bugs (modal duplicate-IDs CTD; `self.run` shadowed `async def run()`).
+- **v2**: bugs fixed, same shape.
+- **v3**: netrunner-gated lifecycle, Shift+R gesture, per-file curation modal (LEAVE/TOOLIFY/PRESERVE/DELETE marks), dispatcher `mark-as-*` protocol.
+- **v4**: ripped curation back out per netrunner direction ("the runs system shouldn't be this involved"). Run = launch lifetime. ~500 LOC removed.
+- **v5 (final)**: cwd plumbing reverted entirely after real-deck stale-resume storm exposed Claude Code's per-project session storage. Run dir survives as prompt-level convention only. ~80 more LOC of plumbing removed.
+
+**Bonus fixes that survived all iterations (filed in state.md gotchas):**
+
+- **Modal duplicate-IDs CTD** — Textual rejects duplicate IDs at mount; render-pipeline crash kills the whole TUI. Lesson filed; offending modal is gone.
+- **`self.run` shadowing `async def run()`** — instance attr shadows class method. Lesson: check class method names before naming new attrs.
+- **Crash-traceback capture** — `sys.excepthook` + asyncio loop exception handler write `deck.crash` events with full traceback. Future CTDs leave evidence.
+- **Stale pool session detect-and-retry** — `Fleet._handle_stale_resume` watches result events for "No conversation found", evicts the bad session_id, marks construct for auto-retry; retry path passes `force_fresh=True` to bypass pool (avoids fork-bomb where retry hits another stale entry).
+- **Claude Code per-project session storage gotcha** — `~/.claude/projects/<cwd-as-path>/` keys session storage on cwd. Cross-cwd `--resume` returns "No conversation found" (same string as server-side eviction). Diagnostic process lesson filed.
+
+*Design:* `in-flight/cyberdeck-per-run-workspaces-design.md` (will rewrite to match v5 final form before moving to `archive/shipped/`).
+*Pending real-deck verification:* manual constructs work fast via pool reuse; daemon composes run dir into spawn task strings; constructs honor the output-directory convention; cross-launch pool reuse works.
+
 ### Tripwires redesign — brake/tripwire unification (2026-05-07)
 
 Major reshape of tripwire enforcement in response to a real-deck operational pain point ("most tasks failed because tripwires fired on benign content"). Lands as one slice; touches `brake_state.py`, `brake_hook.py`, `brake_delay.py`, `tripwires.py`, `tui.py`.
@@ -137,7 +179,7 @@ Major reshape of tripwire enforcement in response to a real-deck operational pai
 
 ## CURRENT FRONTIER
 
-Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Deck at clean phase point. Candidates ranked by tractability:
+Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Per-run workspaces shipped 2026-05-08 (v5 final form) — pending real-deck verification before the next slice picks up. Remaining candidates:
 
 ### 1. Item 000 phase 2 — Role-injection infrastructure
 - Conditional. ~600-1000 LOC. Pull forward only on concrete regression
@@ -199,6 +241,22 @@ Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Deck at clean ph
 - Cold-start caveat: rate-limit fields populate only after first model call
 - Pi gotcha: tmpfs (`/dev/shm/cyberdeck-quota.json`) on OrangePi to avoid SD-card wear
 - *Design:* spec'd inline here; touches status-line script + new quota reader module
+
+### Per-spawn tool/plugin availability surface
+
+Filed 2026-05-07. Profile-spawned constructs should know which tools on their list are actually installed/working so they don't waste turns invoking unavailable ones.
+
+Current state (partial): tools-registry already tracks `available` + `unavailable_reason`; the per-spawn addendum (tui.py `_build_per_spawn_addendum`) renders `[unavailable: <reason>]` after the description for tools that fail their availability check. But:
+
+- No explicit guidance to the construct on what to do when it sees `[unavailable]` — model behavior is implicit (most models will avoid, but it's not told to).
+- Plugins are filtered through `plugin_registry.available()` BEFORE the addendum renders, so unavailable plugins are silently absent. A construct given a daemon-selected plugin that isn't loaded gets an error mid-task instead of a heads-up at spawn time.
+
+Slice shape (~40-60 LOC):
+- Tools: add a brief instruction in the tools header ("entries marked `[unavailable]` are listed for awareness; do not invoke — use the alternative or surface the gap to the netrunner").
+- Plugins: render unavailable plugins in a separate dim section with their `[requires]` reason, instead of filtering them out.
+- Header tweak: explicit "available now" framing so models that skim the list don't assume everything's ready.
+
+*Design:* spec'd inline; touches `tui.py:_build_per_spawn_addendum` only.
 
 ### Discrete bugs (deferred but specified)
 - **Kill doesn't interrupt in-flight assistant turns** — SIGTERM lands AFTER model finishes turn. Stopping mid-turn requires stdin-injection or stream interrupt; design alongside future inject-and-interrupt v2
@@ -269,13 +327,6 @@ Filed 2026-05-07 from real-deck observation. Netrunner flagged several render su
 ---
 
 ## MID FUTURE (designed but blocked or queued behind near-future)
-
-### Per-run workspace compartmentalization
-- Default spawn cwd `<home>/` → `<home>/runs/<run_id>/`. ~50-80 LOC
-- All constructs in a run share folder; created on first spawn, kept across run lifetime
-- Composes with universal list-names, morgue, files-panel dedupe
-- Not blocking anything, not blocked by anything
-- *Design:* spec'd inline here; touches `fleet.py` cwd resolution
 
 ### Universal list-names (spec-level rule)
 - Every new listable object MUST carry `list_name`
@@ -402,6 +453,9 @@ Check this list before proposing a slice that touches one of these areas. If you
 - Autonomous thrash bounds at the daemon level (runner's continuous-comms is the counter-thrash)
 - `--bare` flag on Claude Max OAuth subprocesses (breaks OAuth/keychain auth)
 - `--system-prompt` / `--append-system-prompt` for multi-line content on Windows (argv truncates at first `\n`; use `-file` variants)
+- Auto-purge of run dirs (per-run workspaces, 2026-05-07). Runs persist until the netrunner explicitly deletes one (manual `rm`, or a future bulk "clean out all sessions" gesture). The cost of vaporizing wanted work dwarfs the cost of leaving stale dirs around
+- Autonomous moves of files out of the run dir (per-run workspaces, 2026-05-08). The deck does not auto-promote, auto-archive, or auto-organize files generated during a run — the netrunner asks for what they want via normal spawn actions ("move foo.txt to keepers/")
+- cwd-based per-run workspaces (per-run workspaces, 2026-05-08). Constructs cwd at `<home>` for cache locality + Claude Code's per-project session storage; the run dir is a prompt-level output convention, not a sandbox. cwd-per-run was real-deck-broken (cross-cwd `--resume` returns "No conversation found"); not retrying that approach
 
 ---
 

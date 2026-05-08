@@ -411,6 +411,54 @@ class Fleet:
             if deck_event is not None:
                 self.bus.publish(deck_event)
 
+    def _handle_stale_resume(self, c: Construct, err_text: str) -> None:
+        """Defensive handler: a construct's --resume target was retired
+        server-side. Three actions:
+
+        1. Evict the session_id from the manifest so the pool doesn't
+           try to serve it again to a future spawn.
+        2. Publish `pool.stale_resume` for chatlog observability.
+        3. Mark the construct for auto-retry. The finalize path in
+           `_consume` reads `_needs_retry` and synthesizes a fresh
+           respawn with the same params (sans `--resume`).
+
+        Retry is gated on the construct having `_retry_params` set
+        (only pool-resumed spawns; explicit `resume_session_id`
+        callers like inject opt out — they're continuing a specific
+        named session). `_retry_attempted` prevents retry-loops if
+        the retry itself ALSO hits a stale-resume.
+        """
+        sid = c.resume_session_id or "?"
+        if self.session_manager is not None and sid != "?":
+            try:
+                self.session_manager.update(sid, state="expired")
+            except Exception:
+                pass
+        if self.bus is not None:
+            try:
+                from event_bus import DeckEvent
+                self.bus.publish(DeckEvent(
+                    kind="pool.stale_resume",
+                    source="fleet",
+                    severity="warning",
+                    construct_id=c.id,
+                    payload={
+                        "session_id": sid,
+                        "construct_id": c.id,
+                        "task_preview": (c.task or "")[:60],
+                        "err": err_text,
+                    },
+                ))
+            except Exception:
+                pass
+        # Mark for auto-retry. Only pool-resumed spawns carry
+        # _retry_params (set in spawn() above); explicit-resume
+        # callers don't get retried. _retry_attempted guards against
+        # loops if the retry also fails.
+        if (getattr(c, "_retry_params", None) is not None
+                and not getattr(c, "_retry_attempted", False)):
+            c._needs_retry = True
+
     # ---- per-construct consumer ----------------------------------------
 
     async def _consume(self, c: Construct) -> None:
@@ -478,6 +526,29 @@ class Fleet:
                         permission_denials.extend(
                             d for d in pd if isinstance(d, dict)
                         )
+                    # Stale-resume detection (filed 2026-05-07 evening).
+                    # When --resume <id> targets a session Claude
+                    # Code can't locate (server-side retired OR a
+                    # local-state mismatch like the project-storage
+                    # gotcha — see state.md), the result event lands
+                    # with `errors: ["No conversation found with
+                    # session ID: <uuid>"]` and the construct dies
+                    # with `error_during_execution`. We evict the
+                    # bad session_id from the manifest defensively
+                    # (next pool refill won't reach for it again),
+                    # publish `pool.stale_resume` for chatlog
+                    # observability, and mark the construct for
+                    # auto-retry. Defensive backstop: with stable
+                    # cwd this shouldn't fire often, but session
+                    # retention is server-controlled and the retry
+                    # path keeps UX intact when surprises happen.
+                    if event.raw.get("is_error"):
+                        errors = event.raw.get("errors") or []
+                        for err in errors:
+                            if (isinstance(err, str)
+                                    and "No conversation found" in err):
+                                self._handle_stale_resume(c, err)
+                                break
                     usage = event.raw.get("usage") or {}
                     # Sum all input flavors: fresh input + cache reads
                     # + cache creation. For a user watching the sidebar,
@@ -723,6 +794,40 @@ class Fleet:
                     except Exception:
                         pass
 
+                # Stale-resume auto-retry (filed 2026-05-07 evening,
+                # fork-bomb fix late evening).
+                #
+                # If `_handle_stale_resume` flagged this construct,
+                # synthesize a fresh respawn with the same params.
+                # `force_fresh=True` is critical: without it, the
+                # retry pulls from the pool and may hit ANOTHER
+                # stale session — every retry is a new Construct
+                # instance with `_retry_attempted=False`, so the
+                # original's "prevent loops" guard doesn't apply.
+                # That created a real fork-bomb on real-deck (~8
+                # failed spawns before the netrunner caught it).
+                # Bypassing the pool guarantees the retry is a
+                # fresh `claude -p` with no `--resume`, which
+                # cannot itself trigger another stale-resume retry
+                # (the retry-eligibility check in spawn() requires
+                # pool-served `resume_id` — a fresh spawn doesn't
+                # have one).
+                if (getattr(c, "_needs_retry", False)
+                        and getattr(c, "_retry_params", None) is not None
+                        and not getattr(c, "_retry_attempted", False)):
+                    c._retry_attempted = True
+                    retry_params = dict(c._retry_params)
+                    retry_params["force_fresh"] = True
+                    if not self.quiet:
+                        print(
+                            f"[fleet] {c.id}: stale-resume detected; "
+                            f"retrying spawn fresh"
+                        )
+                    asyncio.create_task(
+                        self.spawn(**retry_params),
+                        name=f"stale-resume-retry-{c.id}",
+                    )
+
     # ---- construct management ------------------------------------------
 
     async def spawn(
@@ -735,6 +840,7 @@ class Fleet:
         plugins: Optional[list[str]] = None,
         per_spawn_addendum: Optional[str] = None,
         caliber: Optional["Caliber"] = None,
+        force_fresh: bool = False,
     ) -> Optional[Construct]:
         """Spawn a single construct and wire its consumer into the fleet.
 
@@ -856,12 +962,21 @@ class Fleet:
 
         # Resolve the session_id we'll resume (if any). Explicit caller
         # request wins; otherwise try the pool (only when profile is
-        # default-or-absent); otherwise fresh spawn.
+        # default-or-absent AND `force_fresh` is False); otherwise
+        # fresh spawn.
+        #
+        # `force_fresh` was added 2026-05-07 late evening to break a
+        # fork-bomb loop in stale-resume auto-retry: the retry was
+        # going through the pool and hitting another stale entry,
+        # which triggered another retry, which... real-deck observed
+        # 8+ failed manual spawns in a row before the loop got
+        # noticed. Retry callers now pass `force_fresh=True` to
+        # guarantee a non-pool spawn.
         resume_id: Optional[str] = resume_session_id
         pool_eligible = (
             profile is None
             or profile.name == "default"
-        )
+        ) and not force_fresh
         if (resume_id is None
                 and self.session_pool is not None
                 and pool_eligible):
@@ -958,6 +1073,31 @@ class Fleet:
             # construct degrades to "tree-kill only, no flag write."
             home_dir=str(self.home_dir) if self.home_dir is not None else None,
         )
+
+        # Stale-resume retry params (filed 2026-05-07 evening). If
+        # `_handle_stale_resume` fires for this construct (pool-served
+        # session was already retired server-side), the finalize path
+        # uses these params to synthesize a fresh respawn — preserves
+        # the netrunner's UX even when the staleness window heuristic
+        # is wrong. `_retry_attempted` gates against retry-loops if
+        # the retry itself ALSO somehow fails (e.g. network down).
+        # Only set when the spawn was pool-resumed; explicit
+        # resume_session_id callers (inject) opt out of retry since
+        # they're continuing a specific named session.
+        if resume_id is not None and resume_session_id is None:
+            c._retry_params = {
+                "task": task,
+                "parent_id": parent_id,
+                "profile": profile,
+                "origin": origin,
+                "plugins": plugins,
+                "per_spawn_addendum": per_spawn_addendum,
+                "caliber": caliber,
+            }
+        else:
+            c._retry_params = None
+        c._retry_attempted = False
+        c._needs_retry = False
 
         # Generate the brake-hook --settings file for this spawn, if
         # the deck has wired up a brake-state provider and a home dir

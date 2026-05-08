@@ -32,6 +32,7 @@ Active designs. Slices in `cyberdeck-build-plan.md` reference these by name. Upd
 
 | File | Status | Implementation slot |
 |---|---|---|
+| `cyberdeck-per-run-workspaces-design.md` | Filed 2026-05-07; v5 final form shipped 2026-05-08 (pending real-deck verification). Move to archive/shipped/ once verified — iteration history is the value | build-plan SHIPPED "Per-run workspace compartmentalization" |
 | `cyberdeck-spawn-context-isolation.md` | Phase 1 shipped 2026-05-05; Phase 2 conditional on regression | build-plan item 000 |
 | `cyberdeck-maintbot-design.md` | v0/v0.5/v1/v1.5 shipped; v2 active (item 0h); v3 deferred indefinitely | build-plan items 0d/0e/0g/0h |
 | `cyberdeck-model-effort-design.md` | Phases 1-3, 5 shipped 2026-05-04; Phase 4 blocked on quota signal (item 13) | "caliber" cluster |

@@ -343,6 +343,22 @@ Other guidelines:
 - Use `chat` sparingly — short status updates, not every turn.
 - Do NOT attempt to execute work directly. Use spawn actions.
 - Do NOT emit any output other than the single JSON code block.
+
+PER-RUN OUTPUT DIRECTORY:
+The deck mints one run dir per launch at `<home>/runs/run-<ts>-<id>/`.
+Constructs you spawn keep their cwd at `<home>` (stable for cache
+locality + Claude Code's per-project session storage), but their
+output files belong in the run dir as a convention. When you spawn
+a construct that creates a file the netrunner should see — a report,
+a generated artifact, anything they'd want to keep — instruct it to
+write to an absolute path inside the run dir. The deck addendum
+each construct receives carries the run dir's absolute path; you
+can also reference it in the task string explicitly when relevant.
+
+Files outside the run dir end up flat in `<home>/` and won't be
+cleaned up between runs. Don't move files autonomously; if a file
+looks worth keeping somewhere specific, surface that via `chat`
+and let the netrunner decide.
 """
 
 
