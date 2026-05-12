@@ -546,7 +546,64 @@ def parse_args() -> argparse.Namespace:
             "elsewhere on disk."
         ),
     )
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help=(
+            "v2 (item 0h, 2026-05-08): standalone config repair scan. "
+            "Skips the supervisor loop entirely — fires a one-shot LLM "
+            "session that scans <home>/.cyberdeck/state.json, "
+            "<home>/profiles/*.toml, and <home>/tools/tools.toml for "
+            "structural corruption and proposes per-file fixes the "
+            "netrunner approves with y/N/q per proposal. Useful when "
+            "you suspect a config got mangled but the deck didn't "
+            "crash. Requires a TTY for the per-proposal prompts; "
+            "non-TTY auto-declines every proposal (clean degradation)."
+        ),
+    )
+    parser.add_argument(
+        "--no-repair-prompt",
+        action="store_true",
+        help=(
+            "v2 (item 0h, 2026-05-08): suppress the post-triage 'Run "
+            "config repair scan?' prompt. Default: after iterative "
+            "triage finishes, the supervisor parses the triage "
+            "report's '## Repair recommendation' section and offers "
+            "to run a repair scan ([Y/n] when triage recommended; "
+            "[y/N] otherwise). Disable this to keep triage output "
+            "single-shape (e.g. for headless / wall-mount where "
+            "there's no netrunner at the terminal). Non-TTY stdin "
+            "auto-skips the prompt regardless of this flag."
+        ),
+    )
+    parser.add_argument(
+        "--repair-timeout",
+        type=float,
+        default=240.0,
+        help=(
+            "v2 (item 0h, 2026-05-08): per-call hard timeout for the "
+            "repair scan subprocess (default 240s). Repair walks "
+            "1-5 small config files + may Read seed defaults from "
+            "deck source for comparison. 240s is generous; usual "
+            "completion is 60-120s. Bump higher if your config "
+            "state is unusual (many profiles, extensive tools.toml)."
+        ),
+    )
     return parser.parse_args()
+
+
+def resolve_home_dir() -> Path:
+    """Resolve the deck home directory for repair operations.
+
+    Mirrors resolve_heartbeat_path's resolution shape: $CYBERDECK_HOME
+    if set, else `<this script>/cyberdeck-home/` (the launch.bat
+    convention). The mechanic uses this to locate config files for
+    repair scans.
+    """
+    env = os.environ.get("CYBERDECK_HOME")
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parent / "cyberdeck-home"
 
 
 def resolve_heartbeat_path(arg_path: Optional[str]) -> Path:
@@ -650,8 +707,90 @@ def wait_for_log_file(log_dir: Path, timeout: float) -> Optional[Path]:
     return None
 
 
+def _run_standalone_repair(args: argparse.Namespace) -> int:
+    """Standalone --repair path. Skips the supervisor loop entirely;
+    fires a one-shot config scan against the resolved home dir.
+    Returns 0 on success (whether or not any proposals were applied),
+    1 on hard failure (claude not found, spawn error, etc.).
+
+    Item 0h v2 — for "I think my profile got mangled" scenarios where
+    the deck isn't crashed but the netrunner wants config sanity-check.
+    """
+    try:
+        from mechanic_repair import RepairRequest, run_repair
+    except Exception as e:
+        print(
+            f"[mechanic] repair module import failed: {e}",
+            file=sys.stderr,
+        )
+        return 1
+
+    home_dir = resolve_home_dir()
+    if not home_dir.is_dir():
+        print(
+            f"[mechanic] home_dir does not exist: {home_dir} — "
+            f"nothing to repair. Set $CYBERDECK_HOME or check the "
+            f"deck source location.",
+            file=sys.stderr,
+        )
+        return 1
+
+    deck_source_dir = _locate_deck_source(Path(__file__).resolve().parent)
+    log_dir = resolve_log_dir(args.log_dir)
+    # Best-effort: pick a recent log to name the report against.
+    # Standalone repair doesn't NEED a log (we set log_path=None and
+    # the report fall-back lands at <home>/.cyberdeck/repair-<ts>.md).
+    # If we can find a recent one, naming gets prettier; if not, no
+    # harm done.
+    log_path = find_log_file(log_dir)
+
+    print(
+        f"[mechanic] standalone repair scan; home={home_dir} "
+        f"deck_source={deck_source_dir}",
+        file=sys.stderr,
+    )
+    req = RepairRequest(
+        home_dir=home_dir,
+        deck_source_dir=deck_source_dir,
+        log_path=log_path,  # None is fine — used only for report naming
+        triage_report_path=None,  # standalone, no triage context
+        claude_bin=args.claude_bin,
+        timeout=args.repair_timeout,
+    )
+    result = run_repair(req)
+
+    if not result.success:
+        print(
+            f"[mechanic] repair FAILED ({result.elapsed_s:.1f}s): "
+            f"{result.error}",
+            file=sys.stderr,
+        )
+        if result.report_path:
+            print(
+                f"[mechanic]   stub written -> {result.report_path}",
+                file=sys.stderr,
+            )
+        return 1
+
+    print(
+        f"[mechanic] repair scan written ({result.elapsed_s:.1f}s) "
+        f"-> {result.report_path}",
+        file=sys.stderr,
+    )
+    print(
+        f"[mechanic] summary: {result.summary_line}",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+
+    # v2 standalone path — skip the supervisor loop, scan-and-propose.
+    if args.repair:
+        return _run_standalone_repair(args)
+
     log_dir = resolve_log_dir(args.log_dir)
 
     print(
@@ -1185,6 +1324,121 @@ def main() -> int:
                     f"[mechanic]   stub written -> {triage_result.report_path}",
                     file=sys.stderr,
                 )
+
+    # v2 (item 0h, 2026-05-08): post-triage repair offer. After the
+    # iterative-triage loop finishes (any outcome), parse the triage
+    # report's "## Repair recommendation" section to pick the prompt
+    # default, then offer a config repair scan. Suppressed by
+    # --no-repair-prompt; auto-skipped on non-TTY stdin.
+    if args.no_repair_prompt:
+        print(
+            f"[mechanic] --no-repair-prompt set; skipping repair offer",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Find the last triage result with a written report. Pass 1 always
+    # writes (success / partial / failure stub all produce a file); we
+    # take that report file as the source of the recommendation since
+    # all subsequent deepening passes append to the same file.
+    triage_report_path: Optional[Path] = None
+    for tr in triage_results:
+        if tr.report_path is not None:
+            triage_report_path = tr.report_path
+            # Don't break — later passes may have updated the file
+            # path (shouldn't, but defensive). Take the last one.
+
+    try:
+        from mechanic_repair import (
+            RepairRequest,
+            parse_repair_recommendation,
+            prompt_repair,
+            run_repair,
+        )
+    except Exception as e:
+        print(
+            f"[mechanic] repair module import failed: {e}; "
+            f"skipping repair offer",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Read the report and parse the recommendation. Failure (file
+    # missing, can't read) → recommendation=None → prompt_repair
+    # falls back to [y/N] default.
+    recommended: Optional[bool] = None
+    if triage_report_path is not None:
+        try:
+            report_text = triage_report_path.read_text(encoding="utf-8")
+            recommended = parse_repair_recommendation(report_text)
+        except OSError:
+            recommended = None
+
+    if recommended is True:
+        print(
+            f"[mechanic] triage recommended config repair scan",
+            file=sys.stderr,
+        )
+    elif recommended is False:
+        print(
+            f"[mechanic] triage recommended skipping repair scan",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[mechanic] triage didn't include a clear repair "
+            f"recommendation; offering anyway with skip-by-default",
+            file=sys.stderr,
+        )
+
+    if not prompt_repair(recommended=recommended):
+        print(f"[mechanic] repair scan declined", file=sys.stderr)
+        return 0
+
+    # Run repair as a fresh spawn (not --resume off triage). Cleaner
+    # role separation; the LLM gets the repair-specific system prompt
+    # instead of the triage prompt's framing. The triage report is
+    # passed via the user prompt so the LLM has the context it needs.
+    home_dir = resolve_home_dir()
+    if not home_dir.is_dir():
+        print(
+            f"[mechanic] home_dir does not exist: {home_dir}; "
+            f"can't run repair",
+            file=sys.stderr,
+        )
+        return 0
+    print(
+        f"[mechanic] firing v2 repair scan; home={home_dir}",
+        file=sys.stderr,
+    )
+    repair_req = RepairRequest(
+        home_dir=home_dir,
+        deck_source_dir=deck_source_dir,
+        triage_report_path=triage_report_path,
+        log_path=log_path,
+        claude_bin=args.claude_bin,
+        timeout=args.repair_timeout,
+    )
+    repair_result = run_repair(repair_req)
+
+    if not repair_result.success:
+        print(
+            f"[mechanic] repair FAILED ({repair_result.elapsed_s:.1f}s): "
+            f"{repair_result.error}",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Final summary — supervisor stderr layer, mirrors triage output.
+    print(
+        f"[mechanic] repair scan written ({repair_result.elapsed_s:.1f}s) "
+        f"-> {repair_result.report_path}",
+        file=sys.stderr,
+    )
+    print(
+        f"[mechanic] summary: {repair_result.summary_line}",
+        file=sys.stderr,
+    )
     return 0
 
 

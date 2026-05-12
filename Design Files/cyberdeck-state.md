@@ -13,12 +13,13 @@ preserved at `archive/journal/cyberdeck-state-journal-pre-2026-05-07.md`
 
 ## Status snapshot
 
-The deck is real and load-bearing. ~22k LOC across 26 Python modules at
+The deck is real and load-bearing. ~22k LOC across 27 Python modules at
 the deck-source root. Daemon orchestrates real Claude Code constructs.
 Watchdog answers questions about fleet activity. Mechanic supervises
-the deck process and triages unclean exits. Constructs talk back via
-the dispatcher protocol. Every focusable surface in the right and
-bottom panels does something.
+the deck process, triages unclean exits, and (as of v2 / 2026-05-10)
+proposes per-fix repairs to corrupt config files under netrunner
+approval. Constructs talk back via the dispatcher protocol. Every
+focusable surface in the right and bottom panels does something.
 
 **🆕 Design-files restructure landed 2026-05-07** (branch
 `designdoc-rewrite`, commit `e324428`). The 19-doc accreted layout was
@@ -112,8 +113,9 @@ below for the cumulative record.
 | `plugin_bridge.py` | Plugin dispatcher (P2 of retool) |
 | `dispatcher.py` | Deck-control script (deck-side stdout protocol) |
 | `advisor.py` | Per-tool Q&A bot (modal-scoped, sonnet+medium) |
-| `mechanic.py` | Sibling-process supervisor (v0+v1+v1.5) |
-| `mechanic_triage.py` | LLM-session triage (mechanic v1) |
+| `mechanic.py` | Sibling-process supervisor (v0+v1+v1.5+v1.6+v2 wiring) |
+| `mechanic_triage.py` | LLM-session triage (mechanic v1+v1.5+v1.6) |
+| `mechanic_repair.py` | LLM-session config-file repair (mechanic v2) |
 | `doctor.py` | First-run prerequisite check |
 | `preferences.py` | Typed accessor over state.json |
 | `mock_*.py`, `main.py` | Test fixtures + smaller entry point |
@@ -318,6 +320,7 @@ Files touched: `brake_state.py`, `brake_hook.py`, `brake_delay.py`, `tripwires.p
 - v1: diagnose-only LLM-session triage on unclean exit. `mechanic_triage.py` (~480 LOC); Family A clean-spawn recipe; sonnet/medium caliber; structured Markdown to `<log>-triage.md`.
 - v1.5: stale-heartbeat triage with interactive prompt + listens-for-recovery; `--auto-triage-on-stale` for headless. Live narration via `stream-json --verbose`. Partial-recovery on timeout; default 300s.
 - **v1.6 (iterative triage, item 0g, 2026-05-07)**: multi-pass deepening on top of v1's single-pass shape. After pass 1 writes its report, mechanic prompts on stderr "Keep delving? [y/N]"; on yes, fires a deepening pass via `claude -p --resume <session_id>` so the model continues with full prior-pass context (log content, gotchas cross-references, prior cause-ranking) instead of re-reading from scratch. Each deepening pass appends a new `## Deeper analysis (pass N)` section to the same report file. Stops on N / max-passes (default 4 via `--max-triage-passes`) / fail / non-TTY stdin. New symbols: `TriageResult.session_id` field, `run_triage` kwargs `resume_session_id` + `user_prompt_override`, `prompt_keep_delving()` helper, `run_iterative_triage()` orchestrator, `_build_deepen_directive(pass_num)` for the user-message body, `_append_pass_to_report()` for the file-side write. Mechanic CLI gains `--no-iterative` (collapse to single-pass) and `--max-triage-passes` (cap deepening loop). Default flow: iterative on, 4-pass cap; non-TTY auto-skips the prompt so headless / wall-mount deployments get single-pass without hanging on input().
+- **v2 (config-file repair authority, item 0h, 2026-05-10)**: scan-and-propose for the deck's three writable config-file shapes — `<home>/.cyberdeck/state.json`, `<home>/profiles/*.toml`, `<home>/tools/tools.toml`. New `mechanic_repair.py` (~600 LOC) with its own Family A spawn shape (`MECHANIC_REPAIR_SYSTEM_PROMPT`, sonnet/medium, Read/Glob/Grep only, env-var belt suppression, `--system-prompt-file` for argv-newline avoidance). Trust separation: LLM is read-only and proposes via structured JSON output (fenced ```json block at end of report); deck applies via Python with hard path allowlist + per-proposal y/N/q approval + backup-before-write. Same separation philosophy as tripwires (LLM authors, deterministic engine enforces). Sanity-check semantics per netrunner direction: SHAPE check, not value check — propose fixes for syntax errors / missing required fields / wrong types / enum violations / broken file references; do NOT propose for non-default values that are still type-valid (those are settings, not corruption — acknowledged in a separate "Non-default values noticed" section so the netrunner sees the divergence without it becoming a fix proposal). Two activation paths: (a) **triage-coupled** — after iterative triage finishes, mechanic parses the triage report's new `## Repair recommendation` section ("Recommend repair: Y/N - reasoning") to set the post-triage prompt's default ([Y/n] when triage recommended; [y/N] otherwise), runs as fresh spawn (not --resume off triage; cleaner role separation since system prompts differ); (b) **standalone summon** — `python mechanic.py --repair` skips the supervisor loop and fires a one-shot scan against the resolved home dir (useful for "I think my profile got mangled" scenarios). New CLI: `--repair`, `--no-repair-prompt`, `--repair-timeout` (default 240s). Backup format: `<home>/.cyberdeck/repair-backups/<YYYY-MM-DD-HHMMSS>-<basename>` with `.N` suffix on sub-second collisions. Plain stderr only — no ANSI color. Non-TTY stdin auto-declines every proposal (clean degradation for headless). New symbols: `RepairRequest`, `RepairProposal`, `RepairResult` dataclasses; `is_writable_path` (deck-side allowlist enforcement); `parse_repair_response` (tolerant JSON extraction mirroring `tripwires.parse_authoring_response`); `parse_repair_recommendation` (triage-report Y/N parser with heading-section + keyword fallback); `present_proposal` (diff display + y/N/q prompt); `apply_proposal` (allowlist check + no-op detection + backup + write/delete); `run_repair` (orchestrator); `prompt_repair` (post-triage Y/n vs y/N picker).
 
 ### Caliber (per-spawn model + effort + fast-mode)
 - `caliber.py` (~250 LOC): `Caliber` frozen dataclass; KNOWN_MODELS + KNOWN_EFFORTS soft-validation; `to_claude_args()`; merge() for override hierarchy.

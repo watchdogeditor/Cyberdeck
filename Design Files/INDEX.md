@@ -34,7 +34,7 @@ Active designs. Slices in `cyberdeck-build-plan.md` reference these by name. Upd
 |---|---|---|
 | `cyberdeck-per-run-workspaces-design.md` | Filed 2026-05-07; v5 final form shipped 2026-05-08 (pending real-deck verification). Move to archive/shipped/ once verified — iteration history is the value | build-plan SHIPPED "Per-run workspace compartmentalization" |
 | `cyberdeck-spawn-context-isolation.md` | Phase 1 shipped 2026-05-05; Phase 2 conditional on regression | build-plan item 000 |
-| `cyberdeck-maintbot-design.md` | v0/v0.5/v1/v1.5 shipped; v2 active (item 0h); v3 deferred indefinitely | build-plan items 0d/0e/0g/0h |
+| `cyberdeck-maintbot-design.md` | v0/v0.5/v1/v1.5/v1.6/v2 shipped; v3 deferred indefinitely | build-plan items 0d/0e/0g/0h |
 | `cyberdeck-model-effort-design.md` | Phases 1-3, 5 shipped 2026-05-04; Phase 4 blocked on quota signal (item 13) | "caliber" cluster |
 | `cyberdeck-keymap-revision.md` | ON HOLD since 2026-04-27. Layer 1 inventory done; Layers 2-3 blank. Blocks new global keybinds | build-plan keymap revision |
 | `cyberdeck-prompt-shaping-design.md` | Filed 2026-05-07; no code yet. Coordinate with spawn-context-isolation Phase 2 | build-plan "Prompt-shaping pass" |

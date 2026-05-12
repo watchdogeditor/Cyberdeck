@@ -119,6 +119,16 @@ Real-deck UX pass on the deck's primary read surfaces.
 - Mechanic CLI gains `--no-iterative` (collapse to single-pass behavior) and `--max-triage-passes` (default 4). Non-TTY stdin auto-skips the prompt so headless / wall-mount deployments get single-pass without hanging on `input()`
 - *Design:* `in-flight/cyberdeck-maintbot-design.md` (now noted in STATUS banner)
 
+### Mechanic v2 — config-file repair authority (item 0h, 2026-05-10)
+- Scan-and-propose for the deck's three writable config-file shapes: `<home>/.cyberdeck/state.json`, `<home>/profiles/*.toml`, `<home>/tools/tools.toml`. NOT deck source — that boundary is hard.
+- New `mechanic_repair.py` (~600 LOC) — Family A spawn shape mirroring triage. LLM is read-only (Read/Glob/Grep) and proposes via structured JSON output; deck applies via Python with hard path allowlist + per-proposal y/N/q approval + backup-before-write. Same separation philosophy as tripwires (LLM authors, deterministic engine enforces).
+- Sanity-check semantics per netrunner direction: SHAPE check, not value check. Propose fixes for syntax errors / missing required fields / wrong types / enum violations / broken file references; do NOT propose for non-default values that are still type-valid. Non-defaults get acknowledged in a separate "Non-default values noticed" section — the netrunner sees the divergence without it becoming a fix proposal.
+- Two activation paths: (a) **triage-coupled** — `mechanic_triage.py`'s system prompt got a new `## Repair recommendation` section ("Recommend repair: Y/N - reasoning"); v2 reads it via `parse_repair_recommendation` to set the post-triage prompt default ([Y/n] when triage recommended; [y/N] otherwise), runs as a fresh spawn (not --resume off triage). (b) **standalone summon** — `python mechanic.py --repair` skips the supervisor loop and fires a one-shot scan against the resolved home dir.
+- New CLI flags: `--repair`, `--no-repair-prompt`, `--repair-timeout` (default 240s). Backup format: `<home>/.cyberdeck/repair-backups/<YYYY-MM-DD-HHMMSS>-<basename>` with `.N` suffix for sub-second collisions. Plain stderr only — no ANSI color.
+- New symbols: `RepairRequest` / `RepairProposal` / `RepairResult` dataclasses; `is_writable_path` (deck-side allowlist enforcement); `parse_repair_response` (tolerant JSON extraction mirroring `tripwires.parse_authoring_response`); `parse_repair_recommendation` (triage-report Y/N parser with heading-section + keyword fallback); `present_proposal` (diff display + y/N/q prompt); `apply_proposal` (allowlist check + no-op detection + backup + write/delete); `run_repair` (orchestrator); `prompt_repair` (post-triage Y/n vs y/N picker).
+- *Design:* `in-flight/cyberdeck-maintbot-design.md` (v2 section + STATUS banner updated)
+- *Pending real-deck verification:* triage-coupled trigger fires at end of iterative triage; recommendation parser correctly picks default; per-proposal approval loop renders diffs cleanly on cmd.exe / Windows Terminal; allowlist rejects non-config paths; backup directory created on first apply; standalone --repair path works without a log file.
+
 ### Stale pool session detect-and-retry (2026-05-07 → 2026-05-08)
 
 Defensive backstop for the case where a pool-served `--resume <id>` fails with "No conversation found." The original symptom was a real-deck storm of failed manual spawns triggered by the per-run-workspaces cwd plumbing (Claude Code's per-project session storage broke cross-cwd resume). The cwd plumbing got reverted in v5; the detect-and-retry layer stays as defense in depth — server-side eviction or any other surprise gets caught and recovered without netrunner intervention.
@@ -179,12 +189,12 @@ Major reshape of tripwire enforcement in response to a real-deck operational pai
 
 ## CURRENT FRONTIER
 
-Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Per-run workspaces shipped 2026-05-08 (v5 final form) — pending real-deck verification before the next slice picks up. Remaining candidates:
+Branch `claude/awesome-wozniak-41d9f1` ahead of `origin/main`. Mechanic v2 (item 0h) shipped 2026-05-10 — pending real-deck verification. Per-run workspaces (v5 final form, 2026-05-08) and tripwires redesign (2026-05-07) also pending real-deck eyes. Remaining candidates:
 
 ### 1. Item 000 phase 2 — Role-injection infrastructure
-- Conditional. ~600-1000 LOC. Pull forward only on concrete regression
-- Real-deck verification of phase-1 confirmed daemon + constructs do NOT regress without CLAUDE.md auto-load
-- New `roles_registry.py`, `general.toml`, `<deck-source>/roles/*.md`, `--system-prompt`/`--append-system-prompt-file` injection
+- Reframed 2026-05-10: pulled forward not for regression mitigation but for **prompt-editing ergonomics** — single editable file per role, auto-resets if wiped. The conditional-on-regression framing was overly cautious; the netrunner wants this for the same reason profiles got externalized into TOMLs (capability accumulates; human-readable on disk).
+- ~600-1000 LOC. New `roles_registry.py`, `general.toml`, `<deck-source>/roles/*.md`, `--system-prompt`/`--append-system-prompt-file` injection
+- Phase 1 verification (daemon + constructs don't regress without auto-CLAUDE.md) is no longer the gate; phase 2 is now slated regardless
 - *Design:* `in-flight/cyberdeck-spawn-context-isolation.md` (Phase 2 section)
 
 ### 2. Item 0f — Adversarial dyad
@@ -194,19 +204,17 @@ Branch `claude/objective-sammet-25e0b4` ahead of `origin/main`. Per-run workspac
 - Companion to caliber Phase 4 (provides quality signal alongside item 13's quota signal)
 - *Design:* doc to be filed; concept summary in this build plan + user auto-memory `project_prompt_shaping_design.md`
 
-### 3. Item 0h — Mechanic repair authority for non-source issues
-- Promotes maintbot v2. Diff-preview + per-fix approval for config files (state.json, profile TOML, tools.toml — NOT deck source)
-- ~300-400 LOC; new `mechanic_repair.py`
-- Composes with 0g (now SHIPPED) as a "third pass" trigger when iterative triage detects config issues
-- *Design:* `in-flight/cyberdeck-maintbot-design.md` (v2 section)
-
-### 4. Architecture review
+### 3. Architecture review
 - Scheduled to fire 2026-06-01 09:00 EDT (taskId `cyberdeck-architecture-review`)
 - Read-only; outputs `Design Files/cyberdeck-review-<date>.md`
 - Findings under (A) architecture coherence, (B) hard-rules compliance, (C) filed-gotcha re-introduction risk, (D) tech debt + TODOs
 - Agent phase-checks first; defers if work is in flight
 
 ### Verification opportunities pending real-deck eyes
+- Per-run workspaces v5 (manual constructs work fast via pool reuse; daemon composes run dir into spawn task strings; cross-launch pool reuse works)
+- Tripwires redesign (X-allow on critical fire skips kill; YOLO truly installs no settings file; tripwire fires under default brake produce visible delay overlays with tripwire context)
+- Mechanic v2 repair authority (triage-coupled trigger fires; recommendation parser picks default; per-proposal approval renders cleanly; allowlist rejects non-config paths; backup dir created on first apply; standalone --repair works without a log)
+- Construct/daemon pane chrome + tripwire overlay (look in narrow panes; daemon Q/A flow during real goal; tripwire-overlay text wrapping when description is long)
 - Limits modal two-column panel + EffortPickerScreen
 - Caliber Phase 5 surfaces (sidebar `daemon: opus·high`, per-pane caliber suffix)
 - Tools-UI: space-launch, z-info, h-Advisor on real targets
@@ -312,6 +320,19 @@ Filed 2026-05-07 from real-deck observation. Netrunner flagged several render su
 - Track non-construct subprocesses: daemon, watchdog Q&A, watchdog authoring one-shots, pool warmers
 - One line per spawn site to add `pid` field; one elif per source in `mechanic._apply_record`
 - *Design:* `in-flight/cyberdeck-maintbot-design.md` v0 section
+
+### Mechanic launch-checksum / integrity scan (speculatively deferred, 2026-05-11)
+Filed as a tentative v2 follow-on after the netrunner mused about it during v2 testing. **Status: not built; may not be needed.** Real-deck use of v2 will tell us whether there's a class of config corruption the LLM consistently misses.
+
+The shape: deck computes a hash of each config file at known-good state (probably first-launch / post-seed / post-explicit-baseline), stores it. On launch / on crash, the mechanic compares against the stored hash to detect "this changed" without needing an LLM scan. Sub-millisecond, no tokens, no false negatives within its scope.
+
+The tradeoff: it can't tell "netrunner edited their profile intentionally" from "file got corrupted." Every legitimate edit invalidates the checksum, asking for re-baselining. That ergonomic cost compounds — profiles are meant to be edited freely per the philosophy ("file system is the database, edit with vim").
+
+Reasonable middle-ground if it lands: only baseline-checksum files that have a deck-canonical version (default.toml, the seeded tools.toml header). Don't checksum user-authored profiles (no canonical to compare against). But that's basically what v2's `restore_default` proposal kind already does — LLM reads the canonical seed in source, compares to disk, proposes restore if diverged. We may not need a separate hash mechanism.
+
+When to pull this forward: if real-deck reports show v2's LLM consistently missing a specific corruption pattern that a checksum would catch reliably (e.g. "I edited state.json by hand and it broke, but v2 said it looked fine"). Until that signal, defer.
+
+*Design:* spec'd inline above; touches a small new state-tracking module + integration into mechanic.py launch path. ~100-200 LOC if built.
 
 ### Spine Phase 8b — Pool + Daemon callback cleanup
 - SessionPool's `on_event`, Daemon's `on_daemon_event`, Blacklist's `on_event` survived Phase 8 because they're integration interfaces
@@ -462,7 +483,7 @@ Check this list before proposing a slice that touches one of these areas. If you
 ## Cross-cuts and dependency edges
 
 - **Item 13 (quota signal)** unblocks **Caliber Phase 4** AND naturally pairs with **Item 0f (adversarial dyad)** — Phase 4 needs both quota AND quality signals to make smart escalation decisions
-- **Item 0g (iterative triage)** + **Item 0h (repair authority)** compose — repair could be triggered as a "third pass" when iterative triage detects config issues
+- **Item 0g (iterative triage)** + **Item 0h (repair authority)** compose — both shipped 2026-05-07 and 2026-05-10 respectively. The composition shape: triage's `## Repair recommendation` section (Y/N + reasoning) sets the default for the post-triage repair prompt; v2 runs as a fresh spawn (not --resume off triage) for clean role separation
 - **Mechanic v1.5 prompt-thread state machine** is the reusable substrate for items 0g/0h
 - **Universal list-names** + **Per-run workspaces** + **Morgue** all dovetail (folder = `run-{run_id}-{list_name}/`; morgue session record gains `cwd` field)
 - **Routing (`r`)** + **Morgue** = complementary recovery paths (wiring pipes output; morgue resumes session_id)

@@ -334,6 +334,21 @@ TRIAGE METHOD
    "investigate Z by spawning a recon construct", "the gotcha at
    <link> says <fix>".
 
+6. **Recommend whether config repair would help.** The deck has a
+   v2 "Mechanic repair" mode that scans config files (state.json,
+   profile TOMLs, tools.toml) for structural corruption and
+   proposes per-file fixes the netrunner approves with one
+   keystroke. After your report writes, the supervisor offers to
+   run the repair scan; your `## Repair recommendation` section
+   sets the prompt's default. Recommend YES when the death
+   evidence points at a config-file shape (TOML parse error,
+   missing required field, broken state.json, etc.). Recommend NO
+   when the failure is in code / network / subprocess / Python
+   runtime — repair won't help with those. Recommend NO when the
+   log is clean and the deck just shut down normally. Be honest:
+   most crashes don't have config-file root causes; the default
+   should be NO unless evidence points at config shape.
+
 ================================================================
 OUTPUT FORMAT
 ================================================================
@@ -367,6 +382,13 @@ deck's file viewer. Structure:
 
 ## Suggested next steps
 <numbered list, concrete actions>
+
+## Repair recommendation
+<one short line in this exact shape: "Recommend repair: Y - <one-sentence reasoning>"
+or "Recommend repair: N - <one-sentence reasoning>". The supervisor parses
+this to set the post-triage prompt's default. Default to N unless the death
+evidence specifically implicates a config file (state.json, profile TOML,
+tools.toml).>
 
 ## Cleanup status (from supervisor)
 <the supervisor's stderr summary, passed in the user message>

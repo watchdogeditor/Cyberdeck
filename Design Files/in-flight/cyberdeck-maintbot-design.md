@@ -1,7 +1,7 @@
 # Cyberdeck — Maintbot / Mechanic Design
 
-> **STATUS: v0 + v0.5 + v1 + v1.5 + v1.6 SHIPPED; v2 ACTIVE; v3 DEFERRED INDEFINITELY.**
-> Updated 2026-05-07.
+> **STATUS: v0 + v0.5 + v1 + v1.5 + v1.6 + v2 SHIPPED; v3 DEFERRED INDEFINITELY.**
+> Updated 2026-05-10.
 >
 > **Shipped slices** (mostly 2026-04-30 → 2026-05-07):
 > - **v0** — sibling Python process supervisor, tails NDJSON for live
@@ -23,24 +23,50 @@
 >   Stops on N / max-passes / fail / non-TTY. New CLI flags:
 >   `--no-iterative`, `--max-triage-passes`. Default cap: 4 deepening
 >   passes.
+> - **v2** (item 0h, 2026-05-10) — config-file repair authority. New
+>   `mechanic_repair.py` (~600 LOC) — Family A spawn shape mirroring
+>   triage, with its own `MECHANIC_REPAIR_SYSTEM_PROMPT` carrying the
+>   v2-specific scope/rules/format. The LLM is READ-ONLY (Read/Glob/
+>   Grep) and proposes via structured JSON output; the deck applies
+>   via Python with a hard path allowlist + per-proposal y/N/q
+>   approval + backup-before-write. Three writable paths only:
+>   `<home>/.cyberdeck/state.json`, `<home>/profiles/*.toml`,
+>   `<home>/tools/tools.toml`. Sanity-check semantics: SHAPE check
+>   only — propose fixes for syntax errors / missing required fields /
+>   wrong types / enum violations / broken file references; do NOT
+>   propose for non-default values that are still type-valid (those
+>   are settings, not corruption — acknowledged in a "Non-default
+>   values noticed" section instead).
+>
+>   Triage-coupled trigger: v1's system prompt got a new
+>   `## Repair recommendation` section ("Recommend repair: Y/N -
+>   reasoning"); v2 reads it via `parse_repair_recommendation` to set
+>   the post-triage prompt's default ([Y/n] when triage recommended;
+>   [y/N] otherwise). Fresh spawn for v2 (not --resume off triage) —
+>   different system prompt, different role; cleaner separation than
+>   carrying triage framing forward.
+>
+>   Standalone summon: `python mechanic.py --repair` skips the
+>   supervisor loop entirely and fires a one-shot scan against the
+>   resolved home dir. New CLI flags: `--repair`, `--no-repair-prompt`,
+>   `--repair-timeout` (default 240s). Backup format:
+>   `<home>/.cyberdeck/repair-backups/<YYYY-MM-DD-HHMMSS>-<basename>`
+>   with `.N` suffix for sub-second collisions. Plain stderr only —
+>   no ANSI color (per netrunner direction: "this isn't a fun tool,
+>   it's a fallback plan").
 >
 > See `cyberdeck-state.md` → Mechanic section for the full shipped
 > reference, and Filed gotchas → Async/subprocess for the bugs caught
 > during real-deck verification (ctypes Windows-handle truncation;
 > log-file-selection race; async-task teardown timing).
 >
-> **v2 (repair authority for non-source config files)** is the active
-> next slice — line item in `cyberdeck-build-plan.md` → CURRENT FRONTIER
-> item 3 (item 0h). Iterative-triage (item 0g) shipped 2026-05-07; v2
-> can compose with it as a "third pass" trigger when iterative triage
-> detects config issues that fall under v2's repair authority.
->
 > **v3 (autonomous correction)** stays deferred indefinitely — defer
-> until v1 + v2 give enough trust data.
+> until real-deck use of v1 + v2 gives enough trust data to make the
+> "how many crashes before we stop relaunching" policy real.
 >
-> **Read this whole doc when picking up v2.** The architecture
-> decisions for v0–v1.5 are still load-bearing for understanding what
-> v2 should and shouldn't do.
+> **Read this whole doc when picking up v3 or any maintbot follow-on.**
+> The architecture decisions for v0–v2 are still load-bearing for
+> understanding what later versions should and shouldn't do.
 
 ---
 
