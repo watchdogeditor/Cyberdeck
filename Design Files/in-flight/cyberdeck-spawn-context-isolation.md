@@ -1,7 +1,7 @@
 # Cyberdeck — Spawn Context Isolation Design
 
-> **STATUS: PHASE 1 SHIPPED 2026-05-05; PHASE 2 CONDITIONAL.**
-> Updated 2026-05-07.
+> **STATUS: PHASE 1 SHIPPED 2026-05-05; PHASE 2 SHIPPED 2026-05-11.**
+> Updated 2026-05-11.
 >
 > **Phase 1 (env-var belt) is complete:** per-role
 > `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` + auto-memory + git-instructions
@@ -12,14 +12,51 @@
 > spawned this work + the multi-line argv truncation gotcha that
 > shipped alongside it.
 >
-> **Phase 2 (role-injection infrastructure) is deferred — conditional.**
-> Real-deck verification of phase 1 confirmed daemon + constructs do
-> NOT regress without CLAUDE.md auto-load. Pull phase 2 forward only on
-> concrete regression. The forward-looking line item is in
-> `cyberdeck-build-plan.md` → CURRENT FRONTIER item 2.
+> **Phase 2 (role-injection infrastructure) shipped 2026-05-11.**
+> Per-role system prompts externalized to `<deck-source>/roles/*.md`
+> behind `prefs.role_injection` flag (default OFF for first ship). Four
+> role files: `daemon.md`, `watchdog-qa.md`, `watchdog-authoring.md`,
+> `advisor.md`. Plus `general.toml` for netrunner identity prepended to
+> every role-injected spawn. Scope narrowed from the original design:
 >
-> **Read phase-1 sections to understand WHY the env-var belt is shaped
-> the way it is. Read phase-2 sections only when picking up phase 2.**
+> - **Construct STAYS in code** (per netrunner direction 2026-05-11):
+>   defense-in-depth content — brake awareness, dispatcher protocol,
+>   security-architecture-relevant prose — should not be user-editable
+>   even on a single-netrunner deck. Pool warmer follows construct.
+> - **Mechanic v1 (triage) + v2 (repair) STAY in code**: recently
+>   verified, working as-is; no ergonomic gain from externalizing.
+> - **No hot reload** (per netrunner direction 2026-05-11): role files
+>   load once at startup. Mid-flight edits would produce confusing
+>   half-applied behavior; deck restart is the right granularity.
+> - **All configs in one folder**: `general.toml` lives in
+>   `<deck-source>/roles/` alongside the role markdown files for
+>   discoverability (one folder for all prompt config).
+>
+> New modules: `roles_registry.py` (load + default-restore;
+> single-shot, no watcher), `general_config.py` (TOML loader + identity
+> block renderer), `roles/_defaults.py` (HTML headers + lazy-import
+> functions for the four in-code prompts). Existing modules touched:
+> `advisor.py` (extracted ADVISOR_TEMPLATE constant + accepted
+> `template=` kwarg in `Advisor.__init__` and `build_system_prompt`),
+> `watchdog.py` (added `authoring_system_prompt` attribute consulted by
+> `author_tripwires`), `preferences.py` (new `role_injection` property +
+> save/reload support), `tui.py` (RolesRegistry + GeneralConfig
+> construction in `App.__init__`, `_compose_role_text` +
+> `_apply_role_injection_to_watchdog` helpers, daemon system-prompt
+> builder consults flag, AdvisorScreen passes template through).
+>
+> Flag-OFF behavior is unchanged from pre-phase-2 — every spawn site
+> uses the in-code constant when `prefs.role_injection=False`.
+> Flag-ON path reads from disk; bundled defaults seed on first launch.
+> Role files (`*.md`) and `general.toml` are gitignored — runtime
+> artifacts seeded from the canonical `_defaults.py` constants in
+> code (same pattern as profile_registry seeding `default.toml`).
+>
+> **Read this whole doc if you're refining phase 2 or adding new
+> role files. The phasing section below is the original design plan;
+> the shipped form omits Phase 0 (instrumented byte-diff baseline)
+> and adds the "construct stays in code" boundary that emerged
+> during real-deck implementation.**
 
 ---
 

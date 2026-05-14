@@ -84,6 +84,14 @@ from brake_state import (
 # save_limits stay exported for any non-tui caller (none today),
 # but tui.py uses Preferences exclusively.
 from preferences import Preferences
+# Item 000 phase 2 (2026-05-11): per-role system prompts externalized
+# to <deck-source>/roles/. RolesRegistry loads + auto-seeds the role
+# files at startup; general_config carries netrunner identity for
+# prepending. Both are gated behind `prefs.role_injection`; when off
+# they have no behavioral effect (registry still loads, just nothing
+# consumes its content).
+from roles_registry import RolesRegistry, RoleName, RoleLoadError
+import general_config
 from brake_delay import (
     DelayEntry, DelayResolution, DelayMonitor,
     write_delay_override,
@@ -2005,12 +2013,21 @@ class AdvisorScreen(ModalScreen[None]):
         target: AdvisorTarget,
         sibling_tool_names: tuple[str, ...] = (),
         claude_bin: str = "claude",
+        *,
+        template: Optional[str] = None,
     ) -> None:
         super().__init__()
+        # Item 000 phase 2 (2026-05-11): `template`, when set, is the
+        # roles registry's advisor.md content (with identity block
+        # prepended). The App passes it through when
+        # prefs.role_injection is True; None preserves current
+        # behavior. Advisor calls build_system_prompt(template=...)
+        # internally.
         self.advisor = Advisor(
             target=target,
             sibling_tool_names=sibling_tool_names,
             claude_bin=claude_bin,
+            template=template,
         )
         # Pre-render the title once; it doesn't change per session.
         self._title = f"Advisor: {target.name}"
@@ -3861,12 +3878,40 @@ class ExpandModal(ModalScreen[None]):
         # need to grab it now.
         app = self.app
         claude_bin = getattr(app, "claude_bin", "claude")
+        # Item 000 phase 2 (2026-05-11): pull the advisor role template
+        # from the App's roles registry when role injection is on.
+        # When off, the Advisor uses the in-module ADVISOR_TEMPLATE
+        # constant (current behavior).
+        advisor_template: Optional[str] = None
+        try:
+            if (
+                app is not None
+                and getattr(app, "prefs", None) is not None
+                and app.prefs.role_injection
+                and getattr(app, "roles_registry", None) is not None
+            ):
+                entry = app.roles_registry.get(RoleName.ADVISOR)
+                if entry is not None:
+                    identity_text = general_config.render_identity_block(
+                        app.general_config_data,
+                    )
+                    advisor_template = (
+                        identity_text + "\n\n" + entry.text
+                        if identity_text else entry.text
+                    )
+        except Exception:
+            # Best-effort: any failure during template resolution
+            # falls back to the in-module ADVISOR_TEMPLATE. Don't let
+            # role-injection plumbing block the netrunner from
+            # opening the Advisor.
+            advisor_template = None
         self.dismiss()
         if app is not None:
             app.push_screen(AdvisorScreen(
                 target=target,
                 sibling_tool_names=siblings,
                 claude_bin=claude_bin,
+                template=advisor_template,
             ))
 
     def action_refresh(self) -> None:
@@ -4853,6 +4898,52 @@ class CyberdeckApp(App):
             # {} on read failure, save_limits swallows OSError); wrap
             # once more so a malformed entry can't break startup.
             pass
+        # Item 000 phase 2 (2026-05-11): roles registry + general
+        # config. Loads <deck-source>/roles/*.md + roles/general.toml,
+        # auto-seeds missing files from bundled defaults, and applies
+        # the loaded content to spawn sites that consult
+        # prefs.role_injection. Default flag-OFF means these are
+        # loaded but inert — files exist on disk, registry has them
+        # in memory, no spawn site uses them.
+        #
+        # Done after prefs is initialized so we can read the flag
+        # to decide whether to apply role content to the already-
+        # constructed Watchdog (which was constructed earlier in
+        # this __init__ before prefs existed). The Daemon is
+        # constructed later, so its system prompt picks up the flag
+        # via _build_daemon_system_prompt naturally.
+        self.roles_dir = (
+            Path(__file__).resolve().parent / "roles"
+        )
+        self.roles_registry = RolesRegistry(self.roles_dir, bus=self.bus)
+        try:
+            self.roles_registry.load()
+        except RoleLoadError as e:
+            print(
+                f"tui: roles registry failed to load: {e!r} — "
+                f"role-injection flag will have no effect this session",
+                file=sys.stderr,
+            )
+        # general.toml lives in the same folder as the role files
+        # (per netrunner direction 2026-05-11 — "all configs in one
+        # dedicated folder"). load() auto-seeds the template when
+        # missing. Empty / all-commented-out config produces an
+        # empty identity block (which callers omit entirely).
+        self.general_config_data = general_config.load(
+            self.roles_dir / "general.toml",
+        )
+
+        # Apply role-injection to the already-constructed Watchdog,
+        # if the flag is on. (Watchdog was constructed at line ~4735
+        # before prefs existed; we mutate its attributes here to
+        # apply the netrunner's saved preference.) The Daemon hasn't
+        # been constructed yet; it picks up the flag via
+        # _build_daemon_system_prompt when its system prompt is
+        # composed. The Advisor is per-modal-session; we pass the
+        # template through at modal-open time (see _open_advisor).
+        if self.prefs.role_injection:
+            self._apply_role_injection_to_watchdog()
+
         # Phase 8 of the unified-event-stream slice: subscribe via the
         # bus instead of the legacy `on_change=` callback. The handler
         # receives a DeckEvent whose payload is the BrakeChangeEvent.
@@ -6786,6 +6877,75 @@ class CyberdeckApp(App):
         # tripwires (credentials, destructive SQL) cover the baseline.
         self._kick_off_tripwire_authoring()
 
+    # ---- role injection helpers (item 000 phase 2, 2026-05-11) -----------
+
+    def _compose_role_text(
+        self, role_name: str, fallback: str,
+    ) -> str:
+        """Build the role-base system prompt for one spawn site.
+
+        Returns the roles registry's role text (with identity block
+        prepended, when general.toml has populated fields) if
+        prefs.role_injection is True AND the role loaded successfully.
+        Otherwise returns `fallback` unchanged — current-behavior path.
+
+        Callers pass the in-code constant as `fallback`:
+
+            _compose_role_text(RoleName.DAEMON, DAEMON_SYSTEM_PROMPT)
+
+        The identity block (when present) comes from general.toml's
+        [identity] table — netrunner handle + pronouns + free-text
+        notes. Empty general.toml = no identity prepended.
+        """
+        if not self.prefs.role_injection:
+            return fallback
+        entry = self.roles_registry.get(role_name)
+        if entry is None:
+            return fallback
+        identity = general_config.render_identity_block(
+            self.general_config_data,
+        )
+        if identity:
+            return identity + "\n\n" + entry.text
+        return entry.text
+
+    def _apply_role_injection_to_watchdog(self) -> None:
+        """Apply role injection to the already-constructed Watchdog.
+
+        Called in __init__ AFTER prefs is loaded (Watchdog was
+        constructed earlier — before prefs existed). Mutates two
+        Watchdog attributes that author_tripwires + the Q&A spawn
+        consult at run-time:
+
+          - self.watchdog.system_prompt          → watchdog-qa.md
+          - self.watchdog.authoring_system_prompt → watchdog-authoring.md
+
+        Both are read at spawn time (lazy), so mutating them here
+        before the deck mounts is sufficient to apply the flag's
+        effect to every subsequent Q&A or authoring spawn.
+        """
+        qa_entry = self.roles_registry.get(RoleName.WATCHDOG_QA)
+        if qa_entry is not None:
+            identity = general_config.render_identity_block(
+                self.general_config_data,
+            )
+            qa_text = (
+                identity + "\n\n" + qa_entry.text
+                if identity else qa_entry.text
+            )
+            self.watchdog.system_prompt = qa_text
+
+        auth_entry = self.roles_registry.get(RoleName.WATCHDOG_AUTHORING)
+        if auth_entry is not None:
+            identity = general_config.render_identity_block(
+                self.general_config_data,
+            )
+            auth_text = (
+                identity + "\n\n" + auth_entry.text
+                if identity else auth_entry.text
+            )
+            self.watchdog.authoring_system_prompt = auth_text
+
     def _build_daemon_system_prompt(self) -> str:
         """Compose the daemon's system prompt with profile + brake awareness.
 
@@ -6801,8 +6961,18 @@ class CyberdeckApp(App):
         anything yet (race), the catalog will be sparse but the prompt
         is still well-formed — the active profile's addendum is the
         important bit for steering, the catalog is for delegation hints.
+
+        Role-injection (item 000 phase 2, 2026-05-11): when
+        `prefs.role_injection` is True, the BASE section comes from
+        <deck-source>/roles/daemon.md instead of the in-code
+        DAEMON_SYSTEM_PROMPT constant. Identity block from general.toml
+        (when populated) prepends. Profile / brake / run-dir sections
+        compose downstream as usual.
         """
-        sections: list[str] = [DAEMON_SYSTEM_PROMPT]
+        base = self._compose_role_text(
+            RoleName.DAEMON, DAEMON_SYSTEM_PROMPT,
+        )
+        sections: list[str] = [base]
 
         # Per-run output directory: bake the absolute run dir path
         # into the prompt so the daemon can reference it in spawn

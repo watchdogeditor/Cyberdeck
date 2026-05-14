@@ -13,8 +13,9 @@ preserved at `archive/journal/cyberdeck-state-journal-pre-2026-05-07.md`
 
 ## Status snapshot
 
-The deck is real and load-bearing. ~22k LOC across 27 Python modules at
-the deck-source root. Daemon orchestrates real Claude Code constructs.
+The deck is real and load-bearing. ~23k LOC across 30 Python modules at
+the deck-source root (27 source + roles/_defaults.py + general_config.py
++ roles_registry.py as of 2026-05-11 role injection). Daemon orchestrates real Claude Code constructs.
 Watchdog answers questions about fleet activity. Mechanic supervises
 the deck process, triages unclean exits, and (as of v2 / 2026-05-10)
 proposes per-fix repairs to corrupt config files under netrunner
@@ -116,6 +117,9 @@ below for the cumulative record.
 | `mechanic.py` | Sibling-process supervisor (v0+v1+v1.5+v1.6+v2 wiring) |
 | `mechanic_triage.py` | LLM-session triage (mechanic v1+v1.5+v1.6) |
 | `mechanic_repair.py` | LLM-session config-file repair (mechanic v2) |
+| `roles_registry.py` | Per-role system prompt loader (item 000 phase 2) |
+| `general_config.py` | netrunner identity + global preferences (item 000 phase 2) |
+| `roles/_defaults.py` | Bundled default content for role files (item 000 phase 2) |
 | `doctor.py` | First-run prerequisite check |
 | `preferences.py` | Typed accessor over state.json |
 | `mock_*.py`, `main.py` | Test fixtures + smaller entry point |
@@ -350,6 +354,16 @@ Files touched: `brake_state.py`, `brake_hook.py`, `brake_delay.py`, `tripwires.p
   - **KEPT** for Watchdog Q&A
 - Multi-line argv truncation fix: switched all problematic spawn sites to `--system-prompt-file` / `--append-system-prompt-file`. Promoted to top-level Hard Rule.
 - `user_email_protection` default tripwire: mitigation for `anthropics/claude-code#55743`. Reads OAuth email from `~/.claude.json` at startup; warning severity; brake denies with redirect.
+
+### Role injection — item 000 phase 2 (2026-05-11)
+- Per-role system prompts externalized to `<deck-source>/roles/*.md` behind `prefs.role_injection` flag (default OFF for first ship — netrunner flips per-launch to A/B). Four role files seeded on first launch from bundled defaults: `daemon.md`, `watchdog-qa.md`, `watchdog-authoring.md`, `advisor.md`. Plus `general.toml` in the same folder carrying netrunner identity (name + pronouns + free-text notes) prepended to every role-injected spawn's system prompt.
+- Scope narrowed from the original design (per netrunner direction 2026-05-11): **Construct STAYS in code** — defense-in-depth content (brake awareness, dispatcher protocol, security-architecture-relevant prose) should not be user-editable even on a single-netrunner deck. Pool warmer follows construct. **Mechanic v1 (triage) + v2 (repair) STAY in code** — recently verified, working as-is, no ergonomic gain from externalizing. **No hot reload** — role files load once at startup; mid-flight edits would produce confusing half-applied behavior. **All configs in one folder** (`<deck-source>/roles/`) — discoverability over file-by-file decoration.
+- New modules: `roles_registry.py` (~280 LOC; load + default-restore; single-shot, no watcher), `general_config.py` (~200 LOC; TOML loader + identity block renderer), `roles/_defaults.py` (~180 LOC; HTML headers + lazy-import functions for the four in-code prompts), `roles/__init__.py` (package marker).
+- Default-restore on empty: if a role `.md` file is "effectively empty" (only HTML comments + whitespace) at load time, registry rewrites it from `_defaults.py`'s bundled content (header + in-code prompt). Header is part of the bundled default so the "save blank to restore" hint survives every restore cycle.
+- Existing modules touched: `advisor.py` (extracted ADVISOR_TEMPLATE module-level constant; `build_system_prompt` accepts `template=` kwarg + uses `str.format()` substitution with flattened placeholders like `{target_name}`; `Advisor.__init__` accepts `template=` kwarg); `watchdog.py` (added `authoring_system_prompt` attribute on Watchdog; `author_tripwires` consults it before falling back to in-code `TRIPWIRE_AUTHORING_SYSTEM_PROMPT`); `preferences.py` (new `role_injection` property + `DEFAULT_ROLE_INJECTION=False` constant); `tui.py` (RolesRegistry + GeneralConfig construction in `App.__init__` after `prefs`, `_compose_role_text` + `_apply_role_injection_to_watchdog` helpers, `_build_daemon_system_prompt` consults the flag via `_compose_role_text`, AdvisorScreen takes `template=` and the spot opening it pulls from registry).
+- **Circular-import dodge**: `_defaults.py` uses lazy imports inside per-role builder functions (`daemon_default()` does `from daemon import DAEMON_SYSTEM_PROMPT` at call time, not import time). `roles_registry._ROLE_FILES` stores the builder functions; `load()` calls them after all source modules are loaded by the App's import graph. This avoids the cycle that would otherwise arise from `roles_registry` → `_defaults` → `daemon` → (eventually back through tui.py imports) → `roles_registry`.
+- Flag-OFF behavior unchanged: every spawn site uses the in-code system-prompt constant when `prefs.role_injection=False`. Flag-ON reads from disk + prepends identity block from `general.toml`. The `.md` files + `general.toml` are gitignored — runtime artifacts seeded from canonical `_defaults.py` constants (same pattern as profile_registry seeding `default.toml`).
+- Pending real-deck verification: flag-OFF default produces identical behavior to pre-phase-2; flipping flag-ON via Limits modal (or direct state.json edit) routes the four roles through their `.md` files; editing a role file + restart picks up the change; saving a role file blank restores the bundled default on next launch; populated `general.toml` injects identity block into role-injected spawns.
 
 ---
 

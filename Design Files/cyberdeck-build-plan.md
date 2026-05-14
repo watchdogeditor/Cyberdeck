@@ -88,6 +88,20 @@ see `cyberdeck-state.md`. This is a one-line index.
 - Item 0b — `preferences.py`
 - Item 0d — Mechanic v0→v1 bridge: liveness heartbeat
 
+### Role injection — item 000 phase 2 (2026-05-11)
+- Per-role system prompts externalized to `<deck-source>/roles/*.md` behind `prefs.role_injection` flag (default OFF for first ship). Four role files: `daemon.md`, `watchdog-qa.md`, `watchdog-authoring.md`, `advisor.md`. Plus `general.toml` for netrunner identity (name + pronouns + free-text notes) prepended to every role-injected spawn.
+- Scope narrowed from original design (netrunner direction 2026-05-11):
+  - **Construct STAYS in code**: defense-in-depth content (brake awareness, dispatcher protocol, security-architecture prose) shouldn't be user-editable even on a single-netrunner deck.
+  - **Mechanic v1 (triage) + v2 (repair) STAY in code**: recently verified, no ergonomic gain from externalizing.
+  - **No hot reload**: load once at startup; restart picks up edits. Mid-flight role-prompt changes would produce confusing half-applied behavior.
+  - **All configs in one folder**: `<deck-source>/roles/` holds the 4 `.md` files + `general.toml` (per "all configs accessible" netrunner direction).
+- New modules: `roles_registry.py` (~280 LOC), `general_config.py` (~200 LOC), `roles/_defaults.py` (~180 LOC), `roles/__init__.py`.
+- Existing modules touched: `advisor.py` (extracted ADVISOR_TEMPLATE constant + `template=` kwarg), `watchdog.py` (new `authoring_system_prompt` attribute), `preferences.py` (new `role_injection` property), `tui.py` (registry + general_config wiring in `App.__init__`, `_compose_role_text` + `_apply_role_injection_to_watchdog` helpers, daemon prompt builder consults flag, AdvisorScreen takes `template=`).
+- Circular-import dodge: `_defaults.py` uses lazy imports inside per-role builder functions; registry calls them at `load()` time, not at module import.
+- Flag-OFF behavior unchanged: every spawn site uses the in-code constant. Flag-ON reads from disk. The `.md` files + `general.toml` are gitignored — runtime artifacts seeded from canonical `_defaults.py` constants in code (same pattern as profile_registry seeding `default.toml`).
+- *Design:* `in-flight/cyberdeck-spawn-context-isolation.md` (STATUS banner updated; design doc still in-flight as documentation reference for future role additions).
+- *Pending real-deck verification:* flag-OFF default produces identical behavior to pre-phase-2; flipping flag-ON routes 4 roles through their `.md` files; editing a role file + restart picks up the change; saving a role file blank restores the bundled default on next launch; populated `general.toml` injects identity block.
+
 ### Auto-context discovery + per-role isolation phase 1 (2026-05-05)
 - Discovery + 4-line proof of CLAUDE.md auto-load via Anthropic docs
 - Per-role env-var belt (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` etc.)
@@ -189,28 +203,23 @@ Major reshape of tripwire enforcement in response to a real-deck operational pai
 
 ## CURRENT FRONTIER
 
-Branch `claude/awesome-wozniak-41d9f1` ahead of `origin/main`. Mechanic v2 (item 0h) shipped 2026-05-10 — pending real-deck verification. Per-run workspaces (v5 final form, 2026-05-08) and tripwires redesign (2026-05-07) also pending real-deck eyes. Remaining candidates:
+Branch `claude/awesome-wozniak-41d9f1` ahead of `origin/main`. Item 000 phase 2 (role injection) shipped 2026-05-11 — pending real-deck verification. Mechanic v2 (item 0h) shipped 2026-05-10. Per-run workspaces (v5, 2026-05-08) and tripwires redesign (2026-05-07) also pending real-deck eyes. Remaining candidates:
 
-### 1. Item 000 phase 2 — Role-injection infrastructure
-- Reframed 2026-05-10: pulled forward not for regression mitigation but for **prompt-editing ergonomics** — single editable file per role, auto-resets if wiped. The conditional-on-regression framing was overly cautious; the netrunner wants this for the same reason profiles got externalized into TOMLs (capability accumulates; human-readable on disk).
-- ~600-1000 LOC. New `roles_registry.py`, `general.toml`, `<deck-source>/roles/*.md`, `--system-prompt`/`--append-system-prompt-file` injection
-- Phase 1 verification (daemon + constructs don't regress without auto-CLAUDE.md) is no longer the gate; phase 2 is now slated regardless
-- *Design:* `in-flight/cyberdeck-spawn-context-isolation.md` (Phase 2 section)
-
-### 2. Item 0f — Adversarial dyad
+### 1. Item 0f — Adversarial dyad
 - Generator/discriminator paired-construct pattern. Daemon synthesizes both opinions; provides "is this work good enough" signal for caliber escalation
 - ~600-900 LOC + new design doc `cyberdeck-adversarial-dyad-design.md` (TBC)
 - Picks up post-architecture-review
 - Companion to caliber Phase 4 (provides quality signal alongside item 13's quota signal)
 - *Design:* doc to be filed; concept summary in this build plan + user auto-memory `project_prompt_shaping_design.md`
 
-### 3. Architecture review
+### 2. Architecture review
 - Scheduled to fire 2026-06-01 09:00 EDT (taskId `cyberdeck-architecture-review`)
 - Read-only; outputs `Design Files/cyberdeck-review-<date>.md`
 - Findings under (A) architecture coherence, (B) hard-rules compliance, (C) filed-gotcha re-introduction risk, (D) tech debt + TODOs
 - Agent phase-checks first; defers if work is in flight
 
 ### Verification opportunities pending real-deck eyes
+- Role injection phase 2 (flag-OFF identical to pre-phase-2; flipping flag-ON routes 4 roles through `.md` files; save-blank-to-restore works; populated general.toml injects identity block)
 - Per-run workspaces v5 (manual constructs work fast via pool reuse; daemon composes run dir into spawn task strings; cross-launch pool reuse works)
 - Tripwires redesign (X-allow on critical fire skips kill; YOLO truly installs no settings file; tripwire fires under default brake produce visible delay overlays with tripwire context)
 - Mechanic v2 repair authority (triage-coupled trigger fires; recommendation parser picks default; per-proposal approval renders cleanly; allowlist rejects non-config paths; backup dir created on first apply; standalone --repair works without a log)
@@ -488,7 +497,7 @@ Check this list before proposing a slice that touches one of these areas. If you
 - **Universal list-names** + **Per-run workspaces** + **Morgue** all dovetail (folder = `run-{run_id}-{list_name}/`; morgue session record gains `cwd` field)
 - **Routing (`r`)** + **Morgue** = complementary recovery paths (wiring pipes output; morgue resumes session_id)
 - **Keymap revision** blocks any new global keybinds — including planning-mode `E`
-- **Item 000 phase 2** simplified by phase-1 selective policy (Watchdog Q&A keeps CLAUDE.md, so role files only needed for KILLED roles where regression appears)
-- **Prompt-shaping pass** has overlap with **Item 000 phase 2** (both touch system prompt composition); coordinate when both pick up
+- **Item 000 phase 2 shipped 2026-05-11** — scope landed narrower than the original design (construct + mechanic stay in code per netrunner direction; 4 role files instead of 5). Phase 1 selective policy still applies (Watchdog Q&A keeps CLAUDE.md). The shipped form preserves flag-OFF as current behavior.
+- **Prompt-shaping pass** has overlap with item 000 phase 2 (both touch system prompt composition). With phase 2 shipped, prompt-shaping iterations now have a clean substrate to land on — the netrunner edits `roles/*.md` between launches without code changes.
 - **B2 fleet synthesizer** is substrate-blocked on D1; spine completion gives it a clean substrate when D1 lands
 - **Architecture review (2026-06-01)** is a soft phase-checkpoint — agent defers if work is in flight

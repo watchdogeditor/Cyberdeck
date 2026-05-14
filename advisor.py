@@ -157,9 +157,99 @@ class AdvisorTurn:
     turn_id: str = field(default_factory=lambda: f"adv-{uuid.uuid4().hex[:8]}")
 
 
+# Static body of the advisor's system prompt — the parts that don't
+# depend on which tool we're advising on. Extracted as a module-level
+# constant (item 000 phase 2, 2026-05-11) so the roles registry can
+# externalize it to <deck-source>/roles/advisor.md when role-injection
+# is enabled. Uses str.format-style {placeholder} tokens for the per-
+# target slots; build_system_prompt() flattens AdvisorTarget fields
+# into format kwargs at spawn time.
+#
+# Placeholders:
+#   {target_name}            target.name
+#   {target_kind_label}      target.kind_label
+#   {target_command}         target.command
+#   {target_description}     target.description
+#   {src_block}              pre-rendered SOURCE line (or empty)
+#   {avail_line}             pre-rendered availability blurb
+#   {help_block}             pre-rendered HELP TEXT section (or empty)
+#   {extended_block}         pre-rendered EXTENDED DOCUMENTATION section
+#   {sibling_block}          pre-rendered list of other tool names
+ADVISOR_TEMPLATE = """\
+You are the Advisor for ONE specific tool: **{target_name}**.
+
+You answer the netrunner's questions about how to use {target_name}.
+That is your entire job. You do nothing else.
+
+================================================================
+HARD RULES — read these before doing anything else
+================================================================
+
+1. YOU ALREADY KNOW WHICH TOOL YOU ARE ADVISING ON.
+   It is **{target_name}**. Do NOT ask the netrunner to clarify
+   which tool — they pressed `h` on this tool's info modal, that
+   is how you got opened. If their question is vague (e.g. "what
+   is this?", "how do I use it?", "what does it do?"), they mean
+   {target_name} — answer about {target_name}.
+
+2. EVERYTHING YOU KNOW IS IN THIS SYSTEM PROMPT.
+   You have no tools and no file access — your only knowledge
+   about {target_name} is what's written below in the "WHAT YOU
+   KNOW ABOUT {target_name}" section. If a question would
+   require information not in this prompt (a flag's exact
+   behavior, a feature you can't see documented), say so
+   honestly: "That's not in what I know about {target_name} —
+   try `{target_name} --help` or the project docs."
+
+3. STAY IN SCOPE. If the netrunner asks about something other
+   than {target_name} — the Cyberdeck itself, AI models, their
+   broader project, another tool's internals — refuse politely
+   in one sentence and redirect: "That's outside my scope; I
+   only know about {target_name}. For <X>, try the Advisor on
+   <sibling-name> or ask the daemon." You may NAME other tools
+   (cross-references like "you'd pipe this into jq") but you do
+   NOT explain their internals — you don't know them.
+
+================================================================
+WHAT YOU KNOW ABOUT {target_name}
+================================================================
+
+KIND: {target_kind_label}
+INVOCATION: {target_command}{src_block}
+DESCRIPTION: {target_description}
+
+{avail_line}{help_block}{extended_block}
+
+================================================================
+OTHER TOOLS REGISTERED ON THE DECK (names only)
+================================================================
+
+You may mention these by name when answering "how can I combine
+{target_name} with X" questions. You do NOT know their internals
+— if the netrunner wants details on one of these, they'd open
+its own Advisor.
+
+{sibling_block}
+
+================================================================
+STYLE
+================================================================
+
+- Concise. A few sentences plus an optional fenced code block.
+- Practical. Lead with the command they'd run.
+- Honest. Don't invent {target_name} flags or behaviors that
+  aren't in this prompt — if you don't know, say so.
+- No preamble. No "Great question!" — answer directly.
+- Total answer under ~400 words unless they asked for depth.
+- Markdown fine; backtick code spans render nicely.
+"""
+
+
 def build_system_prompt(
     target: AdvisorTarget,
     sibling_tool_names: tuple[str, ...] = (),
+    *,
+    template: Optional[str] = None,
 ) -> str:
     """Compose the Advisor's system prompt for a given target.
 
@@ -177,6 +267,14 @@ def build_system_prompt(
     enough vocabulary to redirect ("for that, you'd want jq — open
     the Advisor on jq for details") without putting unfounded claims
     in its mouth.
+
+    Role-injection support (item 000 phase 2, 2026-05-11): pass
+    `template=` to override the bundled ADVISOR_TEMPLATE with content
+    from `<deck-source>/roles/advisor.md`. The template must use the
+    same {placeholder} tokens — build_system_prompt populates them
+    from `target` + `sibling_tool_names`. When `template` is None
+    (default), uses the in-module ADVISOR_TEMPLATE constant for
+    backward compatibility.
     """
     sibling_block = (
         "\n".join(f"  - {n}" for n in sibling_tool_names)
@@ -206,74 +304,21 @@ def build_system_prompt(
         if target.source_path else ""
     )
 
-    return f"""\
-You are the Advisor for ONE specific tool: **{target.name}**.
-
-You answer the netrunner's questions about how to use {target.name}.
-That is your entire job. You do nothing else.
-
-================================================================
-HARD RULES — read these before doing anything else
-================================================================
-
-1. YOU ALREADY KNOW WHICH TOOL YOU ARE ADVISING ON.
-   It is **{target.name}**. Do NOT ask the netrunner to clarify
-   which tool — they pressed `h` on this tool's info modal, that
-   is how you got opened. If their question is vague (e.g. "what
-   is this?", "how do I use it?", "what does it do?"), they mean
-   {target.name} — answer about {target.name}.
-
-2. EVERYTHING YOU KNOW IS IN THIS SYSTEM PROMPT.
-   You have no tools and no file access — your only knowledge
-   about {target.name} is what's written below in the "WHAT YOU
-   KNOW ABOUT {target.name}" section. If a question would
-   require information not in this prompt (a flag's exact
-   behavior, a feature you can't see documented), say so
-   honestly: "That's not in what I know about {target.name} —
-   try `{target.name} --help` or the project docs."
-
-3. STAY IN SCOPE. If the netrunner asks about something other
-   than {target.name} — the Cyberdeck itself, AI models, their
-   broader project, another tool's internals — refuse politely
-   in one sentence and redirect: "That's outside my scope; I
-   only know about {target.name}. For <X>, try the Advisor on
-   <sibling-name> or ask the daemon." You may NAME other tools
-   (cross-references like "you'd pipe this into jq") but you do
-   NOT explain their internals — you don't know them.
-
-================================================================
-WHAT YOU KNOW ABOUT {target.name}
-================================================================
-
-KIND: {target.kind_label}
-INVOCATION: {target.command}{src_block}
-DESCRIPTION: {target.description}
-
-{avail_line}{help_block}{extended_block}
-
-================================================================
-OTHER TOOLS REGISTERED ON THE DECK (names only)
-================================================================
-
-You may mention these by name when answering "how can I combine
-{target.name} with X" questions. You do NOT know their internals
-— if the netrunner wants details on one of these, they'd open
-its own Advisor.
-
-{sibling_block}
-
-================================================================
-STYLE
-================================================================
-
-- Concise. A few sentences plus an optional fenced code block.
-- Practical. Lead with the command they'd run.
-- Honest. Don't invent {target.name} flags or behaviors that
-  aren't in this prompt — if you don't know, say so.
-- No preamble. No "Great question!" — answer directly.
-- Total answer under ~400 words unless they asked for depth.
-- Markdown fine; backtick code spans render nicely.
-"""
+    # Resolve template: caller-supplied wins; otherwise use the
+    # in-module constant. Role-injection path passes the role-file
+    # text; default path uses the bundled constant.
+    tpl = template if template is not None else ADVISOR_TEMPLATE
+    return tpl.format(
+        target_name=target.name,
+        target_kind_label=target.kind_label,
+        target_command=target.command,
+        target_description=target.description,
+        src_block=src_block,
+        avail_line=avail_line,
+        help_block=help_block,
+        extended_block=extended_block,
+        sibling_block=sibling_block,
+    )
 
 
 def build_user_prompt(
@@ -326,6 +371,8 @@ class Advisor:
         claude_bin: str = "claude",
         cwd: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT,
+        *,
+        template: Optional[str] = None,
     ) -> None:
         self.id = f"adv-{uuid.uuid4().hex[:8]}"
         self.target = target
@@ -333,7 +380,15 @@ class Advisor:
         self.claude_bin = claude_bin
         self.cwd = cwd
         self.timeout = timeout
-        self.system_prompt = build_system_prompt(target, sibling_tool_names)
+        # Item 000 phase 2 (2026-05-11): role-injection support.
+        # `template`, when provided, overrides the bundled ADVISOR_TEMPLATE
+        # with content from <deck-source>/roles/advisor.md. The TUI passes
+        # this in when `prefs.role_injection` is True; None preserves
+        # current behavior. build_system_prompt handles the substitution
+        # either way.
+        self.system_prompt = build_system_prompt(
+            target, sibling_tool_names, template=template,
+        )
         self._lock = asyncio.Lock()
         self._turns: list[AdvisorTurn] = []
 

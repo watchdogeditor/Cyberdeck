@@ -616,6 +616,15 @@ class Watchdog:
         self.claude_bin = claude_bin
         self.cwd = cwd
         self.system_prompt = system_prompt
+        # Item 000 phase 2 (2026-05-11): tripwire-authoring system
+        # prompt override. None means "use the module-level
+        # TRIPWIRE_AUTHORING_SYSTEM_PROMPT default" (current behavior).
+        # The TUI sets this to the roles registry's watchdog-authoring
+        # content when `prefs.role_injection` is True. Separate from
+        # self.system_prompt because authoring is a different mode
+        # with a different prompt — same watchdog instance, two role
+        # files (watchdog-qa.md and watchdog-authoring.md) on disk.
+        self.authoring_system_prompt: Optional[str] = None
         self.timeout = timeout
         # Phase 4 of the unified-event-stream slice. The watchdog
         # passes the bus through to its owned components (Blacklist
@@ -884,8 +893,18 @@ class Watchdog:
             defaults_summary=list(DEFAULT_TRIPWIRES),
             blacklist_summary=blacklist_summary,
         )
+        # Item 000 phase 2 (2026-05-11): authoring prompt override.
+        # self.authoring_system_prompt is set by the TUI to the
+        # registry's watchdog-authoring.md content when role injection
+        # is enabled; None means use the in-code default (current
+        # behavior, unchanged).
+        authoring_prompt = (
+            self.authoring_system_prompt
+            if self.authoring_system_prompt is not None
+            else TRIPWIRE_AUTHORING_SYSTEM_PROMPT
+        )
         full_prompt = (
-            TRIPWIRE_AUTHORING_SYSTEM_PROMPT
+            authoring_prompt
             + "\n\n---\n\n"
             + user_body
         )

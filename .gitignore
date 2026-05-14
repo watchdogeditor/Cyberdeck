@@ -37,6 +37,15 @@ logs/
 cyberdeck.log
 ejected-*.json
 
+# Role files (item 000 phase 2, 2026-05-11). Runtime-generated from
+# bundled defaults in roles/_defaults.py on first launch — same
+# pattern as profile_registry seeding default.toml. The `.md` files
+# on disk are local netrunner calibration; the bundled defaults in
+# code are the source of truth. Keep _defaults.py + __init__.py
+# tracked, ignore the generated markdown + general.toml.
+roles/*.md
+roles/general.toml
+
 # Milestone snapshots — history, not source.
 Previous Versions/
 

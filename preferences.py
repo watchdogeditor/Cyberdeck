@@ -29,6 +29,11 @@ Schema:
         "wedge_timeout_seconds": float,   # post-stdout-close kill ceiling
         "fast_mode": bool,                # netrunner cost governor
         "daemon_effort": str,             # daemon power level
+        "role_injection": bool,           # item 000 phase 2 — read role
+                                          # prompts from <deck-source>/roles/
+                                          # instead of in-code constants.
+                                          # Default False; netrunner flips
+                                          # on per launch to A/B verify.
         # ----- future placeholders (not yet wired) -----
         # "theme": str,                   # color theme name
         # "default_profile": str,         # auto-select profile at startup
@@ -56,6 +61,7 @@ Public surface:
     .wedge_timeout_seconds → float, default 30.0
     .fast_mode      → bool, default False
     .daemon_effort  → str, default "high"
+    .role_injection → bool, default False (item 000 phase 2)
     .save(**kwargs) → write deltas to limits namespace
     .reload()       → invalidate the in-process cache; read fresh
 """
@@ -79,6 +85,14 @@ DEFAULT_DELAY_WINDOW_SECONDS: float = 0.0
 DEFAULT_WEDGE_TIMEOUT_SECONDS: float = 30.0
 DEFAULT_FAST_MODE: bool = False
 DEFAULT_DAEMON_EFFORT: str = "high"
+# Item 000 phase 2 (2026-05-11): default OFF for first ship. Netrunner
+# flips on per-launch to A/B verify the role-file path before we
+# consider flipping the default. When False, every spawn site uses the
+# in-code system-prompt constants (current behavior, unchanged). When
+# True, daemon / watchdog Q&A / watchdog tripwire-authoring / advisor
+# all read their system prompts from <deck-source>/roles/*.md +
+# general.toml. Constructs + Mechanic stay in code regardless.
+DEFAULT_ROLE_INJECTION: bool = False
 
 
 # Header comment that gets dropped into state.json on first save IF
@@ -180,6 +194,18 @@ class Preferences:
         v = self._limits().get("daemon_effort")
         return v if isinstance(v, str) else DEFAULT_DAEMON_EFFORT
 
+    @property
+    def role_injection(self) -> bool:
+        """Item 000 phase 2 (2026-05-11). When True, role-bearing
+        spawn sites (daemon, watchdog Q&A, watchdog tripwire authoring,
+        advisor) read their system prompts from <deck-source>/roles/
+        instead of in-code constants. Construct + Mechanic stay in
+        code regardless. Default False — netrunner flips on
+        per-launch to A/B before we consider flipping the default.
+        """
+        v = self._limits().get("role_injection")
+        return v if isinstance(v, bool) else DEFAULT_ROLE_INJECTION
+
     # ---- write surface ----------------------------------------------------
 
     def save(self, **kwargs: Any) -> None:
@@ -220,4 +246,5 @@ class Preferences:
             "wedge_timeout_seconds": self.wedge_timeout_seconds,
             "fast_mode": self.fast_mode,
             "daemon_effort": self.daemon_effort,
+            "role_injection": self.role_injection,
         }
