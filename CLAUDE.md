@@ -38,6 +38,13 @@ to absorb them.
   orientation, workflow patterns
 
 ### Always-read for the area you're working in
+- **`Design Files/cyberdeck-deck-fires.md`** — concentrated registry
+  of patterns that **brick the deck** on contact. Scannable in 2
+  minutes. **Read this BEFORE adding new spawn-site code, new modal
+  code, new settings-JSON entries, or anything that touches subprocess
+  spawn argv on Windows.** Cross-references the long-form gotchas
+  in state.md. Every entry is a real bug we hit; this is the short-
+  form catalog over the long-form record.
 - **`Design Files/cyberdeck-state.md`** — current state of record.
   Filed gotchas (cumulative, sacred), key design decisions, shipped
   feature reference, tech debt. **Read this when touching subprocess

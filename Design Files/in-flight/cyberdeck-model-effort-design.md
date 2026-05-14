@@ -1,7 +1,7 @@
 # Cyberdeck — Model + Effort Selection Design
 
-> **STATUS: PHASES 1-3 + 5 SHIPPED 2026-05-04; PHASE 4 BLOCKED ON QUOTA SIGNAL.**
-> Updated 2026-05-07.
+> **STATUS: PHASES 1-5 ALL SHIPPED (Phases 1-3+5 2026-05-04; Phase 4 2026-05-11).**
+> Updated 2026-05-11.
 >
 > **Shipped slices:**
 > - **Phase 1** — `caliber.py` (~250 LOC); `Caliber` dataclass; threading
@@ -19,14 +19,47 @@
 > - **Phase 5** — Sidebar daemon line; per-pane caliber suffix; watchdog
 >   Q&A CALIBER AWARENESS section.
 >
-> **Phase 4 (quota-aware fallback) HARD-BLOCKED on build-plan item 13**
-> (the quota signal). When item 13 lands, item 0f (adversarial dyad) is
-> Phase 4's natural companion — Phase 4 needs both quota AND quality
+> **Phase 4 (quota-aware fallback) SHIPPED 2026-05-11** alongside
+> build-plan item 13 (the quota signal). Item 0f (adversarial dyad)
+> remains Phase 4's natural companion — Phase 4 has quota AND quality
 > signals to make smart escalation decisions. See
 > `cyberdeck-build-plan.md` for both items.
 >
-> **Read Phase 4 sections when item 13 lands.** Phase 1-3+5 sections
-> stay relevant for understanding what's already wired and why.
+> **Phase 4 implementation (2026-05-11):**
+> - `quota_statusline.py` (Claude Code statusLine command, ~200 LOC)
+>   wired into every spawn's settings.json. Reads session context on
+>   stdin, extracts rate_limits, atomically writes
+>   `<home>/.cyberdeck/quota.json`.
+> - `quota_reader.py` (deck-side, ~200 LOC): `QuotaSnapshot` dataclass
+>   + `load(home_dir) -> Optional[QuotaSnapshot]` + stale detection
+>   (default 60-min threshold) + `format_for_daemon(snapshot) -> str`
+>   for the user-message QUOTA: line.
+> - `brake_state.make_spawn_settings` grew a `statusLine` block on
+>   every spawn (including YOLO — quota tracking is observation, not
+>   enforcement). Settings file now ALWAYS returned (never None), so
+>   every claude subprocess gets statusLine wired.
+> - `DAEMON_SYSTEM_PROMPT` grew a `QUOTA AWARENESS` section: the
+>   policy ratchet bands (<50%/50-75%/75-90%/>90%), stale handling,
+>   cold-start handling. Daemon reads QUOTA: line in the per-turn
+>   user message, weights caliber decisions accordingly.
+> - `daemon_session._format_outcomes` accepts a `quota_snapshot`
+>   kwarg + injects the formatted line just below the
+>   human-input/warning blocks, just above outcomes. DaemonSession's
+>   `quota_provider` callable is called per turn for the freshest
+>   reading. None / "" snapshot omits the line gracefully.
+> - `CYBERDECK_QUOTA_PATH` env-var override at both the script side
+>   AND the reader side handles the Pi tmpfs case
+>   (`/dev/shm/cyberdeck-quota.json`) without code changes.
+>
+> Cold-start covered by side effect: pool warmers fire `statusLine`
+> on their first model call, populating quota.json before the
+> daemon's first turn. Daemon's first turn may have no QUOTA line
+> if pool warming hasn't completed yet; subsequent turns always do.
+>
+> **Read this whole doc only if extending the caliber primitive
+> (new models, new effort levels, future model-axis additions).
+> Day-to-day use of the shipped surfaces is documented in code +
+> `cyberdeck-state.md` Caliber section.**
 
 ---
 

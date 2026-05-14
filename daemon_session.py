@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from watchdog import Blacklist, BlacklistEntry
     from event_bus import EventBus
     from caliber import Caliber
+    from quota_reader import QuotaSnapshot
 
 from daemon import Daemon, DaemonEvent
 from fleet import Fleet, FleetEvent
@@ -58,6 +59,10 @@ class DaemonSession:
         ] = None,
         default_caliber: Optional["Caliber"] = None,
         periodic_wake_seconds: float = 60.0,
+        quota_provider: Optional[
+            Callable[[], Optional["QuotaSnapshot"]]
+        ] = None,
+        connection_state_provider: Optional[Callable[[], str]] = None,
     ) -> None:
         self.daemon = daemon
         self.fleet = fleet
@@ -159,6 +164,29 @@ class DaemonSession:
                 # and Claude Code applies its own default.
                 default_caliber = None
         self.default_caliber = default_caliber
+
+        # Build-plan item 13 (2026-05-11): quota provider. Callable
+        # returning the current QuotaSnapshot (or None when no signal
+        # is available yet — cold start / file missing / unparseable).
+        # _format_outcomes injects the result as a `QUOTA: ...` line
+        # in the daemon's user message; the daemon's system prompt
+        # has the QUOTA AWARENESS section explaining how to weight
+        # the values. None provider means quota awareness is
+        # effectively off — daemon proceeds with no quota line, same
+        # as pre-item-13 behavior. The TUI wires a real provider via
+        # `lambda: quota_reader.load(self.home_dir)` at construction.
+        self.quota_provider = quota_provider
+
+        # Build-plan item 13 follow-on (2026-05-11): connection state
+        # provider. Callable returning the current ConnectionState
+        # value as a string ("online" / "degraded" / "offline"). The
+        # daemon's system prompt has a CONNECTION AWARENESS section
+        # explaining how to weight it — primarily, models with
+        # network_required=true in the catalog become unspawnable
+        # under offline. None provider means connection awareness is
+        # effectively off — daemon proceeds with no CONNECTION line,
+        # assumes online by default (legacy behavior).
+        self.connection_state_provider = connection_state_provider
 
         # Track task-per-construct so we can report useful outcomes
         # (the finalized event doesn't carry the original task text).
@@ -303,12 +331,37 @@ class DaemonSession:
                 blacklist_entries = (
                     self.blacklist.entries if self.blacklist is not None else []
                 )
+                # Build-plan item 13: fetch the freshest quota signal
+                # right before composing the daemon's user message.
+                # Provider returns None on cold start / file missing /
+                # unparseable; _format_outcomes omits the QUOTA: line
+                # in that case (graceful degradation).
+                quota_snapshot = None
+                if self.quota_provider is not None:
+                    try:
+                        quota_snapshot = self.quota_provider()
+                    except Exception:
+                        # Provider failure is non-fatal — daemon turn
+                        # proceeds without quota awareness. Don't let
+                        # observability plumbing break goal execution.
+                        quota_snapshot = None
+                # Connection state — same pattern as quota. Provider
+                # returns the current state as a string; missing /
+                # error returns None and the line is omitted.
+                connection_state = None
+                if self.connection_state_provider is not None:
+                    try:
+                        connection_state = self.connection_state_provider()
+                    except Exception:
+                        connection_state = None
                 message = _format_outcomes(
                     outcomes,
                     self._respawn_warnings,
                     goal_update=self._pending_goal_update,
                     netrunner_messages=self._pending_netrunner_messages,
                     blacklist_entries=blacklist_entries,
+                    quota_snapshot=quota_snapshot,
+                    connection_state=connection_state,
                 )
                 self._respawn_warnings = []  # clear after surfacing
                 self._pending_goal_update = None  # consumed
@@ -847,6 +900,8 @@ def _format_outcomes(
     goal_update: Optional[tuple[str, str, str]] = None,
     netrunner_messages: Optional[list[str]] = None,
     blacklist_entries: Optional[list["BlacklistEntry"]] = None,
+    quota_snapshot: Optional["QuotaSnapshot"] = None,
+    connection_state: Optional[str] = None,
 ) -> str:
     """Render a batch of construct outcomes as a daemon-input message.
 
@@ -973,6 +1028,32 @@ def _format_outcomes(
             "treat plan-affecting content as authoritative input on "
             "next steps."
         )
+        lines.append("")
+
+    # Build-plan item 13 (2026-05-11): inject the operating-state
+    # cluster (QUOTA + CONNECTION; RESOURCES + CREDIT join in
+    # follow-on slices) just below the human-input / warning blocks
+    # and just above the outcomes. Daemon's system prompt has
+    # QUOTA / CONNECTION / RESOURCE AWARENESS sections explaining
+    # how to weight each signal. Missing signals omit their line
+    # (graceful degradation; no QUOTA / no CONNECTION = legacy
+    # pre-item-13 behavior).
+    signal_lines: list[str] = []
+    if quota_snapshot is not None:
+        try:
+            from quota_reader import format_for_daemon
+            quota_line = format_for_daemon(quota_snapshot)
+        except Exception:
+            quota_line = ""
+        if quota_line:
+            signal_lines.append(quota_line)
+    if connection_state:
+        # Pass-through the ConnectionState's string value (already
+        # "online" / "degraded" / "offline"). The daemon's CONNECTION
+        # AWARENESS section reads this verbatim.
+        signal_lines.append(f"CONNECTION: {connection_state}")
+    if signal_lines:
+        lines.extend(signal_lines)
         lines.append("")
 
     # Build a fast lookup of source_construct_id → blacklist entry so the

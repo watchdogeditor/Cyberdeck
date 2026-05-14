@@ -88,6 +88,29 @@ see `cyberdeck-state.md`. This is a one-line index.
 - Item 0b — `preferences.py`
 - Item 0d — Mechanic v0→v1 bridge: liveness heartbeat
 
+### Models catalog — item 13 follow-on (2026-05-11 late)
+Bundled response to Anthropic's announced 2026-06-15 SDK-credit-pool change. The deck's local-substrate migration (long-deferred Phase D) is now on the critical path; the catalog primitive ships first to set up backend-adapter swap-ins. The daemon's caliber decisions become data-driven against a netrunner-edited catalog rather than hardcoded Anthropic-model knowledge.
+
+- New `models_registry.py` (~530 LOC) loads `<deck-source>/roles/models.toml` — same folder as `general.toml` + role markdown files. Default-restore on missing / wiped file. Bundled defaults ship the three Anthropic entries (haiku/sonnet/opus); commented-out templates for ollama / openrouter / private — netrunner uncomments + tunes when backend adapters ship.
+- Schema: per-model `name` + `power` (informational summary) + `provider` + `api_model` + `description` + `use_cases` (pipe-separated; daemon's primary relevance signal) + `cost_per_1m_input/output` + `network_required`. Subtables: `[model.requirements]` (hardware constraints for local providers) + `[model.effort.<level>]` (per-effort `power` rank + description + api_effort).
+- **Power calibration**: each effort table has its own `power` value; daemon ranks (model, effort) pairs by `effort.power`. Encodes both base capability AND effort's contribution. Netrunner-tunable judgment.
+- DAEMON_SYSTEM_PROMPT's CALIBER SELECTION rewritten: hardcoded mappings → catalog-driven decision procedure (filter by use_cases → rank by power → apply CONNECTION/QUOTA/RESOURCE constraints → tie-break local-over-cloud + cheaper-over-pricier). Default disposition flipped: "start at LOW end of power range; escalate only when task warrants."
+- New CONNECTION AWARENESS + RESOURCE AWARENESS sections in daemon system prompt. CONNECTION wires in NOW (consumes existing ConnectionMonitor state via new DaemonSession.connection_state_provider); RESOURCE AWARENESS section ships forward-compatible (RESOURCES line wires in next slice when hardware_profile + resource_monitor ship).
+- CONNECTION line injected into `_format_outcomes` alongside QUOTA — graceful degradation when provider is None (daemon's prompt handles missing as "assume online").
+- TUI wiring: `self.models_registry` in App.__init__; catalog appended to daemon system prompt via `render_catalog_for_daemon`; `_connection_state_for_daemon` reads ConnectionMonitor → passed as DaemonSession kwarg.
+- *Design:* schema + decision procedure documented inline in `models_registry.py` docstring + DAEMON_SYSTEM_PROMPT.
+- *Pending real-deck verification:* models.toml seeds on first launch; netrunner edits survive restart; wiped file restores defaults; CONNECTION line appears in daemon prompts; daemon visibly picks lower-power calibers under new default disposition.
+
+### Quota-aware throttling — item 13 + Caliber Phase 4 (2026-05-11)
+- Claude Code's `statusLine` per-subprocess command wired via `quota_statusline.py` to atomically write `<home>/.cyberdeck/quota.json`. Every claude spawn (constructs + pool warmers) populates the file as a side effect of its first model call. `brake_state.make_spawn_settings` grows a `statusLine` block universally — even YOLO spawns get the file (quota tracking is observation, not enforcement).
+- `quota_reader.py` deck-side: `QuotaSnapshot` + `QuotaWindow` dataclasses, `load(home_dir)` with stale detection (60-min default threshold), `format_for_daemon(snapshot)` rendering the `QUOTA: 5h=47% 7d=12%` line (with `(stale by N min)` suffix when over threshold). Tolerant parsing throughout.
+- Caliber Phase 4 (Daemon awareness) landed simultaneously: `DAEMON_SYSTEM_PROMPT` grew `QUOTA AWARENESS` section with policy ratchet bands (<50% normal / 50-75% slight bias / 75-90% tier-down / >90% refuse non-essential). Per-turn QUOTA line injected via `daemon_session._format_outcomes` (new `quota_snapshot=` kwarg) between human-input/warning blocks and outcomes. DaemonSession's new `quota_provider` callable invoked per turn; TUI wires it as `lambda: quota_reader.load(self.home_dir)`.
+- Cold-start covered by side effect: pool warmers populate quota.json before the daemon's first turn. Daemon system prompt explicitly handles "no QUOTA line at all" as cold-start scenario, proceeds without quota considerations.
+- Pi tmpfs: `CYBERDECK_QUOTA_PATH` env-var handled symmetrically by writer + reader. Linux/Pi deployments point at `/dev/shm/cyberdeck-quota.json` without code changes.
+- Files: new `quota_statusline.py` (~200 LOC), new `quota_reader.py` (~200 LOC). Edits: `brake_state.py` (statusLine universal; settings file always returned), `daemon.py` (QUOTA AWARENESS section), `daemon_session.py` (quota_provider param + _format_outcomes injection), `tui.py` (`_load_quota_snapshot` helper + DaemonSession wire-up).
+- *Design:* `in-flight/cyberdeck-model-effort-design.md` (STATUS banner now lists Phase 4 as shipped; Phase 4 section documents the implementation).
+- *Pending real-deck verification:* quota.json appears in `<home>/.cyberdeck/` after first claude spawn; QUOTA line appears in daemon prompts; stale flag fires correctly after >60 min idle; daemon visibly tiers down caliber when quota >75%; CYBERDECK_QUOTA_PATH redirects correctly.
+
 ### Role injection — item 000 phase 2 (2026-05-11)
 - Per-role system prompts externalized to `<deck-source>/roles/*.md` behind `prefs.role_injection` flag (default OFF for first ship). Four role files: `daemon.md`, `watchdog-qa.md`, `watchdog-authoring.md`, `advisor.md`. Plus `general.toml` for netrunner identity (name + pronouns + free-text notes) prepended to every role-injected spawn.
 - Scope narrowed from original design (netrunner direction 2026-05-11):
@@ -203,7 +226,7 @@ Major reshape of tripwire enforcement in response to a real-deck operational pai
 
 ## CURRENT FRONTIER
 
-Branch `claude/awesome-wozniak-41d9f1` ahead of `origin/main`. Item 000 phase 2 (role injection) shipped 2026-05-11 — pending real-deck verification. Mechanic v2 (item 0h) shipped 2026-05-10. Per-run workspaces (v5, 2026-05-08) and tripwires redesign (2026-05-07) also pending real-deck eyes. Remaining candidates:
+Branch `claude/awesome-wozniak-41d9f1` ahead of `origin/main`. Models catalog (item 13 follow-on) shipped 2026-05-11 late — first step of the accelerated local-substrate migration triggered by Anthropic's 2026-06-15 SDK-credit-pool change. Quota-aware throttling (item 13 + Caliber Phase 4) shipped 2026-05-11. Item 000 phase 2 (role injection) shipped 2026-05-11. Mechanic v2 (item 0h) shipped 2026-05-10. Per-run workspaces (v5, 2026-05-08) and tripwires redesign (2026-05-07) also pending real-deck eyes. **Highest-priority next slice: hardware_profile + resource_monitor + first backend adapter (Ollama)** — completes the local-substrate plumbing. Remaining candidates after that:
 
 ### 1. Item 0f — Adversarial dyad
 - Generator/discriminator paired-construct pattern. Daemon synthesizes both opinions; provides "is this work good enough" signal for caliber escalation
@@ -219,6 +242,8 @@ Branch `claude/awesome-wozniak-41d9f1` ahead of `origin/main`. Item 000 phase 2 
 - Agent phase-checks first; defers if work is in flight
 
 ### Verification opportunities pending real-deck eyes
+- Models catalog (models.toml seeds on first launch in `<deck-source>/roles/`; wipe-to-restore works; daemon prompt includes the rendered catalog block; CONNECTION line appears in daemon prompts; daemon's caliber picks visibly trend lower-power post-new-default-disposition)
+- Quota-aware throttling (quota.json appears in `<home>/.cyberdeck/`; QUOTA: line appears in daemon prompts on second turn onward; stale flag fires after >60 min idle; daemon tiers down caliber at >75% quota; CYBERDECK_QUOTA_PATH env override redirects file)
 - Role injection phase 2 (flag-OFF identical to pre-phase-2; flipping flag-ON routes 4 roles through `.md` files; save-blank-to-restore works; populated general.toml injects identity block)
 - Per-run workspaces v5 (manual constructs work fast via pool reuse; daemon composes run dir into spawn task strings; cross-launch pool reuse works)
 - Tripwires redesign (X-allow on critical fire skips kill; YOLO truly installs no settings file; tripwire fires under default brake produce visible delay overlays with tripwire context)
@@ -247,18 +272,6 @@ Branch `claude/awesome-wozniak-41d9f1` ahead of `origin/main`. Item 000 phase 2 
 - Implementation queued behind prompt-shaping pass and Mechanic v2
 - *Design:* `in-flight/cyberdeck-collections-intake-design.md`
 
-### Caliber Phase 4 — quota-aware fallback
-- HARD-BLOCKED on item 13 below
-- Read `<deck>/.cyberdeck/quota.json`; daemon system prompt grows quota-aware band
-- *Design:* `in-flight/cyberdeck-model-effort-design.md` (Phase 4 section)
-
-### Item 13 — Quota-aware throttling
-- Daemon gates spawns on remaining Max quota (5h + weekly windows)
-- Mechanism: Claude Code's status-line script receives rate-limit fields on stdin; writes JSON; daemon reads
-- Cold-start caveat: rate-limit fields populate only after first model call
-- Pi gotcha: tmpfs (`/dev/shm/cyberdeck-quota.json`) on OrangePi to avoid SD-card wear
-- *Design:* spec'd inline here; touches status-line script + new quota reader module
-
 ### Per-spawn tool/plugin availability surface
 
 Filed 2026-05-07. Profile-spawned constructs should know which tools on their list are actually installed/working so they don't waste turns invoking unavailable ones.
@@ -274,6 +287,16 @@ Slice shape (~40-60 LOC):
 - Header tweak: explicit "available now" framing so models that skim the list don't assume everything's ready.
 
 *Design:* spec'd inline; touches `tui.py:_build_per_spawn_addendum` only.
+
+### Construct spawn: migrate to `--append-system-prompt-file` (filed 2026-05-14)
+The deck's `construct.py` spawn path uses `--append-system-prompt <text>` directly with the deck addendum concatenated as a single newline-collapsed argv. This is the LAST major spawn site in the deck still passing addendum content through argv rather than through a `-file` variant. Real-deck-verified 2026-05-14: interpolating Windows backslash-paths into the addendum (the `_active_run.dir_path` interpolation) brought down every construct spawn with a CreateProcess "file not found" error. Reverting the path interpolation fixed the immediate fire but left the underlying class of bug intact — any future addition to the deck addendum that includes a Windows path or pathological string risks the same failure mode.
+
+**Slice shape (~30-50 LOC)**:
+- Mirror the pattern from `mechanic_triage.py` / `mechanic_repair.py` / `watchdog.py`: write composed addendum to a tempfile via `tempfile.mkstemp`, pass `--append-system-prompt-file <path>`, unlink in `finally`.
+- Cleanup needs to be per-construct lifecycle aware — temp file lives only as long as the subprocess is reading its prompt at startup. Can unlink immediately after `proc.stdin` close OR after `proc.wait()` completes (depending on whether claude code reads the file lazily; verify on real deck).
+- After this migration, the deck addendum can safely interpolate Windows paths again — `_active_run.dir_path` re-injection becomes safe.
+
+Once this lands, the path-in-argv class of bug can't surface at the construct spawn site. Filed in `cyberdeck-deck-fires.md` Category 1.
 
 ### Discrete bugs (deferred but specified)
 - **Kill doesn't interrupt in-flight assistant turns** — SIGTERM lands AFTER model finishes turn. Stopping mid-turn requires stdin-injection or stream interrupt; design alongside future inject-and-interrupt v2
@@ -491,7 +514,7 @@ Check this list before proposing a slice that touches one of these areas. If you
 
 ## Cross-cuts and dependency edges
 
-- **Item 13 (quota signal)** unblocks **Caliber Phase 4** AND naturally pairs with **Item 0f (adversarial dyad)** — Phase 4 needs both quota AND quality signals to make smart escalation decisions
+- **Item 13 (quota signal) + Caliber Phase 4 shipped 2026-05-11** as a bundled slice (signal + consumer landed together). Item 0f (adversarial dyad) remains Phase 4's natural companion — Phase 4 now has quota signal + needs the quality signal 0f will provide for the most sophisticated escalation decisions.
 - **Item 0g (iterative triage)** + **Item 0h (repair authority)** compose — both shipped 2026-05-07 and 2026-05-10 respectively. The composition shape: triage's `## Repair recommendation` section (Y/N + reasoning) sets the default for the post-triage repair prompt; v2 runs as a fresh spawn (not --resume off triage) for clean role separation
 - **Mechanic v1.5 prompt-thread state machine** is the reusable substrate for items 0g/0h
 - **Universal list-names** + **Per-run workspaces** + **Morgue** all dovetail (folder = `run-{run_id}-{list_name}/`; morgue session record gains `cwd` field)

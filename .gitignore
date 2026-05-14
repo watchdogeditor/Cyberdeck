@@ -45,6 +45,7 @@ ejected-*.json
 # tracked, ignore the generated markdown + general.toml.
 roles/*.md
 roles/general.toml
+roles/models.toml
 
 # Milestone snapshots — history, not source.
 Previous Versions/

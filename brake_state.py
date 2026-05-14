@@ -358,9 +358,18 @@ def make_spawn_settings(
     """Generate (or reuse) a `claude --settings` JSON file for a spawn.
 
     Returns the path to the file, or None if no settings are needed
-    (YOLO brake AND no delay window AND no fast_mode — the deck
-    installs no hook, claude runs unrestricted save for
-    --permission-mode).
+    (YOLO brake AND no fast_mode — the deck installs no hook, claude
+    runs unrestricted save for --permission-mode).
+
+    History: build-plan item 13 (2026-05-11) wired in a statusLine
+    block for quota capture and dropped the YOLO+no-fastMode early
+    return so every spawn got a settings file. The statusLine
+    emission broke real-deck construct spawns on Windows (filed
+    gotcha: claude exited 1 in 32ms with "The system cannot find
+    the file specified" — claude code's statusLine subprocess spawn
+    fails in the deck context for reasons we haven't fully isolated).
+    statusLine emission is disabled below; the early-return is
+    restored.
 
     `construct_id` is accepted for backwards-compatibility with the
     callsite signature but is NO LONGER used in the file path or in
@@ -398,11 +407,12 @@ def make_spawn_settings(
     unidirectional — always "allow this particular action to ignore
     the rules." Removing the YOLO+delay branch makes that consistent.
     """
-    # Hook installs unless YOLO. With fast_mode=True we still need
-    # a settings file under YOLO to set "fastMode": true (no CLI flag
-    # exists for fast mode; settings.json is the only input surface),
-    # but the file in that case carries ONLY the fastMode flag —
-    # no hooks block.
+    # 2026-05-14: restored the pre-item-13 early-return now that the
+    # statusLine emission has been disabled (see below). Under YOLO
+    # with no fastMode there's nothing to put in the settings file —
+    # no hooks, no statusLine, no fastMode — so emitting an empty
+    # `{}` file is pointless. Pre-item-13 returned None here so the
+    # caller skipped `--settings` entirely; restoring that behavior.
     if brake == BrakeState.YOLO and not fast_mode:
         return None
 
@@ -447,6 +457,51 @@ def make_spawn_settings(
     # fast_mode=True, we set it here.
     if fast_mode:
         settings["fastMode"] = True
+
+    # Build-plan item 13 (2026-05-11): quota statusLine — DISABLED
+    # 2026-05-14 after real-deck failure.
+    #
+    # The intent: Claude Code statusLine command runs after each turn's
+    # first model call, receives session context (including rate_limits)
+    # on stdin, writes <home>/.cyberdeck/quota.json. We installed it on
+    # every spawn so any model call would populate quota.json as a side
+    # effect, solving cold-start for the daemon's first turn.
+    #
+    # The reality: on Windows + claude code 2.1.126, installing a
+    # statusLine block in --settings for a `claude -p` (headless) spawn
+    # causes claude to exit 1 in ~32ms with stderr "The system cannot
+    # find the file specified." (Windows CreateProcess error). The
+    # error reproduces ONLY in the deck context — not when running
+    # `claude -p` manually with the same settings file. Working
+    # hypothesis: claude code's statusLine subprocess spawn path on
+    # Windows hits an executable-resolution issue specific to how the
+    # deck spawns claude (asyncio.create_subprocess_exec with env vars
+    # set + inherited stdin). The brake hook in the same settings file
+    # uses the same `python "..."` command shape successfully because
+    # it's spawned later (PreToolUse, not init).
+    #
+    # Filed in cyberdeck-state.md gotchas. Quota capture needs a
+    # different mechanism — likely parsing the rate_limit_event in the
+    # construct's own stream-json output (we already see these events
+    # per display.py) or deferring until the local-substrate work
+    # where the cost model shifts anyway. The quota_reader + daemon
+    # QUOTA AWARENESS + _format_outcomes QUOTA line injection all
+    # degrade gracefully when quota.json doesn't exist (daemon's
+    # prompt explicitly handles "no QUOTA line" as cold-start).
+    #
+    # Keeping the imports + code path in case we revisit (Anthropic
+    # might fix this in a future claude code release, or we might
+    # find a workaround). For now, no statusLine block in settings.
+    # statusline_path = Path(__file__).resolve().parent / "quota_statusline.py"
+    # statusline_path_str = str(statusline_path).replace("\\", "/")
+    # quota_json_path = Path(home_dir) / ".cyberdeck" / "quota.json"
+    # quota_json_path_str = str(quota_json_path).replace("\\", "/")
+    # settings["statusLine"] = {
+    #     "type": "command",
+    #     "command": (
+    #         f'python "{statusline_path_str}" "{quota_json_path_str}"'
+    #     ),
+    # }
 
     cyberdeck_dir = Path(home_dir) / ".cyberdeck"
     try:

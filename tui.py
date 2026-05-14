@@ -92,6 +92,22 @@ from preferences import Preferences
 # consumes its content).
 from roles_registry import RolesRegistry, RoleName, RoleLoadError
 import general_config
+# Build-plan item 13 (2026-05-11): quota reader. Each daemon turn
+# reads <home>/.cyberdeck/quota.json (populated by the statusLine
+# script inside every deck-spawned claude subprocess) and injects a
+# QUOTA: line into the daemon's user message. Cold-start / missing /
+# stale handled by quota_reader.load returning None or flagging.
+import quota_reader
+# Build-plan item 13 follow-on (2026-05-11): models catalog. The
+# daemon's system prompt receives the catalog rendered as a Markdown
+# block; the daemon picks (model, effort) by use_cases/power match
+# from this catalog, constrained by QUOTA/CONNECTION/RESOURCES signals
+# in the per-turn user message. Bundled defaults seed
+# <deck-source>/roles/models.toml on first launch with the three
+# Anthropic entries (haiku/sonnet/opus). The netrunner uncomments
+# template entries for local/openrouter/private models when adapters
+# ship (post-2026-05-11 follow-on slices).
+from models_registry import ModelsRegistry, ModelLoadError, render_catalog_for_daemon
 from brake_delay import (
     DelayEntry, DelayResolution, DelayMonitor,
     write_delay_override,
@@ -4944,6 +4960,25 @@ class CyberdeckApp(App):
         if self.prefs.role_injection:
             self._apply_role_injection_to_watchdog()
 
+        # Build-plan item 13 follow-on (2026-05-11): models catalog.
+        # Same directory as roles (configs co-located per netrunner
+        # direction). load() auto-seeds bundled defaults when the
+        # file is missing or effectively empty. _build_daemon_system_
+        # prompt appends the catalog to the daemon's system prompt;
+        # daemon picks (model, effort) by use_cases match + power
+        # rank + constraints from the QUOTA/CONNECTION/RESOURCES
+        # lines in the per-turn user message.
+        self.models_registry = ModelsRegistry(self.roles_dir, bus=self.bus)
+        try:
+            self.models_registry.load()
+        except ModelLoadError as e:
+            print(
+                f"tui: models registry failed to load: {e!r} — "
+                f"daemon will fall back to the in-prompt CALIBER "
+                f"SELECTION defaults without catalog awareness",
+                file=sys.stderr,
+            )
+
         # Phase 8 of the unified-event-stream slice: subscribe via the
         # bus instead of the legacy `on_change=` callback. The handler
         # receives a DeckEvent whose payload is the BrakeChangeEvent.
@@ -6877,6 +6912,46 @@ class CyberdeckApp(App):
         # tripwires (credentials, destructive SQL) cover the baseline.
         self._kick_off_tripwire_authoring()
 
+    # ---- quota helpers (item 13, 2026-05-11) ----------------------------
+
+    def _load_quota_snapshot(self):
+        """Return the freshest quota snapshot (or None if not yet
+        available). Used as the daemon session's `quota_provider`
+        callback; called once per outcome turn.
+
+        Best-effort: any exception in quota_reader.load surfaces as
+        None (daemon proceeds without quota awareness). The daemon's
+        system prompt explicitly handles "no QUOTA line at all" as
+        "cold-start, proceed without quota considerations."
+        """
+        try:
+            return quota_reader.load(self.home_dir)
+        except Exception:
+            return None
+
+    def _connection_state_for_daemon(self) -> Optional[str]:
+        """Return the current ConnectionMonitor state as a string
+        ("online" / "degraded" / "offline"), or None when no monitor
+        is wired or the lookup fails.
+
+        Used as the daemon session's `connection_state_provider`
+        callback; called once per outcome turn. The daemon's system
+        prompt has CONNECTION AWARENESS explaining the three values
+        + how they constrain spawn decisions (most importantly:
+        network_required=true models become unspawnable when offline).
+        """
+        try:
+            cm = getattr(self, "connection_monitor", None)
+            if cm is None:
+                return None
+            state = getattr(cm, "state", None)
+            if state is None:
+                return None
+            # ConnectionState is an Enum; .value gives the string.
+            return getattr(state, "value", None)
+        except Exception:
+            return None
+
     # ---- role injection helpers (item 000 phase 2, 2026-05-11) -----------
 
     def _compose_role_text(
@@ -7091,6 +7166,25 @@ class CyberdeckApp(App):
                 + self.default_profile.default_daemon_addendum.strip()
             )
 
+        # Build-plan item 13 follow-on (2026-05-11): append the
+        # MODELS CATALOG. The daemon's static CALIBER SELECTION
+        # section (in DAEMON_SYSTEM_PROMPT) explains how to read +
+        # use the catalog; this is the catalog data itself. Empty
+        # catalog (catastrophic load failure) gets omitted — daemon
+        # falls back to whatever defaults its in-prompt guidance
+        # describes.
+        try:
+            catalog_block = render_catalog_for_daemon(self.models_registry)
+        except Exception as e:
+            print(
+                f"tui: catalog render failed: {e!r} — daemon prompt "
+                f"composed without catalog block",
+                file=sys.stderr,
+            )
+            catalog_block = ""
+        if catalog_block:
+            sections.append("\n" + catalog_block)
+
         # Plugins catalog. Only available plugins are listed — no
         # point telling the daemon about a plugin whose dependencies
         # aren't installed; that just produces failed spawns. One
@@ -7208,6 +7302,20 @@ class CyberdeckApp(App):
             # specify model/effort/fast_mode, so every spawn carries
             # an explicit caliber on its CLI args.
             default_caliber=self.default_caliber,
+            # Build-plan item 13 (2026-05-11): quota provider. Closure
+            # over self.home_dir so the daemon sees the freshest
+            # quota signal per turn (statusLine scripts inside every
+            # spawned claude subprocess write to
+            # <home>/.cyberdeck/quota.json; we just read it back).
+            # quota_reader.load handles missing / stale / malformed
+            # cases gracefully.
+            quota_provider=self._load_quota_snapshot,
+            # Build-plan item 13 follow-on (2026-05-11): connection
+            # state provider. Reads the App's ConnectionMonitor
+            # current state. Daemon receives "online" / "degraded" /
+            # "offline" in the per-turn CONNECTION line; system prompt
+            # has CONNECTION AWARENESS explaining how to weight it.
+            connection_state_provider=self._connection_state_for_daemon,
         )
 
         if self.daemon_pane is not None:
@@ -7691,44 +7799,27 @@ class CyberdeckApp(App):
               isn't extended, so `cyberdeck` wouldn't resolve.
           (b) Telling the construct exact bytes to invoke is
               clearer than hoping it figures out invocation form."""
+        # 2026-05-14 EMERGENCY DIAGNOSTIC REVERT: temporarily back to
+        # the short version that matches the known-working worktree
+        # (happy-pascal-2f5de2). If this fixes construct spawn, the
+        # bug is in the OUTPUT DIRECTORY addition (likely Windows
+        # path with `.claude\worktrees\<slug>\` getting mangled when
+        # subprocess.list2cmdline encodes it as part of the long
+        # `--append-system-prompt` argv). Will re-add the run-dir
+        # convention via a different mechanism (path normalized to
+        # forward-slashes, or sent via stdin instead of argv).
         dispatcher = self.home_dir / "tools" / "deck" / "cyberdeck.py"
-        sections: list[str] = [
+        return (
             f"You have access to a deck-control utility at "
             f"{dispatcher}. Invoke it via the Bash tool to surface "
             f"files in the netrunner's UI panel:\n"
-            f'  python "{dispatcher}" files add "<path>"\n'
-            f'  python "{dispatcher}" files remove "<path>"\n'
+            f"  python {dispatcher} files add <path>\n"
+            f"  python {dispatcher} files remove <path>\n"
             f"Use this when you produce a file the netrunner should "
             f"see in their Files panel — finished outputs, generated "
             f"reports, etc. Don't surface every intermediate scratch "
-            f"file. Paths can be absolute or relative to your cwd. "
-            f"ALWAYS double-quote both the dispatcher path and the "
-            f"target path — Bash on Windows strips backslashes from "
-            f"unquoted paths and your invocation will fail with "
-            f'"file not found" on a mangled path.'
-        ]
-
-        # Per-run output directory convention (filed 2026-05-08 after
-        # the cwd-as-project-key issue surfaced — see state.md
-        # gotcha). The deck mints one run dir per launch but DOES
-        # NOT change your cwd. Output files belong in this dir as a
-        # convention; files outside it won't be cleaned up
-        # automatically. We bake the absolute path in here so
-        # constructs don't need to compute it.
-        if self._active_run is not None:
-            sections.append(
-                f"OUTPUT DIRECTORY (for this deck launch): "
-                f"`{self._active_run.dir_path}`. When you create "
-                f"files for the netrunner — reports, generated "
-                f"artifacts, anything you'd surface via "
-                f"`files add` — write them inside this directory "
-                f"using absolute paths. Your cwd is `{self.home_dir}` "
-                f"(stable across the deck's lifetime); the output "
-                f"dir is a SEPARATE convention, not your cwd. Files "
-                f"written outside the output dir end up flat in the "
-                f"home dir and won't be cleaned up between runs."
-            )
-        return "\n\n".join(sections)
+            f"file. Paths can be absolute or relative to your cwd."
+        )
 
     def _build_per_spawn_addendum(
         self,

@@ -14,6 +14,7 @@ should I work on"; use this for "what files exist and what are they."*
 | File | Role | Update cadence |
 |---|---|---|
 | `cyberdeck-claude-code-orientation.md` | **Read-first.** Orientation for a fresh session — what the codebase is, hard rules, file-by-file orientation, workflow patterns. | Update on any architectural shift |
+| `cyberdeck-deck-fires.md` | **Read before spawn-site / modal / settings-JSON / Windows-argv code.** Scannable registry of patterns that brick the deck. Two-minute read. Cross-references state.md gotchas. | Add a 5-7 line entry whenever a new "deck on fire" bug gets diagnosed |
 | `cyberdeck-state.md` | Current state of record. Filed gotchas (cumulative, sacred), key design decisions, tech debt, what's shipped. | Update on every meaningful landing |
 | `cyberdeck-build-plan.md` | Forward-looking plan tree. Shipped → current frontier → near → mid → long → non-goals. Each line item points at its design doc. | Update when slices land or new ones file |
 | `cyberdeck-spec.md` | Canonical architecture (the *what*). | Update on architectural shift |
@@ -35,7 +36,7 @@ Active designs. Slices in `cyberdeck-build-plan.md` reference these by name. Upd
 | `cyberdeck-per-run-workspaces-design.md` | Filed 2026-05-07; v5 final form shipped 2026-05-08 (pending real-deck verification). Move to archive/shipped/ once verified — iteration history is the value | build-plan SHIPPED "Per-run workspace compartmentalization" |
 | `cyberdeck-spawn-context-isolation.md` | Phase 1 shipped 2026-05-05; Phase 2 shipped 2026-05-11 (read for future role additions; design ref) | build-plan item 000 |
 | `cyberdeck-maintbot-design.md` | v0/v0.5/v1/v1.5/v1.6/v2 shipped; v3 deferred indefinitely | build-plan items 0d/0e/0g/0h |
-| `cyberdeck-model-effort-design.md` | Phases 1-3, 5 shipped 2026-05-04; Phase 4 blocked on quota signal (item 13) | "caliber" cluster |
+| `cyberdeck-model-effort-design.md` | Phases 1-5 all shipped (1-3+5 2026-05-04; Phase 4 2026-05-11). Read for caliber-primitive extension reference | "caliber" cluster |
 | `cyberdeck-keymap-revision.md` | ON HOLD since 2026-04-27. Layer 1 inventory done; Layers 2-3 blank. Blocks new global keybinds | build-plan keymap revision |
 | `cyberdeck-prompt-shaping-design.md` | Filed 2026-05-07; no code yet. Coordinate with spawn-context-isolation Phase 2 | build-plan "Prompt-shaping pass" |
 | `cyberdeck-collections-intake-design.md` | Filed 2026-05-06; queued behind prompt-shaping pass + Mechanic v2 | build-plan collections intake |

@@ -711,14 +711,21 @@ class Fleet:
                         # tail (~500 chars) here so DeckLogger persists
                         # it on the bus event and the chatlog/Q&A path
                         # can reach it without re-opening the construct.
-                        # Only populated when the wedge-timeout path
-                        # ran — every other kill source skipped the
-                        # drain, and clean exits already have their
-                        # stderr captured but it's rarely interesting.
-                        # None elsewhere to keep payloads tight.
+                        #
+                        # 2026-05-14 diagnostic widening: previously
+                        # populated ONLY on wedge-timeout kills. Now
+                        # populated whenever stderr is non-empty AND
+                        # the construct exited non-zero (failures the
+                        # netrunner / mechanic / triage would want to
+                        # diagnose). Clean exits still skip stderr to
+                        # keep payloads tight. Tied to a real-deck
+                        # construct-spawn failure investigation where
+                        # exit-1 in 32ms with no stderr surfaced was
+                        # impossible to diagnose from the log alone.
                         "stderr_excerpt": (
                             (c.stderr or "")[-500:]
-                            if c._kill_reason == "fleet_wedge_timeout"
+                            if (c._kill_reason == "fleet_wedge_timeout"
+                                or c.exit_code not in (0, None))
                             else None
                         ),
                         # Refusal suffix for the chatlog finalize line.
