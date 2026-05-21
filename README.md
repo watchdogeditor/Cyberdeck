@@ -29,6 +29,7 @@ The user — the *netrunner* — supervises through Textual.
 - [Status, more concretely](#status-more-concretely)
 - [License + contributing](#license--contributing)
 - [Aesthetic](#aesthetic)
+- [Screenshots](#screenshots)
 
 ---
 
