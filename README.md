@@ -1,6 +1,4 @@
 # Cyberdeck
-<img width="1918" height="1078" alt="run in progress" src="https://github.com/user-attachments/assets/4b7d6122-8658-425d-aa1c-90f2be296556" />
-
 A keyboard-first TUI that orchestrates Claude Code subprocesses — a
 personal AI cockpit that makes one human's attention go further than
 it should.
@@ -15,7 +13,7 @@ The user — the *netrunner* — supervises through Textual.
 > serve the netrunner running it." Read the [design canon](#design-canon)
 > before assuming any feature is stable.
 
-<!-- Screenshot placeholder — drop a TUI mid-flight capture here. -->
+<img width="1918" height="1078" alt="run in progress" src="https://github.com/user-attachments/assets/4b7d6122-8658-425d-aa1c-90f2be296556" />
 
 ---
 
@@ -271,3 +269,10 @@ you, doesn't have neon Comic Sans, doesn't pretend to be from 2077.
 It's a quiet TUI that does serious work and uses good names for what
 it's doing. The vibe is "your hacker friend's actual workstation,"
 not "the lobby of a Y2K-era cybercafe."
+
+## Screenshots
+<img width="1911" height="1078" alt="details" src="https://github.com/user-attachments/assets/a3dd3a36-b836-4a84-89fb-580060151613" />
+<img width="1917" height="1071" alt="profile view" src="https://github.com/user-attachments/assets/10595854-791d-445c-9662-3f2edc1c89f7" />
+<img width="1918" height="1078" alt="plugin advisor" src="https://github.com/user-attachments/assets/3855244b-95f6-4411-89be-9de2bbdde963" />
+
+
