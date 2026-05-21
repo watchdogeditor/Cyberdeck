@@ -1,4 +1,5 @@
 # Cyberdeck
+<img width="1918" height="1078" alt="run in progress" src="https://github.com/user-attachments/assets/4b7d6122-8658-425d-aa1c-90f2be296556" />
 
 A keyboard-first TUI that orchestrates Claude Code subprocesses — a
 personal AI cockpit that makes one human's attention go further than
